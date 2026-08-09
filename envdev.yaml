@@ -25,6 +25,7 @@ dependencies:
   - pyyaml=6.0.2
   - scipy=1.17.1 # used by Deformable DETR
   - simpy=4.1.1
+  - myst-parser=4.0.1
   - sphinx=8.2.1
   - sphinx-rtd-theme=3.0.1
   - yaml=0.2.5
