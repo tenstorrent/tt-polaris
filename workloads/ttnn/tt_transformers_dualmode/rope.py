@@ -12,7 +12,7 @@ Audit fixes vs the shim-only base:
     SimOps that do NOT exist on HW: tt-metal precomputes the matrices on host with torch and
     only transfers them via from_torch (no profiled device ops at init). Dual-mode fabricates
     the cos/sin/trans matrices as dummy weights DIRECTLY (no init-time device ops), matching
-    HW and the dummy-weights perf-capture contract (design doc §8b).
+    HW and the dummy-weights perf-capture contract.
   - The rope APPLICATION is a single ttnn.rotary_embedding_llama op emitted in attention.py
     (matches the capture's RotaryEmbeddingLlamaDeviceOperation, ops 27-28), NOT the shim-only
     utils.rotary_embedding_llama matmul-decomposition. rope.py only provides the matrices.

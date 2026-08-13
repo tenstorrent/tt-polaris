@@ -5,9 +5,9 @@
 
 Basis: shim-only workloads/ttnn/tt_transformers/model.py.
 
-Structure: embedding -> N x TransformerBlock -> final RMSNorm -> LMHead. Maps to the capture
-(project_llama3_prefill_op_sequence): EmbeddingsDeviceOperation (op 21), the per-block
-sequence (24-45) x n_layers, final LayerNorm (op 47), lm_head tail (48-59).
+Structure: embedding -> N x TransformerBlock -> final RMSNorm -> LMHead. Maps to the capture:
+EmbeddingsDeviceOperation (op 21), the per-block sequence (24-45) x n_layers, final LayerNorm
+(op 47), lm_head tail (48-59).
 
 Audit vs the shim-only base:
   - llama3-only: the moe / Mixtral norm branch is dropped (args.moe is False).

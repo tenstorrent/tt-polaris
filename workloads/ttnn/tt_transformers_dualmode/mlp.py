@@ -22,7 +22,7 @@ Audit fixes vs the shim-only base:
     multi-chip kwargs (cluster_axis / ccl_dtype / topology / *_links) are omitted because
     they are dead at num_devices=1, keeping the lean ModelArgs free of multi-chip CCL
     config. The galaxy (TG) / reduce_scatter branches in the shim-only base were dead
-    (is_galaxy=False) and are dropped here. See design doc §8c (single-chip).
+    (is_galaxy=False) and are dropped here — TT-Polaris is single-chip.
 """
 import os
 import sys

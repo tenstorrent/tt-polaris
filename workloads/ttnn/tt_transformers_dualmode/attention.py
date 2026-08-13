@@ -4,14 +4,14 @@
 """Dual-mode Attention for the llama3 tt_transformers port (single-chip, paged).
 
 Basis: shim-only workloads/ttnn/tt_transformers/attention.py, audited against tt-metal
-models/tt_transformers/tt/attention.py and the BH prefill capture
-(project_llama3_prefill_op_sequence). Calls the PR1 (#468) single device ops directly.
+models/tt_transformers/tt/attention.py and the BH prefill capture (README, "HW capture").
+Calls the PR1 (#468) single device ops directly.
 
 Audit fixes vs the shim-only base:
   - Single-chip (num_devices=1): all TG / mesh-shard (ShardTensor2dMesh) / CCL machinery in
     the shim-only base is dead and is dropped. The fused QKV weight is one dummy
     (1,1,dim,qkv_size) and wo is (1,1,dim,dim) — no per-device cat loop. tt_all_reduce is the
-    identity from ccl.py (design doc §8c).
+    identity from ccl.py.
   - Rope is a SINGLE ttnn.experimental.rotary_embedding_llama op per Q/K (capture ops 27-28),
     replacing the shim-only utils.rotary_embedding_llama matmul-decomposition (which did NOT
     match HW).
