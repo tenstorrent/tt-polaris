@@ -134,7 +134,8 @@ class ResNet(SimNN.Module):
         x = self.avgpool(x)
 
         assert x.shape is not None, "basicresnet ResNet.__call__: pooled tensor shape must be set"
-        x_size   = np.prod(x.shape[1:]) # don't use batchsize in finding reshape dim
+        # int() keeps the dims plain: np.prod returns a numpy integer.
+        x_size   = int(np.prod(x.shape[1:])) # don't use batchsize in finding reshape dim
         q_factor = x_size // Bottleneck.expansion
         r_factor = x_size % Bottleneck.expansion
         assert r_factor == 0, f"Input Image Size did not result into a neat multiple of Bottleneck.expansion = {Bottleneck.expansion}"

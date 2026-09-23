@@ -441,6 +441,28 @@ class TestIntegration:
         except ImportError as e:
             pytest.fail(f"Failed to import diffusers modules: {e}")
 
+    @pytest.mark.unit
+    def test_stable_diffusion_forward(self):
+        """The SD forward runs end to end and produces a 512x512 image.
+
+        UNet2DConditionModel.get_time_embed built its timestep tensor from the
+        bare batch dimension, which raised `Invalid shape type: <class 'int'>`,
+        so the workload never ran. The timestep tensor must have shape [B].
+        """
+        from workloads.diffusers.stablediffusion import SDModel
+
+        sd_model = SDModel('sd', {'bs': 1})
+        sd_model.create_input_tensors()
+        latents = sd_model.input_tensors['latents']
+        assert latents.shape is not None
+        timesteps = F._from_shape('t', shape=[])
+        t_emb = sd_model.unet.get_time_embed(latents, timesteps)
+        assert t_emb is not None
+        assert t_emb.shape is not None and t_emb.shape[0] == latents.shape[0], 'one timestep per batch element'
+
+        image = sd_model()
+        assert image.shape == [1, 3, 512, 512]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
