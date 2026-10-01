@@ -550,6 +550,17 @@ def move_sinf(iTList, oTList, op, **kwargs):
     return
 
 
+def copy_sinf(iTList, oTList, op, **kwargs):
+    """Shape inference for Copy (interleaved buffer-to-buffer copy): 1->1, same shape and dtype."""
+    assert len(iTList) == 1 and len(oTList) == 1
+    X = iTList[0]
+    in_shape = require_shape_list(X.shape, "Copy shape inference: input tensor shape must be known")
+    oTList[0].shape = list(in_shape)
+    oTList[0].dtype = X.dtype
+    op.perf_stats = _passthrough_perf([in_shape], in_shape, op.attrs.get('element_size', 2))
+    return
+
+
 def _passthrough_perf(in_shapes, out_shape, elem_size):
     """Build a passthrough perf_stats dict: 1 mov per output element."""
     in_elems = sum(_nelems(s) for s in in_shapes if s)
@@ -823,6 +834,7 @@ def register_layout_ops():
         ['UntilizeWithUnpadding', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, untilize_with_unpadding_sinf, True, True, True, True, True],
         ['InterleavedToSharded', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, interleaved_to_sharded_sinf, True, True, True, True, True],
         ['ShardedToInterleaved', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, sharded_to_interleaved_sinf, True, True, True, True, True],
+        ['Copy', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, copy_sinf, True, True, True, True, True],
         ['Reshard', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, reshard_sinf, True, True, True, True, True],
         ['Halo', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, halo_sinf, True, True, True, True, True],
         ['Move', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, move_sinf, True, True, True, True, True],

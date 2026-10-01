@@ -11,8 +11,9 @@ sequence (24-45) x n_layers, final LayerNorm (op 47), lm_head tail (48-59).
 
 Audit vs the shim-only base:
   - llama3-only: the moe / Mixtral norm branch is dropped (args.moe is False).
-  - Final norm + lm_head run when get_last_token != -1 (last-token logits) — the capture
-    includes them, so the prefill graph is built with get_last_token set.
+  - Prefill: get_last_token == -1 stops after the last block (the traced forward, 21 ops at 1
+    layer). Otherwise it is the last token's index and the prefill tail runs (_prefill_logits:
+    slice -> norm -> lm_head -> DRAM logits), which tt-metal runs eagerly after each trace replay.
 """
 import os
 import sys
@@ -116,12 +117,40 @@ class Transformer:
                 orientation=ttnn.ShardOrientation.ROW_MAJOR,
                 use_height_and_width_as_shard_shape=False,
             ))
+        if mode == 'prefill':
+            return self._prefill_logits(x, get_last_token)
         x = self.norm(x, mode=mode)        # final norm (capture op 47)
         x = self.lm_head(x)                # lm_head (capture ops 48-59)
-        if mode == 'prefill':
-            x = ttnn.to_layout(x, layout=ttnn.ROW_MAJOR_LAYOUT)
-            x = ttnn.to_memory_config(x, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         return x
+
+    def _prefill_logits(self, x, last_token_idx):
+        """Prefill tail: last-token tile -> final norm -> lm_head -> DRAM logits.
+
+        tt-metal 02b76a9 model.process_logits_after_prefill_trace + _apply_norm_and_lm_head. The
+        profiler records these eagerly after each trace replay (BH p100a prefill raw pass: Slice,
+        LayerNorm, InterleavedToSharded, 8 x (Matmul + ShardedToInterleaved), Concat, Copy):
+          - slice the 32-row tile holding the last token ((idx // 32) * 32);
+          - final RMSNorm in prefill mode on [1,1,32,dim];
+          - width-shard it for the DRAM-sharded lm_head (get_lm_head_input_mem_config(PREFILL):
+            [32, dim // 64] shards on the 8x8 lm_head grid);
+          - lm_head (Polaris: one GEMM that the backend splits 8 ways; HW: the 8 chunks directly);
+          - to_memory_config(DRAM): an interleaved L1 -> DRAM move, a CopyDeviceOperation on HW.
+        """
+        start = (last_token_idx // 32) * 32
+        dim = self.args.dim
+        if IS_POLARIS:
+            x = ttnn.slice(x, slice=(slice(None), slice(None), slice(start, start + 32), slice(None)))
+        else:
+            x = ttnn.slice(x, (0, 0, start, 0), (1, 1, start + 32, dim))
+        x = self.norm(x, mode='prefill')
+        x = ttnn.interleaved_to_sharded(x, ttnn.create_sharded_memory_config(
+            (32, dim // 64), ttnn.CoreGrid(x=8, y=8), ttnn.ShardStrategy.WIDTH,
+            ttnn.ShardOrientation.ROW_MAJOR, use_height_and_width_as_shard_shape=True,
+        ))
+        x = self.lm_head(x, mode='prefill')
+        if IS_POLARIS:
+            return ttnn.interleaved_copy(x, ttnn.DRAM_MEMORY_CONFIG)
+        return ttnn.to_memory_config(x, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
     def ttnn_prefill_forward(self, x, rot_mats, user_id, page_table=None, chunk_page_table=None,
                              chunk_start_idx=None, get_last_token=-1, kv_cache=None):

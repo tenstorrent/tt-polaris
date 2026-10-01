@@ -116,6 +116,9 @@ def test_unary_op_chain_resolution():
         ("RotaryEmbeddingLlamaDeviceOperation", "rotaryembeddingllama"),
         ("PagedFusedUpdateCacheDeviceOperation", "pagedfusedupdatecache"),
         ("PagedFillCacheDeviceOperation", "pagedfillcache"),
+        # Prefill head split: the profiler spells it NlpCreateHeads (no "QKV"), BH p100a 260923/260924.
+        ("NlpCreateHeadsDeviceOperation", "createqkvheads"),
+        ("CopyDeviceOperation", "copy"),
         ("SDPAOperation", "scaleddotproductattention"),
         ("SdpaDecodeDeviceOperation", "scaleddotproductattention"),
     ],

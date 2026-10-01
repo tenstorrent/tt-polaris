@@ -518,7 +518,7 @@ class PackageInstanceModel(BaseModel, extra='forbid'):
             assert compute_group.ipobj is not None
             assert isinstance(compute_group.ipobj, ComputeBlockModel)
         N        = compute_group.num_units
-        
+
         # Try primary pipe first
         pipe_obj = compute_group.ipobj.get_pipe(pipe)
         try:
@@ -529,7 +529,7 @@ class PackageInstanceModel(BaseModel, extra='forbid'):
             # This enables mixed-pipe operations (e.g., MatMul with fused activation:
             # matmul uses matrix pipe, activation uses vector pipe)
             pass
-        
+
         # Search all other pipes for this instruction
         for other_pipe in compute_group.ipobj.pipes:
             if other_pipe.name == pipe:
@@ -543,7 +543,7 @@ class PackageInstanceModel(BaseModel, extra='forbid'):
                 return N * ipc
             except AssertionError:
                 continue  # Try next pipe
-        
+
         # Instruction not found in any pipe
         raise AssertionError(
             f"Instruction '{instr}' not found in any compute pipe "

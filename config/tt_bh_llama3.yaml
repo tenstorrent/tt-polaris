@@ -63,7 +63,7 @@ packages:
     -   name: Blackhole
         instances:
         -   name: p100a
-            operator_lookup_file: lfc://hlm-lut/bh_p100a_llama3_lut_v8.yaml
+            operator_lookup_file: bh_p100a_llama3_lut_v9.yaml
             # Logical tensix grid (x, y) — see doc/TTNN_SHIM_ARCHITECTURE.md §17.
             # Source: tt-metal/tt_metal/core_descriptors/blackhole_140_arch.yaml (end=[12, 9] inclusive → 13×10).
             # p100a has one column reserved → effective 12×10 = 120 cores (matches num_units below).

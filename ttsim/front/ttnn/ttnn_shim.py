@@ -23,7 +23,7 @@ from ttsim.ops.op import SimOp
 from .tensor import DataType, Layout, Shape
 from .types import TILE_HEIGHT, TILE_WIDTH, TILE_HW
 from .tensor import Tensor
-from .op import _propagate_ttnn_dtype, _propagate_memory_config, generate_new_op_name, reshape as ttnn_reshape_simop
+from .op import _propagate_ttnn_dtype, generate_new_op_name, reshape as ttnn_reshape_simop
 
 from .memory import MemoryConfig
 from .buffer import BufferType, TensorMemoryLayout
@@ -2329,6 +2329,44 @@ def interleaved_to_sharded_op(input_tensor, memory_config=None, element_size=2):
     _propagate_ttnn_dtype([input_tensor], [out_tensor])
     if memory_config is not None:
         out_tensor._memory_config = memory_config
+    input_tensor.device.add_op(opobj)
+    return out_tensor
+
+
+def interleaved_copy(input_tensor, memory_config):
+    """Copy an interleaved tensor to another interleaved buffer (e.g. L1 -> DRAM).
+
+    Real ttnn.to_memory_config dispatches a CopyDeviceOperation for an interleaved-to-interleaved
+    buffer change, which the shim's to_memory_config does not emit (it only retags the tensor).
+    Callers that need the Copy op on the graph call this explicitly; to_memory_config is left
+    unchanged so no existing workload gains an op. Shape, layout and dtype are preserved.
+    """
+    assert input_tensor.device is not None, "interleaved_copy requires input_tensor on device"
+    assert memory_config is not None and not memory_config.is_sharded(), \
+        "interleaved_copy targets an interleaved memory_config"
+    op_name = generate_new_op_name()
+    out_tensor = Tensor(
+        name=op_name + '.out',
+        shape=input_tensor.logical_shape()._shape,
+        dtype=input_tensor.dtype,
+        layout=input_tensor.get_layout(),
+        padded_shape=input_tensor.padded_shape()._shape,
+        op_out=[op_name],
+        device=input_tensor.device,
+    )
+    input_tensor.op_in.append(op_name)
+    elem_sz = input_tensor.element_size() if hasattr(input_tensor, 'element_size') else 2
+    opobj = SimOp({
+        'name': op_name,
+        'optype': 'Copy',
+        'inList': [input_tensor.name],
+        'outList': [out_tensor.name],
+        'attrs': {'element_size': elem_sz},
+    })
+    opobj.get_perf_counts([input_tensor], [out_tensor])
+    opobj.update_tensor_counts([input_tensor], [out_tensor])
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
+    out_tensor._memory_config = memory_config
     input_tensor.device.add_op(opobj)
     return out_tensor
 

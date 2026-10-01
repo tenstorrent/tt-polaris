@@ -8,7 +8,7 @@ import sys
 import os
 import argparse
 import csv
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
@@ -55,6 +55,8 @@ except ImportError:
 _REPLAY_SESSION_COL = 'METAL TRACE REPLAY SESSION ID'
 _DURATION_NS_COL = 'DEVICE KERNEL DURATION [ns]'
 _SEQNO_COL = 'GLOBAL CALL COUNT'
+_TRACE_ID_COL = 'METAL TRACE ID'
+_OP_CODE_COL = 'OP CODE'
 
 
 @dataclass
@@ -69,20 +71,28 @@ class TraceReplayInfo:
 
 
 def _detect_trace_replay(filepath: str) -> Tuple['TraceReplayInfo', Dict[int, List[Tuple[int, float]]]]:
-    """Scan the raw profiler CSV for METAL TRACE REPLAY SESSION ID structure.
+    """Scan the raw profiler CSV for trace-replay **steps**.
 
-    Returns ``(info, sessions)`` where ``sessions`` maps session_id to a list
-    of ``(row_index, duration_ns)`` tuples.  ``row_index`` is the 0-based
-    position of the row in the CSV data (excluding header), which aligns
-    directly with the index in the list returned by ``layers_profiler``.
+    Returns ``(info, steps)`` where ``steps`` maps step number (1-based, capture order) to a list
+    of ``(row_index, duration_ns)`` tuples.  ``row_index`` is the 0-based position of the row in
+    the CSV data (excluding header), which aligns directly with the index in the list returned by
+    ``layers_profiler``.
 
-    Using row index rather than GLOBAL CALL COUNT is necessary because the
-    hardware trace replay re-uses the same GLOBAL CALL COUNT values for every
-    replay session — seqnos are NOT unique across sessions.
+    A step is one replay session of the *first replayed trace* plus every following row up to that
+    trace's next replay session, trace-capture rows excluded (the same definition as
+    ops_perf_trace_replay_merge.py, #538/#539).  Not every op of a model step is traced: llama3
+    prefill traces only the embedding and decoder blocks, and runs the final norm, lm_head and
+    sampling eagerly after each replay, so those rows carry a blank session id.  Selecting by
+    session id alone dropped them.  Rows before the first step (setup, compile run) are excluded.
+
+    Using row index rather than GLOBAL CALL COUNT is necessary because the hardware trace replay
+    re-uses the same GLOBAL CALL COUNT values for every replay session — seqnos are NOT unique
+    across sessions.
     """
-    sessions: DefaultDict[int, List[Tuple[int, float]]] = defaultdict(list)
-    setup_row_count = 0
-    has_replay_col = False
+    steps: List[List[Tuple[int, float, str]]] = []
+    excluded_row_count = 0
+    first_trace: Optional[str] = None
+    current_sid: Optional[str] = None
 
     with open(filepath, 'r') as fh:
         reader = csv.DictReader(fh)
@@ -91,42 +101,49 @@ def _detect_trace_replay(filepath: str) -> Tuple['TraceReplayInfo', Dict[int, Li
         for row_idx, row in enumerate(reader):
             dur_raw = (row.get(_DURATION_NS_COL) or '').strip()
             try:
-                dur_ns = float(dur_raw) if dur_raw else 0.0
+                dur_ns: Optional[float] = float(dur_raw) if dur_raw else None
             except ValueError:
-                dur_ns = 0.0
-            sid_raw = (row.get(_REPLAY_SESSION_COL, '') or '').strip() if has_replay_col else ''
-            if sid_raw:
-                try:
-                    sid = int(float(sid_raw))
-                    sessions[sid].append((row_idx, dur_ns))
-                except ValueError:
-                    setup_row_count += 1
-            else:
-                setup_row_count += 1
+                dur_ns = None
+            sid = (row.get(_REPLAY_SESSION_COL, '') or '').strip() if has_replay_col else ''
+            tid = (row.get(_TRACE_ID_COL, '') or '').strip()
+            if sid and first_trace is None:
+                first_trace = tid
+            if sid and tid == first_trace and sid != current_sid:
+                current_sid = sid
+                steps.append([])
+            if not steps or (not sid and dur_ns is None):  # prologue, or a trace-capture row
+                excluded_row_count += 1
+                continue
+            steps[-1].append((row_idx, dur_ns or 0.0, (row.get(_OP_CODE_COL) or '').strip()))
 
-    if not sessions:
+    if not steps:
         return TraceReplayInfo(
             has_trace_replay=False,
             n_sessions=0,
             ops_per_session=0,
-            setup_op_count=setup_row_count,
+            setup_op_count=excluded_row_count,
             selected_session=0,
             selected_duration_ns=0.0,
         ), {}
 
-    session_totals = {sid: sum(d for _, d in rows) for sid, rows in sessions.items()}
-    sorted_sids = sorted(session_totals, key=lambda s: session_totals[s])
-    selected_sid = sorted_sids[len(sorted_sids) // 2]
-    ops_per_session = max(len(v) for v in sessions.values())
+    # Candidates: steps with the most frequent op sequence (excludes warmup variants); then the
+    # median-total-duration candidate, as before.
+    signatures = [tuple(op for _, _, op in st) for st in steps]
+    modal = Counter(signatures).most_common(1)[0][0]
+    candidates = [i for i, sig in enumerate(signatures) if sig == modal]
+    totals = {i + 1: sum(d for _, d, _ in steps[i]) for i in candidates}
+    ordered = sorted(totals, key=lambda n: totals[n])
+    selected = ordered[len(ordered) // 2]
+    by_step = {i + 1: [(r, d) for r, d, _ in st] for i, st in enumerate(steps)}
 
     return TraceReplayInfo(
         has_trace_replay=True,
-        n_sessions=len(sessions),
-        ops_per_session=ops_per_session,
-        setup_op_count=setup_row_count,
-        selected_session=selected_sid,
-        selected_duration_ns=session_totals[selected_sid],
-    ), dict(sessions)
+        n_sessions=len(steps),
+        ops_per_session=len(modal),
+        setup_op_count=excluded_row_count,
+        selected_session=selected,
+        selected_duration_ns=totals[selected],
+    ), by_step
 
 
 def _maybe_dedup_profiler_layers(
@@ -168,20 +185,20 @@ def _maybe_dedup_profiler_layers(
         return layers
 
     print(
-        f'Trace replay detected: {info.n_sessions} session(s) x {info.ops_per_session} ops, '
-        f'{info.setup_op_count} setup-only rows excluded'
+        f'Trace replay detected: {info.n_sessions} step(s) x {info.ops_per_session} ops, '
+        f'{info.setup_op_count} setup/capture rows excluded'
     )
 
     session_sizes = {sid: len(rows) for sid, rows in sessions.items()}
     if len(set(session_sizes.values())) > 1:
         print(
-            f'WARNING: replay sessions have uneven op counts: {session_sizes}  '
-            f'- unexpected structure; using largest session size as reference.',
+            f'WARNING: trace-replay steps have uneven op counts: {session_sizes}  '
+            f'- selecting among the steps with the most frequent op sequence.',
             file=sys.stderr,
         )
 
     print(
-        f'Selected session {info.selected_session} '
+        f'Selected step {info.selected_session} '
         f'(median total duration {info.selected_duration_ns / 1e6:.3f} ms)'
     )
 

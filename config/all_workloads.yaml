@@ -189,7 +189,11 @@ workloads:
     basedir: workloads/ttnn/llama3_dualmode
     module : run_llama3_dualmode@test_llama3_prefill.py
     instances:
-      llama3_8b_dualmode_prefill: { bs: 1, model_name: llama3-8B }
+      # MATCHES the BH p100a 260923 prefill capture (bs=1, 1 layer, max_generated_tokens=1, seq_len=128):
+      # max_seq_len=1024 sizes the rope cos/sin tables ([1,1,1024,128])
+      # Full prefill step - the traced forward plus the eager tail tt-metal runs after each replay -- last-token
+      # slice, final norm, lm_head (8-way split) and on-device sampling.
+      llama3_8b_dualmode_prefill: { bs: 1, model_name: llama3-8B, n_layers: 1, max_generated_tokens: 1, max_seq_len: 1024}
 
   - api: TTNN
     name: llama3_dualmode_decode

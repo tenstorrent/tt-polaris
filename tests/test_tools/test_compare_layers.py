@@ -579,3 +579,47 @@ def test_perf_comparison_no_lut_hides_all_lut_columns(capsys):
 
     assert 'LUT1' not in out
     assert 'LUT2' not in out
+
+
+def _write_trace_csv(path, rows):
+    """rows: (op_code, trace_id, session_id, duration_ns or '') -> minimal profiler CSV."""
+    import csv
+    with open(path, 'w', newline='') as fh:
+        w = csv.writer(fh)
+        w.writerow(['OP CODE', 'METAL TRACE ID', 'METAL TRACE REPLAY SESSION ID', 'DEVICE KERNEL DURATION [ns]'])
+        w.writerows(rows)
+
+
+@pytest.mark.unit
+def test_trace_replay_step_keeps_eager_tail(tmp_path):
+    """A step is a replay session of the first trace plus the eager rows after it (#538/#539).
+
+    llama3 prefill traces only the forward; the lm_head and sampling run eagerly after each replay
+    with a blank session id. Selecting by session id alone dropped them.
+    """
+    from tools.profiling.compare_layers import _detect_trace_replay
+    fwd = [('Matmul', '0', None, 100), ('Add', '0', None, 10)]
+    tail = [('Matmul', '', '', 50), ('TopK', '', '', 70)]
+    rows = [('Tilize', '', '', 5),                         # setup
+            ('Matmul', '', '', 100), ('Add', '', '', 10),  # compile run
+            ('Matmul', '', '', ''), ('Add', '', '', '')]   # trace capture (no device time)
+    for sid in ('1', '2'):
+        rows += [(op, tid, sid, d) for op, tid, _, d in fwd] + tail
+    path = tmp_path / 'trace.csv'
+    _write_trace_csv(path, rows)
+
+    info, steps = _detect_trace_replay(str(path))
+    assert info.has_trace_replay and info.n_sessions == 2 and info.ops_per_session == 4
+    assert info.setup_op_count == 5                    # setup + compile + capture rows
+    assert [len(v) for v in steps.values()] == [4, 4]
+    assert info.selected_duration_ns == 230.0          # forward 110 + eager tail 120
+
+
+@pytest.mark.unit
+def test_trace_replay_step_on_merged_csv(tmp_path):
+    """A #539-merged CSV is one step: one session's rows followed by its eager tail."""
+    from tools.profiling.compare_layers import _detect_trace_replay
+    path = tmp_path / 'merged.csv'
+    _write_trace_csv(path, [('Matmul', '0', '2', 100), ('Add', '0', '2', 10), ('TopK', '', '', 70)])
+    info, steps = _detect_trace_replay(str(path))
+    assert info.n_sessions == 1 and info.ops_per_session == 3 and info.setup_op_count == 0

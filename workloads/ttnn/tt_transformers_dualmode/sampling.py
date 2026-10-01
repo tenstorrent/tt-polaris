@@ -40,8 +40,11 @@ def _dummy(shape, device, dtype, layout=None):
                       layout=layout if layout is not None else ttnn.TILE_LAYOUT, device=device)
 
 
-def sample_decode(logits, device, max_top_k=32, num_splits=2):
+def sample_decode(logits, device, max_top_k=32, num_splits=2, preallocated_output=True):
     """logits ``[1, 1, batch, vocab]`` -> sampled token id ``[1, 1, batch, 1]``.
+
+    ``preallocated_output``: decode passes a preallocated output_tensor (Sampling arity 6 in the
+    decode capture); the prefill capture's Sampling has no input_5, so prefill passes False.
 
     Sequence: typecast -> topk -> typecast -> add(device offsets) -> untilize
     -> manual_seed -> sampling.
@@ -125,5 +128,7 @@ def sample_decode(logits, device, max_top_k=32, num_splits=2):
     # LUT-miss fix (arity): HW ttnn.sampling takes a preallocated output_tensor (tt-metal
     # tt_sampling.py: output_tensor=tt_out_tok), which the profiler logs as Sampling input_5
     # (uint32, DRAM). Pass it so the sim emits the arity-6 op the capture records.
+    if not preallocated_output:
+        return ttnn.sampling(topk_values, global_indices, k=k_t, p=p_t, temp=temp_t)
     out_tok = _dummy([1, 1, 1, batch], device, ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
     return ttnn.sampling(topk_values, global_indices, k=k_t, p=p_t, temp=temp_t, output_tensor=out_tok)

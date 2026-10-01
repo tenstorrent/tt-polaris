@@ -80,14 +80,20 @@ class MLP:
 
     def forward(self, x: 'ttnn.Tensor', mode) -> 'ttnn.Tensor':
         """HF reference: self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))."""
-        # DRAM-sharded weights -> DRAM-sharded matmul program configs on HW (None on Polaris, and
-        # None in prefill which uses a different, non-dram-sharded matmul config — prefill-on-HW is
-        # a separate future path). See model_config.dram_matmul_config.
-        ff13_pc = self.args.mlp_ff13_decode_program_config() if mode == 'decode' else None
-        ff2_pc = self.args.mlp_ff2_decode_program_config() if mode == 'decode' else None
-        # Decode DRAM-sharded matmuls need a sharded output (see _DECODE_MM_MEMCFG); prefill keeps
-        # None (different, non-dram-sharded matmul config).
-        mm_memcfg = _DECODE_MM_MEMCFG if mode == 'decode' else None
+        # DRAM-sharded weights need explicit program configs on HW (None on Polaris): DRAM-sharded 1D in
+        # decode, 2D multicast in prefill. See model_config.dram_matmul_config / *_prefill_program_config.
+        if mode == 'decode':
+            ff13_pc = self.args.mlp_ff13_decode_program_config()
+            ff2_pc = self.args.mlp_ff2_decode_program_config()
+        else:
+            assert x.shape is not None, 'MLP prefill input must have a shape'
+            seq_len = x.shape[-2]
+            ff13_pc = self.args.mlp_ff13_prefill_program_config(seq_len)
+            ff2_pc = self.args.mlp_ff2_prefill_program_config(seq_len)
+        # Decode DRAM-sharded matmuls need a sharded output (see _DECODE_MM_MEMCFG); prefill outputs
+        # go to DRAM (tt-metal get_mlp_ff1_3/ff2_mem_config(PREFILL); BH p100a prefill capture: every
+        # MLP matmul/mul output DRAM_INTERLEAVED). None let the shim shard them.
+        mm_memcfg = _DECODE_MM_MEMCFG if mode == 'decode' else ttnn.DRAM_MEMORY_CONFIG
         # FF1/FF3 (gate/up) matmuls run at LoFi under the performance preset
         # (tt-metal DecodersPrecision.performance: OpGroup.LI_FF1_FF3 = LOFI).
         w1_out = ttnn.linear(
@@ -104,7 +110,8 @@ class MLP:
         # The mul downcasts its output to bfp8 (tt-metal: dtype=activation_dtype or
         # bfloat8_b), so the down_proj (w2) sees a bf8 activation in the capture.
         w2_in = ttnn.multiply(
-            w1_out, w3_out, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=None,
+            w1_out, w3_out, input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+            memory_config=None if mode == 'decode' else w1_out.memory_config(),  # tt-metal: w1_out's
             dtype=ttnn.bfloat8_b,
         )
         ttnn.deallocate(w3_out)
