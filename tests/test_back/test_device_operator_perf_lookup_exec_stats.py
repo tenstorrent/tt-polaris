@@ -217,3 +217,61 @@ def test_get_exec_stats_lut_validation_error_propagates():
 
     with pytest.raises(OperatorPerfLUTValidationError, match="bad row"):
         device.get_exec_stats(graph, bs=1)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "coverage, memory_traffic, mem_util, exp_traffic, exp_mem_util",
+    [
+        ("time_only", None, None, None, None),
+        ("full", 2048.0, 40.0, 2048.0, 0.4),
+    ],
+)
+def test_get_exec_stats_lut_stats_coverage(coverage, memory_traffic, mem_util, exp_traffic, exp_mem_util):
+    """A time-only hit reports memory_traffic / mem_util as None (not measured), never 0."""
+    device = Device(MockSimConfigWithPeakIpc())
+    op = _create_stub_op("op1", "MatMul")
+    graph = _make_wlgraph(op)
+    master = MasterPerfStats(
+        msecs=1.5,
+        matrix_pipe_util=10.0,
+        vector_pipe_util=20.0,
+        memory_traffic=memory_traffic,
+        mem_util=mem_util,
+        stats_coverage=coverage,
+    )
+    device.operator_perf_map = Mock(lookup=Mock(return_value=master))
+
+    device.get_exec_stats(graph, bs=1)
+
+    st = op.exec_stats
+    assert st["lut_stats_coverage"] == coverage
+    assert st["memory_traffic"] == (None if exp_traffic is None else pytest.approx(exp_traffic))
+    assert st["mem_util"] == (None if exp_mem_util is None else pytest.approx(exp_mem_util))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("with_lut", [True, False], ids=["lut_miss", "no_lut"])
+def test_get_exec_stats_analytical_op_reports_memory_fields_not_measured(with_lut):
+    """An analytical op (LUT miss, or no LUT) measures no memory traffic: None, never 0."""
+    device = Device(MockSimConfigWithPeakIpc())
+    op = _create_stub_op("op1", "MatMul")
+    graph = _make_wlgraph(op)
+    if with_lut:
+        device.operator_perf_map = Mock(lookup=Mock(return_value=None))
+
+    device.get_exec_stats(graph, bs=1)
+
+    assert op.exec_stats["uses_perf_lookup"] is False
+    assert op.exec_stats["lut_stats_coverage"] is None
+    assert op.exec_stats["memory_traffic"] is None
+    assert op.exec_stats["mem_util"] is None
+
+
+@pytest.mark.unit
+def test_opstats_models_accept_not_measured_memory_fields():
+    from ttsim.config.validators import TTSimHLWlDevRunOperatorPerfStats, TTSimHLWlDevRunOpCSVPerfStats
+
+    for model in (TTSimHLWlDevRunOperatorPerfStats, TTSimHLWlDevRunOpCSVPerfStats):
+        for field in ("memory_traffic", "mem_util", "lut_stats_coverage"):
+            assert type(None) in getattr(model.model_fields[field].annotation, "__args__", ()), (model, field)

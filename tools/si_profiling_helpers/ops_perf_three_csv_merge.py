@@ -6,6 +6,8 @@
 Specification: doc/SPEC_ops_perf_three_csv_merge.md
 Uses stdlib **csv** for I/O (no pandas); **loguru** for warnings. Exit 0 on success, 1 on error.
 Warnings (e.g. fpuutil vs vanilla duration beyond tolerance) do not stop the merge.
+With ``--allow-missing-noctrace``, a vanilla CSV and an fpu CSV merge without the noctrace
+CSV; the noctrace-only output columns are then omitted.
 
 Two derived overhead-ratio columns are appended last (blank when raw duration is 0):
 ``FPUUtil/Raw`` = ``[ms]_fpuutil / [ms]`` and ``MemUtil/Raw`` = ``[ms]_noctrace / [ms]``.
@@ -99,6 +101,15 @@ NOCTRACE_OUTPUT_BODY: Tuple[str, ...] = (
     COL_ETH_BW_UTIL,
     COL_NPE_CONG,
     COL_DRAM_BW_UTIL,
+)
+
+# Output columns only the noctrace CSV supplies. With --allow-missing-noctrace and no
+# noctrace CSV they are omitted, never written blank: consumers read a blank cell as 0.
+NOCTRACE_ONLY_OUTPUT_COLUMNS: Tuple[str, ...] = (
+    f"{COL_DEVICE_KERNEL_NS}{NOCTRACE_OUTPUT_SUFFIX}",
+    f"{COL_DEVICE_KERNEL_MS}{NOCTRACE_OUTPUT_SUFFIX}",
+    *(f"{c}{NOCTRACE_OUTPUT_SUFFIX}" for c in NOCTRACE_OUTPUT_BODY),
+    COL_MEM_UTIL_RAW,
 )
 
 
@@ -691,15 +702,16 @@ def validate_iteration_args(
 # ops_perf_trace_replay_merge.py) can replace the default iteration reducer
 # without duplicating the shared classify / header-check / join / output
 # machinery.  When run_merge is called without a reducer it builds the default
-# iteration reducer below from its CLI iteration args.
+# iteration reducer below from its CLI iteration args.  The noctrace rows are None
+# when the merge runs without a noctrace CSV (--allow-missing-noctrace).
 Reducer = Callable[
-    [List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]],
-    Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]],
+    [Optional[List[Dict[str, str]]], List[Dict[str, str]], List[Dict[str, str]]],
+    Tuple[Optional[List[Dict[str, str]]], List[Dict[str, str]], List[Dict[str, str]]],
 ]
 
 
 def reduce_iterative(
-    rows_noc: List[Dict[str, str]],
+    rows_noc: Optional[List[Dict[str, str]]],
     rows_fpu: List[Dict[str, str]],
     rows_van: List[Dict[str, str]],
     *,
@@ -707,7 +719,7 @@ def reduce_iterative(
     cli_ops_per_iteration: Optional[int] = None,
     cli_measured_indices: Optional[List[int]] = None,
     cli_select_iteration: str = "median",
-) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
+) -> Tuple[Optional[List[Dict[str, str]]], List[Dict[str, str]], List[Dict[str, str]]]:
     """Reduce a multi-iteration capture to a single representative iteration.
 
     Detect iterations on the vanilla CSV (canonical timing), pick one iteration
@@ -732,12 +744,13 @@ def reduce_iterative(
         )
         # Sanity-check that all 3 CSVs have the same row count (synchronized iteration layout).
         for label, r in (("noctrace", rows_noc), ("fpu", rows_fpu), ("vanilla", rows_van)):
-            if len(r) != len(rows_van):
+            if r is not None and len(r) != len(rows_van):
                 raise MergeError(
                     f"Pre-filter row count differs ({label}={len(r)} vs vanilla={len(rows_van)}); "
                     "iteration layouts must be synchronized across the three variants."
                 )
-        rows_noc = filter_to_iteration(rows_noc, start, end)
+        if rows_noc is not None:
+            rows_noc = filter_to_iteration(rows_noc, start, end)
         rows_fpu = filter_to_iteration(rows_fpu, start, end)
         rows_van = filter_to_iteration(rows_van, start, end)
         logger.info(
@@ -766,13 +779,21 @@ def run_merge(
     cli_measured_indices: Optional[List[int]] = None,
     cli_select_iteration: str = "median",
     reducer: Optional[Reducer] = None,
+    allow_missing_noctrace: bool = False,
 ) -> None:
     paths = discover_csv_paths(input_dir)
-    if len(paths) != 3:
-        raise MergeError(
-            f"Expected exactly 3 CSV files under {input_dir}, found {len(paths)}: "
-            f"{', '.join(str(p) for p in paths)}"
+    if len(paths) != 3 and not (allow_missing_noctrace and len(paths) == 2):
+        expected = "2 or 3" if allow_missing_noctrace else "exactly 3"
+        hint = (
+            " Pass --allow-missing-noctrace to merge a vanilla CSV and an fpu CSV without the noctrace CSV."
+            if len(paths) == 2 and not allow_missing_noctrace
+            else ""
         )
+        raise MergeError(
+            f"Expected {expected} CSV files under {input_dir}, found {len(paths)}: "
+            f"{', '.join(str(p) for p in paths)}.{hint}"
+        )
+    missing_noctrace = len(paths) == 2
 
     loaded: List[Tuple[Path, Tuple[str, ...], List[Dict[str, str]]]] = []
     path_kind: Dict[Path, str] = {}
@@ -823,31 +844,46 @@ def run_merge(
             ps[2],
         )
 
-    for kind in ("noctrace", "fpu", "vanilla"):
+    # With two files, exactly one fpu and one vanilla CSV leaves no noctrace CSV.
+    for kind in ("fpu", "vanilla") if missing_noctrace else ("noctrace", "fpu", "vanilla"):
         ps = by_kind[kind]
         if len(ps) != 1:
             raise MergeError(
                 f"Expected exactly one {kind} CSV, found {len(ps)}: {', '.join(str(x) for x in ps)}"
             )
 
-    path_noc = by_kind["noctrace"][0]
+    path_noc = None if missing_noctrace else by_kind["noctrace"][0]
     path_fpu = by_kind["fpu"][0]
     path_van = by_kind["vanilla"][0]
 
-    h_noc = next(h for p, h, _ in loaded if p == path_noc)
     h_fpu = next(h for p, h, _ in loaded if p == path_fpu)
     h_van = next(h for p, h, _ in loaded if p == path_van)
 
-    assert_fpu_header_extends_noctrace(h_noc, h_fpu, path_fpu)
-    assert_vanilla_header_matches_noctrace(h_noc, h_van, path_van)
-
-    header = h_noc
+    rows_noc: Optional[List[Dict[str, str]]] = None
+    if path_noc is not None:
+        h_noc = next(h for p, h, _ in loaded if p == path_noc)
+        assert_fpu_header_extends_noctrace(h_noc, h_fpu, path_fpu)
+        assert_vanilla_header_matches_noctrace(h_noc, h_van, path_van)
+        header = h_noc
+        known_cols = set(h_noc)
+        rows_noc = next(r for p, _, r in loaded if p == path_noc)
+    else:
+        # The vanilla header stands in for the noctrace header. In tt-metal captures the two
+        # are identical (neither carries the FPU/SFPU util columns), so the base and
+        # fpu-only output columns match a three-CSV merge.
+        assert_fpu_header_extends_noctrace(h_van, h_fpu, path_fpu)
+        header = h_van
+        known_cols = set(h_van)
+        logger.warning(
+            "No noctrace CSV under {!s} (--allow-missing-noctrace): omitting {}. The output has no "
+            "NOC-trace data and cannot build a LUT.",
+            input_dir,
+            ", ".join(NOCTRACE_ONLY_OUTPUT_COLUMNS),
+        )
     # Fpu-only columns identified by name (not position): tt-metal may splice the
     # perf-counter analysis block before trailing op-type columns that noctrace also
     # carries, so the extras are not a positional suffix. Preserve fpu column order.
-    _noc_set = set(h_noc)
-    fpu_trailing_cols: Tuple[str, ...] = tuple(c for c in h_fpu if c not in _noc_set)
-    rows_noc = next(r for p, _, r in loaded if p == path_noc)
+    fpu_trailing_cols: Tuple[str, ...] = tuple(c for c in h_fpu if c not in known_cols)
     rows_fpu = next(r for p, _, r in loaded if p == path_fpu)
     rows_van = next(r for p, _, r in loaded if p == path_van)
 
@@ -866,14 +902,19 @@ def run_merge(
         )
     rows_noc, rows_fpu, rows_van = reducer(rows_noc, rows_fpu, rows_van)
 
-    if len(rows_noc) != len(rows_fpu) or len(rows_noc) != len(rows_van):
+    if (rows_noc is not None and len(rows_noc) != len(rows_van)) or len(rows_fpu) != len(rows_van):
+        n_noc = "-" if rows_noc is None else str(len(rows_noc))
         raise MergeError(
-            f"Row count mismatch: noctrace={len(rows_noc)} fpu={len(rows_fpu)} vanilla={len(rows_van)}"
+            f"Row count mismatch: noctrace={n_noc} fpu={len(rows_fpu)} vanilla={len(rows_van)}"
         )
 
-    rows_noc_s, keys_noc = sort_rows_by_key(list(rows_noc), path_noc)
     rows_fpu_s, keys_fpu = sort_rows_by_key(list(rows_fpu), path_fpu)
     rows_van_s, keys_van = sort_rows_by_key(list(rows_van), path_van)
+    # Without a noctrace CSV the vanilla keys stand in, so the join checks reduce to fpu vs vanilla.
+    rows_noc_s: Optional[List[Dict[str, str]]] = None
+    keys_noc = keys_van
+    if rows_noc is not None and path_noc is not None:
+        rows_noc_s, keys_noc = sort_rows_by_key(list(rows_noc), path_noc)
 
     set_noc = set(keys_noc)
     set_fpu = set(keys_fpu)
@@ -888,14 +929,14 @@ def run_merge(
     total_vanilla_kernel_ns = 0.0
     warned_missing_noctrace_dram = False
 
-    for i in range(len(rows_noc_s)):
+    for i in range(len(rows_van_s)):
         kn, kf, kv = keys_noc[i], keys_fpu[i], keys_van[i]
         if not (keys_equal(kn, kf) and keys_equal(kn, kv)):
             raise MergeError(
                 f"Join key mismatch at sorted row index {i}: noctrace={kn!r} fpu={kf!r} vanilla={kv!r}"
             )
 
-        rn = rows_noc_s[i]
+        rn = None if rows_noc_s is None else rows_noc_s[i]
         rf = rows_fpu_s[i]
         rv = rows_van_s[i]
 
@@ -930,27 +971,28 @@ def run_merge(
                     duration_rel_tol,
                 )
 
-        u_dram = parse_finite_float(rn.get(COL_DRAM_BW_UTIL))
-        if u_dram is None:
-            if not warned_missing_noctrace_dram:
-                logger.warning(
-                    "Noctrace CSV {!s} has blank or unparsable {!r} on at least one row; using 0 "
-                    "for MemTraffic for those rows.",
-                    path_noc,
-                    COL_DRAM_BW_UTIL,
+        if rn is not None:
+            u_dram = parse_finite_float(rn.get(COL_DRAM_BW_UTIL))
+            if u_dram is None:
+                if not warned_missing_noctrace_dram:
+                    logger.warning(
+                        "Noctrace CSV {!s} has blank or unparsable {!r} on at least one row; using 0 "
+                        "for MemTraffic for those rows.",
+                        path_noc,
+                        COL_DRAM_BW_UTIL,
+                    )
+                    warned_missing_noctrace_dram = True
+                u_dram_f = 0.0
+            else:
+                u_dram_f = float(u_dram)
+            ns_noc = parse_finite_float(rn.get(COL_DEVICE_KERNEL_NS))
+            if ns_noc is None:
+                raise MergeError(
+                    f"{COL_DEVICE_KERNEL_NS!r} must be finite on noctrace row index {i}: {path_noc}"
                 )
-                warned_missing_noctrace_dram = True
-            u_dram_f = 0.0
-        else:
-            u_dram_f = float(u_dram)
-        ns_noc = parse_finite_float(rn.get(COL_DEVICE_KERNEL_NS))
-        if ns_noc is None:
-            raise MergeError(
-                f"{COL_DEVICE_KERNEL_NS!r} must be finite on noctrace row index {i}: {path_noc}"
-            )
-        mem_traffic = round((u_dram_f / 100.0) * dram_bps * (float(ns_noc) / 1e9))
+            mem_traffic = round((u_dram_f / 100.0) * dram_bps * (float(ns_noc) / 1e9))
+            ms_noc = float(ns_noc) / 1e6
 
-        ms_noc = float(ns_noc) / 1e6
         ms_fpu = float(parse_finite_float(rf.get(COL_DEVICE_KERNEL_NS)) or 0.0) / 1e6
         # vanilla canonical ns/ms from vanilla row
         van_ns_num = float(van_ns_v)
@@ -972,13 +1014,14 @@ def run_merge(
         out[COL_DEVICE_KERNEL_NS] = _strip_cell(rv.get(COL_DEVICE_KERNEL_NS, ""))
         out[COL_DEVICE_KERNEL_MS] = str(ms_van)
 
-        out[f"{COL_DEVICE_KERNEL_NS}{NOCTRACE_OUTPUT_SUFFIX}"] = _strip_cell(
-            rn.get(COL_DEVICE_KERNEL_NS, "")
-        )
-        out[f"{COL_DEVICE_KERNEL_MS}{NOCTRACE_OUTPUT_SUFFIX}"] = str(ms_noc)
-        out[f"MemTraffic{NOCTRACE_OUTPUT_SUFFIX}"] = str(mem_traffic)
-        for c in NOCTRACE_OUTPUT_BODY[1:]:
-            out[f"{c}{NOCTRACE_OUTPUT_SUFFIX}"] = _strip_cell(rn.get(c, ""))
+        if rn is not None:
+            out[f"{COL_DEVICE_KERNEL_NS}{NOCTRACE_OUTPUT_SUFFIX}"] = _strip_cell(
+                rn.get(COL_DEVICE_KERNEL_NS, "")
+            )
+            out[f"{COL_DEVICE_KERNEL_MS}{NOCTRACE_OUTPUT_SUFFIX}"] = str(ms_noc)
+            out[f"MemTraffic{NOCTRACE_OUTPUT_SUFFIX}"] = str(mem_traffic)
+            for c in NOCTRACE_OUTPUT_BODY[1:]:
+                out[f"{c}{NOCTRACE_OUTPUT_SUFFIX}"] = _strip_cell(rn.get(c, ""))
 
         out[f"{COL_DEVICE_KERNEL_NS}{FPU_OUTPUT_SUFFIX}"] = _strip_cell(
             rf.get(COL_DEVICE_KERNEL_NS, "")
@@ -995,7 +1038,8 @@ def run_merge(
 
         # Derived overhead ratios (blank when raw duration is 0 -> no division).
         out[COL_FPU_UTIL_RAW] = "" if ms_van == 0.0 else str(ms_fpu / ms_van)
-        out[COL_MEM_UTIL_RAW] = "" if ms_van == 0.0 else str(ms_noc / ms_van)
+        if rn is not None:
+            out[COL_MEM_UTIL_RAW] = "" if ms_van == 0.0 else str(ms_noc / ms_van)
 
         out_rows.append(out)
 
@@ -1019,6 +1063,8 @@ def run_merge(
     # Derived overhead ratios, appended last.
     fieldnames.append(COL_FPU_UTIL_RAW)
     fieldnames.append(COL_MEM_UTIL_RAW)
+    if rows_noc_s is None:
+        fieldnames = [c for c in fieldnames if c not in NOCTRACE_ONLY_OUTPUT_COLUMNS]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding=encoding) as f:
@@ -1062,6 +1108,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "Root directory; recursively discovers exactly three ops_perf_results_*.csv files "
+            "(two with --allow-missing-noctrace) "
             "(falls back to *.csv when none match), classified by content."
         ),
     )
@@ -1129,6 +1176,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "iteration with median total DEVICE KERNEL DURATION [ns]."
         ),
     )
+    p.add_argument(
+        "--allow-missing-noctrace",
+        action="store_true",
+        help=(
+            "Accept a vanilla CSV and an fpu CSV without the noctrace CSV. The output omits the "
+            "noctrace-only columns (the _noctrace block and MemUtil/Raw) and cannot build a LUT."
+        ),
+    )
     return p
 
 
@@ -1169,6 +1224,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cli_ops_per_iteration=args.ops_per_iteration,
             cli_measured_indices=measured,
             cli_select_iteration=args.select_iteration,
+            allow_missing_noctrace=args.allow_missing_noctrace,
         )
     except MergeError as e:
         print(str(e), file=sys.stderr)
