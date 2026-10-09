@@ -52,6 +52,13 @@ PROFILER_PREFIX_RULES: tuple[tuple[str, str], ...] = (
     ("NLPCreateQKVHeads", "createqkvheads"),
     ("CreateQKVHeadsDeviceOperation", "createqkvheads"),  # Profiler form → canonical
     ("CreateQKVHeads", "createqkvheads"),
+    # NlpCreateHeadsDeviceOperation is ttnn.experimental.nlp_create_qkv_heads (the shim's
+    # CreateQKVHeads). The Boltz/Segformer/Vit variants are distinct kernels with their own
+    # APIs: keep their own canonical (must precede the bare NlpCreateHeads prefix).
+    ("NlpCreateHeadsBoltz", "nlpcreateheadsboltz"),
+    ("NlpCreateHeadsSegformer", "nlpcreateheadssegformer"),
+    ("NlpCreateHeadsVit", "nlpcreateheadsvit"),
+    ("NlpCreateHeads", "createqkvheads"),
     ("NLPConcatHeads", "concatheads"),
     ("ConcatHeads", "concatheads"),
     # llama3/transformer ops — canonical = lowercased shim optype (ttsim/front/ttnn) so
@@ -79,6 +86,7 @@ PROFILER_PREFIX_RULES: tuple[tuple[str, str], ...] = (
     ("Permute", "permute"),
     ("Typecast", "typecast"),
     ("Concat", "concat"),
+    ("Copy", "copy"),  # CopyDeviceOperation (data_movement/copy)
     ("Split", "split"),
     ("Slice", "slice"),
     ("Embedding", "embedding"),
