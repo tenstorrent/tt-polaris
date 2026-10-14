@@ -521,6 +521,35 @@ def halo_sinf(iTList, oTList, op, **kwargs):
     return
 
 
+def copy_sinf(iTList, oTList, op, **kwargs):
+    """Shape inference for Copy: logical shape passthrough.
+
+    tt-metal's CopyDeviceOperation copies a tensor to another memory config (to_memory_config
+    falls back to it for an interleaved-to-interleaved change). Shape and dtype are unchanged;
+    cost is one read and one write of the tensor.
+    """
+    assert len(iTList) == 1 and len(oTList) == 1
+    X = iTList[0]
+    in_shape = require_shape_list(
+        X.shape,
+        'Copy shape inference: input tensor shape must be known',
+    )
+    oTList[0].shape = list(in_shape)
+    oTList[0].dtype = X.dtype
+    oTList[0].hw_shape = getattr(X, 'hw_shape', None)  # propagate NHWC-flattened hw shape
+
+    elem_size = op.attrs.get('element_size', 2)
+    elems = _nelems(in_shape)
+    op.perf_stats = {
+        'inElems': elems,
+        'outElems': elems,
+        'inBytes': elems * elem_size,
+        'outBytes': elems * elem_size,
+        'instrs': {'mov': elems},
+    }
+    return
+
+
 def move_sinf(iTList, oTList, op, **kwargs):
     """Shape inference for Move: logical shape passthrough.
 
@@ -826,6 +855,7 @@ def register_layout_ops():
         ['Reshard', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, reshard_sinf, True, True, True, True, True],
         ['Halo', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, halo_sinf, True, True, True, True, True],
         ['Move', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, move_sinf, True, True, True, True, True],
+        ['Copy', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, copy_sinf, True, True, True, True, True],
         ['ConcatHeads', 'ARITY_1->1', d, 'COMMON', 24, 21, 1, 1, 1, 1, nlp_concat_heads_sinf, True, True, True, True, True],
         ['CreateQKVHeads', 'ARITY_VARIADIC[1-2]->3', d, 'COMMON', 24, 21, 2, 1, 3, 3, nlp_create_qkv_heads_sinf, True, True, True, True, True],
         ['RotaryEmbeddingLlama', 'ARITY_VARIADIC[1-4]->1', d, 'COMMON', 24, 21, 4, 1, 1, 1, rotary_embedding_llama_sinf, True, True, True, True, True],
