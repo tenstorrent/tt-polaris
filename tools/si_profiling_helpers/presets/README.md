@@ -51,7 +51,8 @@ producing `raw/`, `perf/`, and `trace/` CSVs under the `RUNID` output directory.
 > `--merge-variant`: **`iterative`** (`ops_perf_three_csv_merge.py`, the default — for
 > multi-iteration workloads like **VGG UNet**) or **`trace_replay`**
 > (`ops_perf_trace_replay_merge.py` — for non-iterative trace+replay workloads like **ViT**
-> and **llama3**, which have a single compile pass + replay session(s), no iteration loop).
+> and **llama3**, which have a prologue followed by replayed steps, no iteration loop; it keeps
+> one step, including any eager ops that run after each replay).
 > The `vit/` and `llama3/` presets pass `--merge-variant trace_replay`; `vggunet/` uses the
 > default. Both tools are
 > co-located with these presets (one directory up), so they ship with the rsynced bundle and

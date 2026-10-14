@@ -3,7 +3,7 @@
 """Tests for the trace+replay merge sibling (ops_perf_trace_replay_merge.py).
 
 Focus is the reduction step that differs from the iterative tool: dropping the
-compile/warmup pass and selecting one replay session so join keys are unique.
+prologue and capture rows and selecting one step so join keys are unique.
 The shared classify/join/output machinery is covered by
 test_ops_perf_three_csv_merge.py and is exercised here only end-to-end.
 """
@@ -14,11 +14,12 @@ import pytest
 
 from tools.si_profiling_helpers.ops_perf_trace_replay_merge import (
     COL_REPLAY_SESSION_ID,
+    COL_TRACE_ID,
     MergeError,
     main,
     reduce_trace_replay,
-    replay_session_ids,
-    select_replay_session,
+    select_step,
+    split_steps,
 )
 
 # ---------------------------------------------------------------------------
@@ -29,18 +30,53 @@ _TR_COLS = [
     'GLOBAL CALL COUNT', 'OP CODE', 'OP TYPE', 'DEVICE KERNEL DURATION [ns]',
     'DRAM BW UTIL (%)', 'FPU Util Median (%)', 'SFPU Util Median (%)',
     'NOC UTIL (%)', 'MULTICAST NOC UTIL (%)', 'ETH BW UTIL (%)', 'NPE CONG IMPACT (%)',
-    COL_REPLAY_SESSION_ID,
+    COL_REPLAY_SESSION_ID, COL_TRACE_ID,
 ]
 
 
-def _tr_row(gcc, op, ns, rsid, dram='', fpu=''):
+def _tr_row(gcc, op, ns, rsid, dram='', fpu='', tid=''):
     return {
         'GLOBAL CALL COUNT': str(gcc), 'OP CODE': op, 'OP TYPE': 'op',
         'DEVICE KERNEL DURATION [ns]': str(ns), 'DRAM BW UTIL (%)': dram,
         'FPU Util Median (%)': fpu, 'SFPU Util Median (%)': '',
         'NOC UTIL (%)': '', 'MULTICAST NOC UTIL (%)': '', 'ETH BW UTIL (%)': '',
         'NPE CONG IMPACT (%)': '', COL_REPLAY_SESSION_ID: rsid,
+        COL_TRACE_ID: tid if rsid else '',
     }
+
+
+def _keys(rows):
+    return [(r['GLOBAL CALL COUNT'], r['OP CODE'], r['OP TYPE']) for r in rows]
+
+
+def _is_capture(r):
+    return not r[COL_REPLAY_SESSION_ID] and not r['DEVICE KERNEL DURATION [ns]']
+
+
+class _Gcc:
+    """Fresh, monotonically increasing GLOBAL CALL COUNTs for eager ops."""
+
+    def __init__(self, start=5000):
+        self.n = start
+
+    def __call__(self):
+        self.n += 1
+        return self.n
+
+
+def _prefill_like(tails, replay=(('1024', 'Emb'), ('2048', 'Layer')), tail_ns=50):
+    """A prefill-shaped capture: a prologue (setup + eager compile + capture rows),
+    then one step per entry of ``tails``: a replay session of trace 0 followed by
+    that tail's eager ops (fresh GCCs).  Replay sessions reuse the replay GCCs.
+    """
+    gcc = _Gcc()
+    rows = [_tr_row(gcc(), 'Tilize', 1, '')]  # one-time setup
+    rows += [_tr_row(gcc(), op, 9, '') for _, op in replay]  # eager compile run
+    rows += [_tr_row(g, op, '', '') for g, op in replay]  # capture rows: no duration
+    for i, tail in enumerate(tails, start=1):
+        rows += [_tr_row(g, op, 10, str(i), tid='0') for g, op in replay]
+        rows += [_tr_row(gcc(), op, tail_ns, '') for op in tail]
+    return rows
 
 
 def _capture_rows(ns_by_session, ops=(('1024', 'Matmul'), ('2048', 'Add')), dram='', fpu=''):
@@ -58,41 +94,68 @@ def _capture_rows(ns_by_session, ops=(('1024', 'Matmul'), ('2048', 'Add')), dram
 
 
 # ---------------------------------------------------------------------------
-# replay_session_ids / select_replay_session
+# split_steps / select_step
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_replay_session_ids_distinct_in_capture_order():
+def test_split_steps_one_step_per_session_prologue_dropped():
     rows = _capture_rows({'': 999, '1': 100, '2': 200})
-    assert replay_session_ids(rows) == ['1', '2']  # blank excluded, first-appearance order
+    steps = split_steps(rows)
+    assert [{r[COL_REPLAY_SESSION_ID] for r in s} for s in steps] == [{'1'}, {'2'}]
 
 
 @pytest.mark.unit
-def test_select_replay_session_median_lower_middle():
-    # session '1' total < session '2' total -> median (lower-middle of 2) picks '1'.
-    rows = _capture_rows({'': 999, '1': 100, '2': 200})
-    assert select_replay_session(rows, 'median') == '1'
+def test_select_step_median_lower_middle():
+    # step 0 total < step 1 total -> median (lower-middle of 2) picks step 0.
+    steps = split_steps(_capture_rows({'': 999, '1': 100, '2': 200}))
+    assert select_step(steps, 'median') == 0
 
 
 @pytest.mark.unit
-def test_select_replay_session_min_max():
-    rows = _capture_rows({'': 999, '1': 100, '2': 200})
-    assert select_replay_session(rows, 'min') == '1'
-    assert select_replay_session(rows, 'max') == '2'
+def test_select_step_min_max():
+    steps = split_steps(_capture_rows({'': 999, '1': 100, '2': 200}))
+    assert select_step(steps, 'min') == 0
+    assert select_step(steps, 'max') == 1
 
 
 @pytest.mark.unit
-def test_select_replay_session_first_last_capture_order():
-    rows = _capture_rows({'': 999, '2': 200, '1': 100})  # session 2 appears first
-    assert select_replay_session(rows, 'first') == '2'
-    assert select_replay_session(rows, 'last') == '1'
+def test_select_step_first_last_capture_order():
+    steps = split_steps(_capture_rows({'': 999, '2': 200, '1': 100}))  # session 2 appears first
+    assert steps[select_step(steps, 'first')][0][COL_REPLAY_SESSION_ID] == '2'
+    assert steps[select_step(steps, 'last')][0][COL_REPLAY_SESSION_ID] == '1'
 
 
 @pytest.mark.unit
-def test_select_replay_session_no_sessions_raises():
+def test_split_steps_no_sessions_raises():
     rows = _capture_rows({'': 999})  # compile pass only, no replay session
     with pytest.raises(MergeError, match='trace\\+replay'):
-        select_replay_session(rows, 'median')
+        split_steps(rows)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('select', ['last', 'first', 'median', 'min', 'max'])
+def test_select_step_never_picks_a_non_modal_step(select):
+    # Warmup-like first steps carry a longer tail; with any selection the chosen
+    # step has the most frequent signature.
+    rows = _prefill_like([['Norm', 'Pen', 'TopK'], ['Norm', 'TopK'], ['Norm', 'TopK'], ['Norm', 'TopK']])
+    steps = split_steps(rows)
+    sigs = [tuple(r['OP CODE'] for r in s) for s in steps]
+    modal = max(set(sigs), key=sigs.count)
+    assert sigs[select_step(steps, select)] == modal
+
+
+@pytest.mark.unit
+def test_select_step_last_not_modal_raises():
+    rows = _prefill_like([['Norm', 'TopK'], ['Norm', 'TopK'], ['Norm', 'TopK', 'Extra']])
+    with pytest.raises(MergeError, match='last step'):
+        select_step(split_steps(rows), 'last')
+
+
+@pytest.mark.unit
+def test_select_step_tie_raises():
+    rows = _prefill_like([['Norm', 'Pen', 'TopK'], ['Norm', 'TopK']])
+    with pytest.raises(MergeError, match='most frequent'):
+        select_step(split_steps(rows), 'median')
 
 
 # ---------------------------------------------------------------------------
@@ -103,14 +166,101 @@ def test_select_replay_session_no_sessions_raises():
 def test_reduce_trace_replay_drops_compile_and_selects_one_session():
     rows = _capture_rows({'': 999, '1': 100, '2': 200})
     noc, fpu, van = reduce_trace_replay(list(rows), list(rows), list(rows))
-    # 2 ops kept (one session), compile pass and the other session dropped.
+    # 2 ops kept (one step), compile pass and the other session dropped.
     assert len(van) == 2
-    # median picks session '1' (lower total) -> its distinguishing ns=100 survives.
-    assert {r['DEVICE KERNEL DURATION [ns]'] for r in van} == {'100'}
-    # join keys are now unique.
-    keys = [(r['GLOBAL CALL COUNT'], r['OP CODE'], r['OP TYPE']) for r in van]
-    assert len(keys) == len(set(keys))
+    # the default selects the first candidate step -> session '1', ns=100.
+    assert {r[COL_REPLAY_SESSION_ID] for r in van} == {'1'}
+    assert len(set(_keys(van))) == len(van)
     assert len(noc) == len(fpu) == len(van)
+
+
+@pytest.mark.unit
+def test_reduce_trace_replay_step_includes_eager_tail():
+    rows = _prefill_like([['Norm', 'TopK'], ['Norm', 'TopK']])
+    _, _, van = reduce_trace_replay(list(rows), list(rows), list(rows), select_session='last')
+    last_replay_row = max(i for i, r in enumerate(rows) if r[COL_REPLAY_SESSION_ID] == '2')
+    # The kept rows are the last replay session followed by the eager rows after it.
+    assert van == [r for r in rows if r[COL_REPLAY_SESSION_ID] == '2'] + rows[last_replay_row + 1:]
+    assert len(set(_keys(van))) == len(van)
+
+
+@pytest.mark.unit
+def test_reduce_trace_replay_drops_prologue_and_capture_rows():
+    # Every step also carries a capture row (e.g. another trace being captured);
+    # neither those nor any prologue row may reach the output.
+    rows = _prefill_like([['Norm', 'TopK'], ['Norm', 'TopK'], ['Norm', 'TopK']])
+    first_replay = next(i for i, r in enumerate(rows) if r[COL_REPLAY_SESSION_ID])
+    prologue = rows[:first_replay]
+    for i in reversed([i for i, r in enumerate(rows) if r['OP CODE'] == 'Norm']):
+        rows.insert(i, _tr_row(90000 + i, 'Captured', '', ''))
+    for select in ('last', 'first', 'median'):
+        _, _, van = reduce_trace_replay(list(rows), list(rows), list(rows), select_session=select)
+        assert not any(_is_capture(r) for r in van)
+        assert not any(r in van for r in prologue)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('bad_ns', ['-', 'nan', 'inf', 'n/a'])
+def test_eager_row_with_malformed_duration_is_kept(bad_ns):
+    # Only a blank duration cell marks a capture row. An eager tail row with a
+    # malformed duration must stay in its step, so the merge's duration check
+    # reports it instead of the row vanishing from the output.
+    rows = _prefill_like([['Norm', 'TopK'], ['Norm', 'TopK']])
+    last_topk = max(i for i, r in enumerate(rows) if r['OP CODE'] == 'TopK')
+    rows[last_topk]['DEVICE KERNEL DURATION [ns]'] = bad_ns
+    _, _, van = reduce_trace_replay(list(rows), list(rows), list(rows), select_session='last')
+    assert rows[last_topk] in van
+
+
+@pytest.mark.unit
+def test_main_reports_malformed_eager_duration(tmp_path, capsys):
+    # End to end: an op whose duration is malformed in every step keeps all steps'
+    # signatures identical, so dropping it as a capture row would merge silently
+    # without that op. Instead it must reach the duration validation and fail loudly.
+    def capture(**kw):
+        rows = _prefill_like([['Norm', 'TopK'], ['Norm', 'TopK']])
+        for r in rows:
+            r.update(kw)
+            if r['OP CODE'] == 'TopK':
+                r['DEVICE KERNEL DURATION [ns]'] = '-'
+        return rows
+
+    _write_csv(tmp_path / 'trace.csv', capture(**{'DRAM BW UTIL (%)': '45.2'}))
+    _write_csv(tmp_path / 'perf.csv', capture(**{'FPU Util Median (%)': '62.1'}))
+    _write_csv(tmp_path / 'raw.csv', capture())
+    rc = main(['--input-dir', str(tmp_path), '--dram-peak-bw-gbps', '288.0',
+               '--output', str(tmp_path / 'merged_ops.csv'), '--duration-rel-tol', '1e9'])
+    assert rc == 1
+    assert 'DEVICE KERNEL DURATION [ns]' in capsys.readouterr().err
+    assert not (tmp_path / 'merged_ops.csv').exists()
+
+
+@pytest.mark.unit
+def test_reduce_trace_replay_no_eager_rows_matches_session_filter():
+    # Decode-shaped: each step is a replay of trace 0 then a replay of trace 1
+    # (traced sampling); no eager rows between sessions.  The step reducer must
+    # reproduce a plain filter on the selected session id.
+    gcc = _Gcc()
+    fwd, samp = [('1024', 'Emb'), ('2048', 'PlusOne')], [('3072', 'Sampling')]
+    rows = [_tr_row(gcc(), op, 9, '') for _, op in fwd]  # eager compile
+    rows += [_tr_row(g, op, '', '') for g, op in fwd]  # capture trace 0
+    rows += [_tr_row(gcc(), op, 9, '') for _, op in samp]  # eager sampling
+    rows += [_tr_row(g, op, '', '') for g, op in samp]  # capture trace 1
+    for sid in ('1', '2'):
+        rows += [_tr_row(g, op, 10, sid, tid='0') for g, op in fwd]
+        rows += [_tr_row(g, op, 20, sid, tid='1') for g, op in samp]
+    for select in ('last', 'first'):
+        _, _, van = reduce_trace_replay(list(rows), list(rows), list(rows), select_session=select)
+        sid = '2' if select == 'last' else '1'
+        assert van == [r for r in rows if r[COL_REPLAY_SESSION_ID] == sid]
+
+
+@pytest.mark.unit
+def test_reduce_trace_replay_step_count_mismatch_raises():
+    rows = _prefill_like([['Norm'], ['Norm']])
+    short = _prefill_like([['Norm']])
+    with pytest.raises(MergeError, match='Step count differs'):
+        reduce_trace_replay(list(rows), list(rows), short)
 
 
 @pytest.mark.unit
@@ -180,10 +330,10 @@ def test_main_merges_trace_replay_capture(tmp_path):
 
     with out.open(newline='') as fh:
         rows = list(csv.DictReader(fh))
-    assert len(rows) == 2  # one replay session, compile pass dropped
+    assert len(rows) == 2  # one step, compile pass dropped
     keys = [(r['GLOBAL CALL COUNT'], r['OP CODE'], r['OP TYPE']) for r in rows]
     assert len(keys) == len(set(keys))  # unique -> join did not abort
-    # median selected session '1' (lower total); its vanilla ns is canonical.
+    # the default selects the first candidate step (session '1'); its vanilla ns is canonical.
     assert {r['DEVICE KERNEL DURATION [ns]'] for r in rows} == {'100'}
 
 

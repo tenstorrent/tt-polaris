@@ -8,35 +8,46 @@ Specification: doc/SPEC_ops_perf_trace_replay_merge.md
 This is the trace+replay sibling of ``ops_perf_three_csv_merge.py`` (the iterative,
 VGG-style merge).  It reuses that module's classify / header-check / join / output
 machinery verbatim and only swaps the *row-reduction* step: instead of detecting
-and selecting one iteration, it selects one **replay session** and drops the
-compile/warmup pass, so the join keys are unique.
+and selecting one iteration, it selects one **step** (defined below), so the join
+keys are unique.
 
 Why a separate reducer
 ----------------------
 A trace+replay capture (ViT, llama3 decode/prefill) is *not* the concatenation of
-equal-size iterations that the iterative reducer expects.  It is one warmup/compile
-pass followed by N replays of a captured trace.  TT-Metal tags each op with
-``METAL TRACE REPLAY SESSION ID``:
+equal-size iterations that the iterative reducer expects.  It is a prologue (setup
+ops, an eager compile run of the traced region, and the trace-capture rows)
+followed by N replays of the captured trace.  TT-Metal tags each replayed op with
+``METAL TRACE ID`` and ``METAL TRACE REPLAY SESSION ID``; replays of one trace reuse
+identical ``(GLOBAL CALL COUNT, OP CODE, OP TYPE)`` join keys, while eager ops always
+get fresh ones.
 
-* ``''`` (blank)  -> the compile/warmup pass (ops dispatched individually before the
-  trace is captured); its op set overlaps the replay op set, so keeping it makes the
-  ``(GLOBAL CALL COUNT, OP CODE, OP TYPE)`` join key non-unique.
-* ``'1'``, ``'2'``, ...  -> successive replays of the captured trace; within any one
-  replay session the join keys are unique and identical across the raw/perf/trace
-  variants.
+Not every op of a model step is traced.  In llama3 prefill only the embeddings and
+decoder layers are traced; the final norm, LM head and sampling run eagerly after
+each replay and carry a blank session id.  In llama3 decode, sampling is a second
+trace replayed right after the first.  So one step is not one replay session:
 
-The iterative reducer's first-op marker heuristic mis-fires here (the marker recurs
-intra-pass, giving unequal chunks), and the downstream join then aborts on the
-duplicate key.  This reducer instead keeps exactly one replay session — steady-state,
-compile cost excluded — and hands unique keys to the shared join.
+* **capture row** — blank session id and blank device kernel duration (recorded
+  while a trace is captured; nothing ran on device).  Always dropped.
+* **step** — one replay session of the *first replayed trace*, plus every following
+  row up to that trace's next replay session (eager rows and other traces' replays
+  included, capture rows excluded).  Rows before the first step are the prologue
+  and are dropped.
+* **step signature** — the step's ordered ``OP CODE`` sequence.
+
+Only steps with the most frequent signature are candidates, which excludes warmup
+variants (e.g. first steps with sampling penalties) and steps that contain another
+trace's compile run.  The default selection is the **first** candidate step.  In
+llama3 decode NOC traces, the last replay session under-reports DRAM traffic while
+its kernel time is unchanged; the first candidate carries plausible DRAM values.
+``last`` selects the demo's measured call (the final one) when that is wanted.
 
 Composition (trace+replay+iterative)
 ------------------------------------
-If a future capture is trace+replay **and** iterative (a replay session that itself
-contains several concatenated iterations), the selected session's join keys will not
-be unique.  In that case (unless ``--no-compose-iteration``) the iterative reducer is
-applied *within* the selected session, composing the two reductions.  For the common
-one-inference-per-session case the keys are already unique and no iteration reduction
+If a future capture is trace+replay **and** iterative (a step that itself contains
+several concatenated iterations), the selected step's join keys will not be unique.
+In that case (unless ``--no-compose-iteration``) the iterative reducer is applied
+*within* the selected step, composing the two reductions.  For the common
+one-inference-per-step case the keys are already unique and no iteration reduction
 runs (so the iterative marker heuristic — and its warning — is never triggered).
 
 Uses stdlib **csv**; **loguru** for warnings/info.  Exit 0 on success, 1 on error.
@@ -45,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -73,72 +85,109 @@ reduce_iterative = _merge.reduce_iterative
 run_merge = _merge.run_merge
 _strip_cell = _merge._strip_cell
 
-# TT-Metal tags each op with the replay session it belongs to; the compile/warmup
-# pass carries a blank id.  (METAL TRACE ID also exists but is not needed for
-# reduction — the replay session id alone discriminates warmup from each replay.)
+# TT-Metal tags each replayed op with its trace and replay session; eager ops and
+# capture rows carry a blank session id.
 COL_REPLAY_SESSION_ID = "METAL TRACE REPLAY SESSION ID"
+COL_TRACE_ID = "METAL TRACE ID"
 
-SESSION_SELECT_CHOICES: Tuple[str, ...] = ("median", "min", "max", "first", "last")
+SESSION_SELECT_CHOICES: Tuple[str, ...] = ("first", "last", "median", "min", "max")
 
 
 def _session_id(row: Dict[str, str]) -> str:
-    """Stripped replay-session id for a row ('' = compile/warmup pass)."""
+    """Stripped replay-session id for a row ('' = eager op or capture row)."""
     return _strip_cell(row.get(COL_REPLAY_SESSION_ID))
 
 
-def replay_session_ids(rows: Sequence[Dict[str, str]]) -> List[str]:
-    """Distinct non-blank replay-session ids, in first-appearance (capture) order."""
-    seen: set = set()
-    out: List[str] = []
-    for r in rows:
-        sid = _session_id(r)
-        if sid and sid not in seen:
-            seen.add(sid)
-            out.append(sid)
-    return out
+def _trace_id(row: Dict[str, str]) -> str:
+    """Stripped trace id for a row ('' when the column is absent or blank)."""
+    return _strip_cell(row.get(COL_TRACE_ID))
 
 
-def _session_total_kdur_ns(rows: Sequence[Dict[str, str]], sid: str) -> float:
-    """Sum of DEVICE KERNEL DURATION [ns] over the rows of one replay session."""
-    total = 0.0
-    for r in rows:
-        if _session_id(r) == sid:
-            v = parse_finite_float(r.get(COL_DEVICE_KERNEL_NS))
-            if v is not None:
-                total += v
-    return total
+def _is_capture_row(row: Dict[str, str]) -> bool:
+    """True for a trace-capture row: blank session id and a blank device kernel duration.
 
-
-def select_replay_session(rows_van: Sequence[Dict[str, str]], select: str) -> str:
-    """Return the replay-session id to keep, chosen from the vanilla CSV.
-
-    Selection vocabulary matches the iterative tool's ``--select-iteration``:
-      * ``median`` — lower-middle by total kernel ns (stable; the default).
-      * ``min`` / ``max`` — least / greatest total kernel ns.
-      * ``first`` / ``last`` — earliest / latest replay session in capture order.
-
-    The compile/warmup pass (blank session id) is never a candidate.
+    Only a blank duration cell marks a capture row. An eager row with a malformed duration
+    ('-', 'nan', non-numeric) is kept, so the merge's duration validation reports it.
     """
-    sessions = replay_session_ids(rows_van)
-    if not sessions:
+    return not _session_id(row) and not _strip_cell(row.get(COL_DEVICE_KERNEL_NS))
+
+
+def split_steps(rows: Sequence[Dict[str, str]]) -> List[List[Dict[str, str]]]:
+    """Split a capture into steps; the prologue and all capture rows are dropped.
+
+    A step starts at each new replay session of the first replayed trace and runs
+    up to that trace's next replay session, so it carries the eager rows and other
+    traces' replays that follow its session (see the module docstring).
+    """
+    first_trace = next((_trace_id(r) for r in rows if _session_id(r)), None)
+    if first_trace is None:
         raise MergeError(
             f"No populated {COL_REPLAY_SESSION_ID!r} values found — this does not look like a "
             "trace+replay capture. Use ops_perf_three_csv_merge.py for iterative (VGG-style) runs."
         )
-    if select in ("first", "last"):
-        chosen = sessions[0] if select == "first" else sessions[-1]
-    else:
-        totals = [(sid, _session_total_kdur_ns(rows_van, sid)) for sid in sessions]
-        if select == "min":
-            chosen = min(totals, key=lambda x: x[1])[0]
-        elif select == "max":
-            chosen = max(totals, key=lambda x: x[1])[0]
-        elif select == "median":
-            ordered = sorted(totals, key=lambda x: x[1])
-            chosen = ordered[(len(ordered) - 1) // 2][0]  # lower-middle for even counts
-        else:
-            raise MergeError(f"Unknown --select-session value: {select!r}")
-    return chosen
+    steps: List[List[Dict[str, str]]] = []
+    current_sid: Optional[str] = None
+    for r in rows:
+        sid = _session_id(r)
+        if sid and _trace_id(r) == first_trace and sid != current_sid:
+            current_sid = sid
+            steps.append([])
+        if steps and not _is_capture_row(r):
+            steps[-1].append(r)
+    return steps
+
+
+def _step_signature(step: Sequence[Dict[str, str]]) -> Tuple[str, ...]:
+    """Ordered OP CODE sequence of a step."""
+    return tuple(_strip_cell(r.get(COL_OP_CODE)) for r in step)
+
+
+def _step_total_kdur_ns(step: Sequence[Dict[str, str]]) -> float:
+    """Sum of DEVICE KERNEL DURATION [ns] over the rows of one step."""
+    total = 0.0
+    for r in step:
+        v = parse_finite_float(r.get(COL_DEVICE_KERNEL_NS))
+        if v is not None:
+            total += v
+    return total
+
+
+def select_step(steps: Sequence[Sequence[Dict[str, str]]], select: str) -> int:
+    """Return the index of the step to keep, chosen from the vanilla CSV's steps.
+
+    Candidates are the steps with the most frequent step signature.
+      * ``first`` — the first candidate (the default).
+      * ``last`` — the last step; it must have the most frequent signature.
+      * ``median`` — lower-middle candidate by total kernel ns.
+      * ``min`` / ``max`` — least / greatest candidate total kernel ns.
+    """
+    sigs = [_step_signature(s) for s in steps]
+    ranked = Counter(sigs).most_common(2)
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        raise MergeError(
+            f"No single most frequent step signature among {len(steps)} step(s) "
+            f"(top two occur {ranked[0][1]} time(s) each); cannot choose a representative step."
+        )
+    modal = ranked[0][0]
+    candidates = [i for i, s in enumerate(sigs) if s == modal]
+    if select == "last":
+        if sigs[-1] != modal:
+            raise MergeError(
+                f"The last step ({len(sigs[-1])} ops) does not have the most frequent step signature "
+                f"({len(modal)} ops, {len(candidates)} of {len(steps)} steps); refusing to select it."
+            )
+        return len(steps) - 1
+    if select == "first":
+        return candidates[0]
+    totals = [(i, _step_total_kdur_ns(steps[i])) for i in candidates]
+    if select == "min":
+        return min(totals, key=lambda x: x[1])[0]
+    if select == "max":
+        return max(totals, key=lambda x: x[1])[0]
+    if select == "median":
+        ordered = sorted(totals, key=lambda x: x[1])
+        return ordered[(len(ordered) - 1) // 2][0]  # lower-middle for even counts
+    raise MergeError(f"Unknown --select-session value: {select!r}")
 
 
 def _keys_unique(rows: Sequence[Dict[str, str]]) -> bool:
@@ -161,19 +210,19 @@ def reduce_trace_replay(
     rows_fpu: List[Dict[str, str]],
     rows_van: List[Dict[str, str]],
     *,
-    select_session: str = "median",
+    select_session: str = "first",
     compose_iteration: bool = True,
     cli_ops_per_iteration: Optional[int] = None,
     cli_measured_indices: Optional[List[int]] = None,
     cli_select_iteration: str = "median",
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
-    """Reduce a trace+replay capture to a single replay session.
+    """Reduce a trace+replay capture to a single step.
 
-    Steps: choose one replay session from the vanilla CSV, then filter all three
-    variants to that session (dropping the compile/warmup pass and the other
-    sessions).  If the kept session still has duplicate join keys (a trace+replay
-    *and* iterative capture) and ``compose_iteration`` is set, apply the iterative
-    reducer within the session to collapse it to one iteration.
+    Split each variant into steps (dropping the prologue and capture rows), choose
+    one step from the vanilla CSV, and keep the same step in all three variants
+    (they share step layout).  If the kept step still has duplicate join keys (a
+    trace+replay *and* iterative capture) and ``compose_iteration`` is set, apply
+    the iterative reducer within the step to collapse it to one iteration.
     """
     if COL_REPLAY_SESSION_ID not in (rows_van[0] if rows_van else {}):
         raise MergeError(
@@ -181,21 +230,23 @@ def reduce_trace_replay(
             "Use ops_perf_three_csv_merge.py for iterative (VGG-style) runs."
         )
 
-    sessions = replay_session_ids(rows_van)
-    chosen = select_replay_session(rows_van, select_session)
-
-    def _keep(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        return [r for r in rows if _session_id(r) == chosen]
-
-    n_compile = sum(1 for r in rows_van if not _session_id(r))
-    rows_noc, rows_fpu, rows_van = _keep(rows_noc), _keep(rows_fpu), _keep(rows_van)
+    steps_noc, steps_fpu, steps_van = split_steps(rows_noc), split_steps(rows_fpu), split_steps(rows_van)
+    if not len(steps_noc) == len(steps_fpu) == len(steps_van):
+        raise MergeError(
+            f"Step count differs across variants (noctrace={len(steps_noc)} fpu={len(steps_fpu)} "
+            f"vanilla={len(steps_van)}); step layouts must be synchronized across the three variants."
+        )
+    chosen = select_step(steps_van, select_session)
+    chosen_sid = _session_id(steps_van[chosen][0])
+    n_prologue = next(i for i, r in enumerate(rows_van) if _session_id(r))
+    rows_noc, rows_fpu, rows_van = steps_noc[chosen], steps_fpu[chosen], steps_van[chosen]
     logger.info(
-        "Replay-session filter: {} session(s) {}; dropped {} compile/warmup op(s); "
-        "selected session {!r} (select={!r}) -> {} op(s) per variant.",
-        len(sessions),
-        sessions,
-        n_compile,
+        "Step filter: {} step(s); dropped {} prologue row(s); selected step {} (replay session {!r}, "
+        "select={!r}) -> {} op(s) per variant.",
+        len(steps_van),
+        n_prologue,
         chosen,
+        chosen_sid,
         select_session,
         len(rows_van),
     )
@@ -203,8 +254,8 @@ def reduce_trace_replay(
     if not _keys_unique(rows_van):
         if compose_iteration:
             logger.info(
-                "Selected replay session {!r} has duplicate join keys "
-                "(trace+replay+iterative); composing the iteration reducer within the session.",
+                "Selected step {} has duplicate join keys "
+                "(trace+replay+iterative); composing the iteration reducer within the step.",
                 chosen,
             )
             rows_noc, rows_fpu, rows_van = reduce_iterative(
@@ -217,9 +268,9 @@ def reduce_trace_replay(
             )
         else:
             raise MergeError(
-                f"Selected replay session {chosen!r} has duplicate join keys and "
+                f"Selected step {chosen} has duplicate join keys and "
                 "--no-compose-iteration was given; the join requires unique keys. "
-                "Re-run without --no-compose-iteration to reduce iterations within the session."
+                "Re-run without --no-compose-iteration to reduce iterations within the step."
             )
     return rows_noc, rows_fpu, rows_van
 
@@ -228,7 +279,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Merge three TT-Metal ops perf CSVs from a non-iterative trace+replay capture "
-            "(ViT, llama3) under --input-dir into one CSV, keeping a single replay session."
+            "(ViT, llama3) under --input-dir into one CSV, keeping a single step."
         ),
         epilog=(
             "Default --output is <input-dir>/merged_ops.csv. For iterative (VGG-style) runs use "
@@ -271,24 +322,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--select-session",
         choices=SESSION_SELECT_CHOICES,
-        default="median",
+        default="first",
         help=(
-            "How to choose the replay session to keep: 'median' (lower-middle by total kernel "
-            "ns), 'min', 'max', 'first', or 'last' (capture order). The compile/warmup pass "
-            "(blank session id) is always dropped."
+            "How to choose the step to keep. 'first', 'median' (lower-middle by total kernel ns), "
+            "'min' and 'max' select among the steps with the most frequent step signature. "
+            "'last' selects the last step (the demo's measured call), which must have the most "
+            "frequent step signature. The prologue and capture rows are always dropped."
         ),
     )
     p.add_argument(
         "--no-compose-iteration",
         action="store_true",
         help=(
-            "Disable the iteration reducer that otherwise runs when the selected replay session "
-            "still has duplicate join keys (a trace+replay+iterative capture). With this flag such "
-            "a capture is a hard error instead."
+            "Disable the iteration reducer that otherwise runs when the selected step still has "
+            "duplicate join keys (a trace+replay+iterative capture). With this flag such a capture "
+            "is a hard error instead."
         ),
     )
     # Forwarded to the composed iteration reducer; only take effect for a
-    # trace+replay+iterative capture (a replay session with duplicate keys).
+    # trace+replay+iterative capture (a step with duplicate keys).
     p.add_argument(
         "--ops-per-iteration",
         type=int,

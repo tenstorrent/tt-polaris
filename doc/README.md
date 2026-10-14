@@ -43,6 +43,8 @@ high-level roofline performance simulator for AI workloads.
   files are stored and fetched through the large-file cache.
 - **[Three-CSV Merge Spec](SPEC_ops_perf_three_csv_merge.md)** — merging the
   profiler's triple-CSV output into a single per-op perf CSV.
+- **[Trace+Replay Merge Spec](SPEC_ops_perf_trace_replay_merge.md)** — the same
+  merge for trace+replay captures, reduced to one step.
 
 ## Hardware correlation
 
