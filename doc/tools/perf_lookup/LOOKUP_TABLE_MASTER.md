@@ -2,7 +2,7 @@
 
 ## Wire format
 
-Normative schema: [YAML_MASTER_FORMAT.md](../../YAML_MASTER_FORMAT.md) (`schema_name: correqn.tt-perf-master`, `schema_version: 2`; v1 files accepted with `DeprecationWarning`).
+Normative schema: [YAML_MASTER_FORMAT.md](../../YAML_MASTER_FORMAT.md) (`schema_name: correqn.tt-perf-master`, `schema_version: 6`; versions 1–5 accepted with `DeprecationWarning`).
 
 Loaded by [lookup_operator_perf.py](../../../tools/perf_lookup/lookup_operator_perf.py) via [`tools.perf_lookup.tt_perf_master_loader.load_existing_yaml`](../../../tools/perf_lookup/tt_perf_master_loader.py). Legacy top-level **list** YAML is **not** supported.
 
@@ -10,7 +10,7 @@ Loaded by [lookup_operator_perf.py](../../../tools/perf_lookup/lookup_operator_p
 
 ### Entry `value` shapes
 
-- **`entry_type: single`:** flat mapping: `num_cores` plus all canonical stat keys (`msecs`, `memory_traffic`, `mem_util`, `noc_util`, `noc_multicast_util`, `npe_cong_impact_pct`, `vector_pipe_util`, `matrix_pipe_util`) on the **same** mapping as `entry_type`. There are **no** per-core integer buckets (e.g. `8: { ... }`).
+- **`entry_type: single`:** flat mapping: `num_cores` plus all canonical stat keys (`msecs`, `memory_traffic`, `mem_util`, `noc_util`, `noc_multicast_util`, `npe_cong_impact_pct`, `vector_pipe_util`, `matrix_pipe_util`) on the **same** mapping as `entry_type`. There are **no** per-core integer buckets (e.g. `8: { ... }`). A **time-only** payload (`stats_coverage: time_only`, from a capture without the NOC-trace pass) carries only `msecs`, `vector_pipe_util` and `matrix_pipe_util`; see *Stats coverage* in [YAML_MASTER_FORMAT.md](../../YAML_MASTER_FORMAT.md).
 - **`entry_type: curve`:** `curve_family` (`linear` or `power`) plus one sub-mapping per stat, each with `a`, `b`, `r2`, and `equation`.
 - **`entry_type: hybrid`:** optional `single` (same flat shape as above, **without** an inner `entry_type`) and/or optional `curve` (same shape as a top-level curve). **`op_code: matmul`** must use `hybrid` (enforced by the loader).
 
@@ -98,9 +98,12 @@ estimates for unmatched ops, with no double-counting or extra deration on either
 |--------|--------|
 | `msecs`, `cycles`, `ideal_*` | Master `msecs` (after guardband handling in `Device.get_exec_stats`) |
 | `matrix_pipe_util`, `vector_pipe_util` | **Required** from master; YAML/curve values are **percentages [0, 100]**; stored in exec stats / CSV as **fractions [0, 1]** (`value / 100`) |
-| `memory_traffic`, `mem_util` | Master when present; `mem_util` same **% → fraction** rule when present |
+| `memory_traffic`, `mem_util` | Master when present; `mem_util` same **% → fraction** rule when present. **Empty (None) on a hit on a time-only entry and on a LUT miss**: not measured, not 0. A removed or fused op reports 0 |
 | `mem_rd_util`, `mem_wr_util` | Set to **0** on LUT hit (cycle-derived ratios are inconsistent with LUT-rescaled `ideal_cycles`; use `mem_util` from master when present) |
 | `uses_perf_lookup` | `True` on hit |
+| `lut_stats_coverage` | `full` or `time_only` on hit (coverage of the matched payload); empty on miss |
+
+Loading a LUT with time-only entries logs one warning; a run with hits on them logs `LUT hits on time-only entries: N`.
 
 Analytical pipe/mem utilization **> 1.0** checks are skipped when `uses_perf_lookup` (matrix/vector come from validated master percentages converted to fractions).
 

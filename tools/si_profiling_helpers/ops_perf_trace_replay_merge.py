@@ -206,7 +206,7 @@ def _keys_unique(rows: Sequence[Dict[str, str]]) -> bool:
 
 
 def reduce_trace_replay(
-    rows_noc: List[Dict[str, str]],
+    rows_noc: Optional[List[Dict[str, str]]],
     rows_fpu: List[Dict[str, str]],
     rows_van: List[Dict[str, str]],
     *,
@@ -215,7 +215,7 @@ def reduce_trace_replay(
     cli_ops_per_iteration: Optional[int] = None,
     cli_measured_indices: Optional[List[int]] = None,
     cli_select_iteration: str = "median",
-) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
+) -> Tuple[Optional[List[Dict[str, str]]], List[Dict[str, str]], List[Dict[str, str]]]:
     """Reduce a trace+replay capture to a single step.
 
     Split each variant into steps (dropping the prologue and capture rows), choose
@@ -223,6 +223,7 @@ def reduce_trace_replay(
     (they share step layout).  If the kept step still has duplicate join keys (a
     trace+replay *and* iterative capture) and ``compose_iteration`` is set, apply
     the iterative reducer within the step to collapse it to one iteration.
+    ``rows_noc`` is None when the merge runs without a noctrace CSV.
     """
     if COL_REPLAY_SESSION_ID not in (rows_van[0] if rows_van else {}):
         raise MergeError(
@@ -230,16 +231,19 @@ def reduce_trace_replay(
             "Use ops_perf_three_csv_merge.py for iterative (VGG-style) runs."
         )
 
-    steps_noc, steps_fpu, steps_van = split_steps(rows_noc), split_steps(rows_fpu), split_steps(rows_van)
-    if not len(steps_noc) == len(steps_fpu) == len(steps_van):
+    steps_fpu, steps_van = split_steps(rows_fpu), split_steps(rows_van)
+    steps_noc = None if rows_noc is None else split_steps(rows_noc)
+    if len(steps_fpu) != len(steps_van) or (steps_noc is not None and len(steps_noc) != len(steps_van)):
+        n_noc = "-" if steps_noc is None else str(len(steps_noc))
         raise MergeError(
-            f"Step count differs across variants (noctrace={len(steps_noc)} fpu={len(steps_fpu)} "
+            f"Step count differs across variants (noctrace={n_noc} fpu={len(steps_fpu)} "
             f"vanilla={len(steps_van)}); step layouts must be synchronized across the three variants."
         )
     chosen = select_step(steps_van, select_session)
     chosen_sid = _session_id(steps_van[chosen][0])
     n_prologue = next(i for i, r in enumerate(rows_van) if _session_id(r))
-    rows_noc, rows_fpu, rows_van = steps_noc[chosen], steps_fpu[chosen], steps_van[chosen]
+    rows_noc = None if steps_noc is None else steps_noc[chosen]
+    rows_fpu, rows_van = steps_fpu[chosen], steps_van[chosen]
     logger.info(
         "Step filter: {} step(s); dropped {} prologue row(s); selected step {} (replay session {!r}, "
         "select={!r}) -> {} op(s) per variant.",
@@ -293,6 +297,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "Root directory; recursively discovers exactly three ops_perf_results_*.csv files "
+            "(two with --allow-missing-noctrace) "
             "(falls back to *.csv when none match), classified by content."
         ),
     )
@@ -359,6 +364,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="median",
         help="Iteration selection for the composed iteration reducer (trace+replay+iterative only).",
     )
+    p.add_argument(
+        "--allow-missing-noctrace",
+        action="store_true",
+        help=(
+            "Accept a vanilla CSV and an fpu CSV without the noctrace CSV. The output omits the "
+            "noctrace-only columns (the _noctrace block and MemUtil/Raw) and cannot build a LUT."
+        ),
+    )
     return p
 
 
@@ -399,6 +412,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             duration_rel_tol=float(args.duration_rel_tol),
             encoding=str(args.encoding),
             reducer=reducer,
+            allow_missing_noctrace=args.allow_missing_noctrace,
         )
     except MergeError as e:
         print(str(e), file=sys.stderr)

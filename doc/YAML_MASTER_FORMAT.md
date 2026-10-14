@@ -2,7 +2,7 @@
 
 Repository path: **`doc/YAML_MASTER_FORMAT.md`**. Excel/key-tuple and CLI pipeline: **`tools/perf_lookup/tt_perf_mapper.py`**.
 
-Normative description of the YAML written by the **`tools/perf_lookup/tt_perf_mapper.py`** CLI when **`--update`** is set (inputs: repeatable **`--model-run`** / **`--sweep-run`**, optional existing **`--output`** file merged first). Files produced by the current tool carry **`schema_version: 2`** (`MASTER_YAML_SCHEMA_VERSION`); the loader also accepts **`schema_version: 1`** (legacy, emits `DeprecationWarning`). **Constants and parsing** live in **`tools/perf_lookup/tt_perf_master_schema.py`**; **reading** a file is **`tools.perf_lookup.tt_perf_master_loader.load_existing_yaml`**. Use this document to implement loaders, JSON Schema, Pydantic models, or contract tests in **other repositories**.
+Normative description of the YAML written by the **`tools/perf_lookup/tt_perf_mapper.py`** CLI when **`--update`** is set (inputs: repeatable **`--model-run`** / **`--sweep-run`**, optional existing **`--output`** file merged first). Files produced by the current tool carry **`schema_version: 6`** (`MASTER_YAML_SCHEMA_VERSION`); the loader also accepts **`schema_version`** **1–5** (legacy, emits `DeprecationWarning`). **Constants and parsing** live in **`tools/perf_lookup/tt_perf_master_schema.py`**; **reading** a file is **`tools.perf_lookup.tt_perf_master_loader.load_existing_yaml`**. Use this document to implement loaders, JSON Schema, Pydantic models, or contract tests in **other repositories**.
 
 **Producer:** `tools/perf_lookup/tt_perf_mapper.py` — **`serialize_master_for_yaml`** builds a mapping; **`yaml.dump`** (`default_flow_style=False`, `sort_keys=False`, `allow_unicode=True`). **Loader:** `tools/perf_lookup/tt_perf_master_loader.py` — **`load_existing_yaml`**.
 
@@ -18,9 +18,11 @@ Stable names and keys (defined in `tt_perf_master_schema.py`):
 |----------|-------|------|
 | **`MASTER_YAML_SCHEMA_NAME`** | **`correqn.tt-perf-master`** | **Unique format name** (reverse-DNS style). Use in loaders, Pydantic, or **`$id`**-style docs to detect the correct file type before deep parsing. **Do not reuse** this string for unrelated YAML. |
 | **`MASTER_YAML_SCHEMA_NAME_KEY`** | **`schema_name`** | Top-level YAML key for the string above. |
-| **`MASTER_YAML_SCHEMA_VERSION`** | **`2`** (integer, current) | **v2** added **`math_fidelity`** to the key tuple (9th field, between `input_0_memory` and `input_1_*`). Loaders must reject versions outside the range **1–2**; v1 files load with a **`DeprecationWarning`** (default fill: `math_fidelity: N/A`). |
+| **`MASTER_YAML_SCHEMA_VERSION`** | **`6`** (integer, current) | Changelog in `tt_perf_master_schema.py`. **v2** added **`math_fidelity`** to the key tuple (9th field, between `input_0_memory` and `input_1_*`); **v6** added time-only entries (see **Stats coverage**). Loaders must reject versions outside the range **1–6**; older versions load with a **`DeprecationWarning`** (v1 default fill: `math_fidelity: N/A`). |
 | **`MASTER_YAML_SCHEMA_VERSION_KEY`** | **`schema_version`** | Top-level YAML key for the integer above. |
 | **`MASTER_YAML_ENTRIES_KEY`** | **`entries`** | Top-level YAML key holding the list of records. |
+| **`MASTER_YAML_COVERAGE_KEY`** | **`coverage`** | Top-level YAML key: entry count per stats coverage (see **Stats coverage**). |
+| **`MASTER_STATS_COVERAGE_KEY`** | **`stats_coverage`** | On a flat single or curve payload: **`full`** (default when absent) or **`time_only`** (see **Stats coverage**). |
 | **`MASTER_YAML_RECORD_KEY_FIELD`** | **`key`** | On each **`entries[i]`**: nested mapping for the labeled **logical record key** (see **Record key**). |
 | **`MASTER_YAML_ENTRY_VALUE_FIELD`** | **`value`** | On each **`entries[i]`**: mapping for the **entry payload** (**`entry_type`**, stats or curve fits). |
 | **`MASTER_ENTRY_TYPE_KEY`** | **`entry_type`** | Discriminator on each entry **value**: **`single`**, **`curve`**, or **`hybrid`** (matmul: nested **`single`** + **`curve`**). |
@@ -30,7 +32,7 @@ Stable names and keys (defined in `tt_perf_master_schema.py`):
 | **`MASTER_CURVE_FAMILY_KEY`** | **`curve_family`** | **`curve`** and **`hybrid.curve`**: **`linear`** or **`power`** (same family for every stat; chosen from duration vs core count). |
 | **`MASTER_DURATION_MS_KEY`** | **`msecs`** | Device kernel duration in YAML (**milliseconds**); Excel column is nanoseconds. |
 
-**Consumers:** require **`schema_name`** **`correqn.tt-perf-master`**, **`schema_version`** in range **1–2**, and **`entries`** as defined below. Wrong **`schema_name`**, out-of-range **`schema_version`**, or missing fields → **`ValueError`**; **`schema_version: 1`** → **`DeprecationWarning`** (see **`tt_perf_master_loader.load_existing_yaml`**).
+**Consumers:** require **`schema_name`** **`correqn.tt-perf-master`**, **`schema_version`** in range **1–6**, and **`entries`** as defined below. Wrong **`schema_name`**, out-of-range **`schema_version`**, or missing fields → **`ValueError`**; **`schema_version`** below 6 → **`DeprecationWarning`** (see **`tt_perf_master_loader.load_existing_yaml`**).
 
 **Record key wire shape:** **`entries[i]['key']`** is a **labeled mapping** (see **Record key**). **`yaml_labeled_key_to_tuple`** / **`labeled_key_map_to_tuple`** in **`tt_perf_master_schema`** parse it to an internal 9-, 16-, or 23-tuple.
 
@@ -46,6 +48,7 @@ The file is a **YAML mapping** with these keys (current write path):
 |-----|------|----------|---------|
 | **`schema_name`** | string | yes | Must be **`correqn.tt-perf-master`**. |
 | **`schema_version`** | integer | yes | Must match **`MASTER_YAML_SCHEMA_VERSION`** for files produced by the current tool. |
+| **`coverage`** | mapping | no | **`full`** and **`time_only`** entry counts. Written by the producer (v6) from the entries. When present, the loader rejects a block that disagrees with the entries. |
 | **`entries`** | sequence | yes | List of **records** (see next table). |
 
 - **Empty `entries`:** valid: zero key tuples.
@@ -63,7 +66,10 @@ Example shape (matmul after merge; **`schema_version`** = **`MASTER_YAML_SCHEMA_
 
 ```yaml
 schema_name: correqn.tt-perf-master
-schema_version: 2
+schema_version: 6
+coverage:
+  full: 1
+  time_only: 0
 entries:
   - key:
       op_code: matmul
@@ -119,13 +125,13 @@ entries:
 
 ## Unsupported top-level shapes
 
-Only the **versioned** mapping (**`schema_name`**, **`schema_version`**, **`entries`**) is accepted by **`tt_perf_master_loader.load_existing_yaml`** (used by the **`tt_perf_mapper`** CLI when merging). Bare top-level lists, plain dicts without **`entries`**, **`entries`** items that are not **`{key, value}`** mappings, wrong **`schema_name`**, or **`schema_version`** outside the accepted range **1–2** are rejected on load. **`schema_version: 1`** (legacy) loads with a **`DeprecationWarning`**; re-export with the current tool to upgrade to v2.
+Only the **versioned** mapping (**`schema_name`**, **`schema_version`**, **`entries`**) is accepted by **`tt_perf_master_loader.load_existing_yaml`** (used by the **`tt_perf_mapper`** CLI when merging). Bare top-level lists, plain dicts without **`entries`**, **`entries`** items that are not **`{key, value}`** mappings, wrong **`schema_name`**, or **`schema_version`** outside the accepted range **1–6** are rejected on load. Older versions (legacy) load with a **`DeprecationWarning`**; re-export with the current tool to upgrade to v6.
 
 ---
 
 ## Record key (`entries[i]['key']`)
 
-The logical key is a **full-arity tuple** of length **9 + 7·(n_inputs−1)** — i.e. **9, 16, 23, 30, 37, 44, 51, or 58** for 1–8 inputs (built from Excel columns in **`tt_perf_mapper.build_key_tuple`**). Standard ops key on **all** populated input slots (input_0..input_7), so >3-input ops (e.g. `pagedfusedupdatecache`, `scaleddotproductattention`) key on every operand; arity ≤3 keys are byte-identical to the historical 9/16/23-tuples (schema **v5**). Input slots must be **contiguous** (no gaps). Under **`key`**, the wire form is a **YAML mapping** whose field names are **`KEY_TUPLE_YAML_KEYS`** in `tt_perf_master_schema.py` (fixed order; values are the same scalars as the Excel-driven tuple). (Note: the version references above still say `2`/range `1–2` from earlier drift; the authoritative changelog is `MASTER_YAML_SCHEMA_VERSION` in `tt_perf_master_schema.py`, currently **5**.)
+The logical key is a **full-arity tuple** of length **9 + 7·(n_inputs−1)** — i.e. **9, 16, 23, 30, 37, 44, 51, or 58** for 1–8 inputs (built from Excel columns in **`tt_perf_mapper.build_key_tuple`**). Standard ops key on **all** populated input slots (input_0..input_7), so >3-input ops (e.g. `pagedfusedupdatecache`, `scaleddotproductattention`) key on every operand; arity ≤3 keys are byte-identical to the historical 9/16/23-tuples (schema **v5**). Input slots must be **contiguous** (no gaps). Under **`key`**, the wire form is a **YAML mapping** whose field names are **`KEY_TUPLE_YAML_KEYS`** in `tt_perf_master_schema.py` (fixed order; values are the same scalars as the Excel-driven tuple).
 
 - **`op_code`:** Polaris **layer type** (e.g. `matmul`, `eltwise`, `tilize`, `tilizewithvalpadding`, `untilize`, `untilizewithunpadding`).
 - **`input_0_w_pad_logical`**, **`input_0_z_pad_logical`**, **`input_0_y_pad_logical`**, **`input_0_x_pad_logical`:** logical pad integers (aligned with **`INPUT_0_*_PAD[LOGICAL]`**).
@@ -157,7 +163,7 @@ Constants in code: **`MASTER_ENTRY_TYPE_KEY`**, **`MASTER_SINGLE_NUM_CORES_KEY`*
 
 ## Single entry (`value` with `entry_type: single`)
 
-- **Required:** `entry_type: single`, **`num_cores`** (**`MASTER_SINGLE_NUM_CORES_KEY`**), and every key in **`MASTER_SINGLE_STAT_KEYS`** (same set as the table below). **Extra keys** are accepted but **`load_existing_yaml`** emits a **`warnings.warn`** (consumers should not rely on them).
+- **Required:** `entry_type: single`, **`num_cores`** (**`MASTER_SINGLE_NUM_CORES_KEY`**), and every key in **`MASTER_SINGLE_STAT_KEYS`** (same set as the table below). A **`stats_coverage: time_only`** payload instead requires **`MASTER_TIME_ONLY_STAT_KEYS`** and must not carry the NOC-trace stats (see **Stats coverage**). **Extra keys** are accepted but **`load_existing_yaml`** emits a **`warnings.warn`** (consumers should not rely on them).
 - **Producer behavior:** Non-whole **`CORE COUNT`** in Excel is coerced with **`int(round(...))`** for **`num_cores`** and a log **warning** (see **`tt_perf_mapper`**).
 - **PyYAML quirk:** **`num_cores`** may load as a whole-number **float** (e.g. `64.0`). **`load_existing_yaml`** normalizes **`64.0` → `64`**. External loaders **SHOULD** do the same.
 
@@ -208,6 +214,19 @@ Special cases: all-NaN/zero stats use **`_curve_zero_law_entry`**-style payloads
 
 ---
 
+## Stats coverage (time-only entries, v6)
+
+Some captures have no NOC-trace pass (merged with **`--allow-missing-noctrace`**): they measure kernel time and pipe utilization, but not memory or NOC behaviour. Their entries are **time-only**.
+
+- **Marker:** a flat single payload (**`single`**, **`hybrid.single`**) or a curve payload (**`curve`**, **`hybrid.curve`**) MAY carry **`stats_coverage`**: **`full`** or **`time_only`**. A payload without the key is **`full`**, so pre-v6 files stay valid. The producer writes the key only for **`time_only`**.
+- **Time-only stats:** a **`time_only`** payload carries **`MASTER_TIME_ONLY_STAT_KEYS`** (**`msecs`**, **`vector_pipe_util`**, **`matrix_pipe_util`**) and MUST NOT carry **`MASTER_NOCTRACE_STAT_KEYS`** (**`memory_traffic`**, **`mem_util`**, **`noc_util`**, **`noc_multicast_util`**, **`npe_cong_impact_pct`**). An absent NOC-trace stat means **not measured**. It is never written as **0**.
+- **Entry coverage:** an entry is **`time_only`** if any of its payloads is **`time_only`**; otherwise **`full`**.
+- **Mixed files:** a file MAY mix **`full`** and **`time_only`** entries. The root **`coverage`** block records the count of each.
+- **Merge rule (producer):** for the same key, a **`time_only`** payload does not replace a **`full`** one (the producer keeps the full payload and logs a warning). A **`full`** payload replaces a **`time_only`** one. **`hybrid.single`** and **`hybrid.curve`** are each replaced whole, never merged field by field.
+- **Simulator:** a hit on a time-only payload reports **`memory_traffic`** and **`mem_util`** as empty (None) in the opstats, and **`lut_stats_coverage: time_only`**.
+
+---
+
 ## What is not in the YAML
 
 - In-process **`curve_meta`** extras (duration **R²** linear vs power, core count list for dry-run reporting) — **not serialized**. **`curve_family`** on the entry replaces the need to infer family from **`equation`** alone.
@@ -218,13 +237,13 @@ Special cases: all-NaN/zero stats use **`_curve_zero_law_entry`**-style payloads
 ## Suggested consumer algorithm
 
 1. `raw = yaml.safe_load(stream)`; handle **`None`** → no entries.
-2. Require `raw` is a **dict** with **`schema_name`**, **`schema_version`**, and **`entries`**. Reject if **`schema_name`** ≠ **`correqn.tt-perf-master`** or **`schema_version`** is outside **1–2** (see **`tt_perf_master_schema.py`**, **`tt_perf_master_loader.py`**). Emit **`DeprecationWarning`** for **`schema_version: 1`** and back-fill **`math_fidelity: N/A`** on any key entry that omits it.
+2. Require `raw` is a **dict** with **`schema_name`**, **`schema_version`**, and **`entries`**. Reject if **`schema_name`** ≠ **`correqn.tt-perf-master`** or **`schema_version`** is outside **1–6** (see **`tt_perf_master_schema.py`**, **`tt_perf_master_loader.py`**). Emit **`DeprecationWarning`** for **`schema_version`** below 6. If **`coverage`** is present, reject it unless it equals the entry counts per coverage. Back-fill **`math_fidelity: N/A`** on any key entry that omits it.
 3. Let `records = raw["entries"]` (a list).
 4. For each `item` in `records`: require `item` is a **dict** with exactly **`key`** and **`value`** (and no other keys). Let `key_wire = item["key"]`, `entry = item["value"]`. Require **`entry`** is a **mapping**. Require **`key_wire`** is a **dict**; map fields in **`KEY_TUPLE_YAML_KEYS`** order (8, 15, or 22 keys per rules above) to `key_tuple` (same rules as **`labeled_key_map_to_tuple`**).
 5. Require `entry["entry_type"]` is **`single`**, **`curve`**, or **`hybrid`** (do not guess from keys).
 6. If **`key_tuple[0]`** (Polaris **`op_code`**) is **`matmul`**, require **`entry_type: hybrid`** (same rule as **`tt_perf_master_loader`**).
-7. If **`single`**: read **`num_cores`** and the stat keys (see **`MASTER_SINGLE_STAT_KEYS`**); require all of them; unknown keys → warn (see **`load_existing_yaml`** / **`_validate_flat_single_payload`**). Stat values must be finite real scalars (including NumPy scalar types if your loader passes them through).
-8. If **`curve`**: read **`curve_family`** (`linear` \| `power`). For each `k, v` in `entry.items()` with `k` not in `entry_type` / `curve_family` and `v` a dict, require **`MASTER_CURVE_STAT_ENTRY_KEYS`**: `a`, `b`, `r2`, `equation` (extras → warn).
+7. If **`single`**: read **`num_cores`**, **`stats_coverage`** (default **`full`**) and the stat keys (see **`MASTER_SINGLE_STAT_KEYS`**); require all of them, or for **`time_only`** exactly **`MASTER_TIME_ONLY_STAT_KEYS`** with no NOC-trace stat; unknown keys → warn (see **`load_existing_yaml`** / **`_validate_flat_single_payload`**). Stat values must be finite real scalars (including NumPy scalar types if your loader passes them through).
+8. If **`curve`**: read **`curve_family`** (`linear` \| `power`). For each `k, v` in `entry.items()` with `k` not in `entry_type` / `curve_family` / `stats_coverage` and `v` a dict, require **`MASTER_CURVE_STAT_ENTRY_KEYS`**: `a`, `b`, `r2`, `equation` (extras → warn).
 9. If **`hybrid`**: parse optional **`single`** (flat **`num_cores`** + stats) and optional **`curve`** (`curve_family` + stat fits); require at least one branch.
 10. Optionally normalize **`num_cores`** whole-number floats to `int` (including under **`hybrid.single`**).
 

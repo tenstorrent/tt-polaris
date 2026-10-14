@@ -841,8 +841,10 @@ class Device:
             assert ideal_cycles > 0, f"Error: ideal_cycles = {ideal_cycles}!!"
             assert ideal_msecs > 0, f"Error: ideal_msecs = {ideal_msecs}!!"
 
-            memory_traffic = 0.0
-            mem_util = 0.0
+            # None means "not measured". Only a LUT hit measures memory traffic and DRAM utilization;
+            # a miss (analytical) and a hit on a time-only LUT entry leave them None, never 0.
+            memory_traffic: Optional[float] = None
+            mem_util: Optional[float] = None
             if uses_perf_lookup and master_stats is not None:
                 matrix_pipe_util = self._profiler_pct_to_exec_fraction(
                     master_stats.matrix_pipe_util
@@ -944,6 +946,13 @@ class Device:
                         master_stats.hit_source
                         if (uses_perf_lookup and master_stats is not None and master_stats.hit_source)
                         else ('analytical' if self.operator_perf_map is not None else None)
+                    ),
+                    # Coverage of the LUT entry behind a hit: "full", or "time_only" when the
+                    # entry has no NOC-trace stats (memory_traffic and mem_util are then None).
+                    # None when the op is not a LUT hit.
+                    'lut_stats_coverage': (
+                        master_stats.stats_coverage
+                        if (uses_perf_lookup and master_stats is not None) else None
                     ),
                     }
 
@@ -1077,6 +1086,16 @@ class Device:
             for n in graph_ordered_nodes
             if not wlgraph.get_op(n).removed_in_optimization
         )
+        n_time_only_hits = sum(
+            1 for n in graph_ordered_nodes
+            if wlgraph.get_op(n).exec_stats.get('lut_stats_coverage') == 'time_only'
+        )
+        if n_time_only_hits:
+            logger.info(
+                "LUT hits on time-only entries: {} (memory traffic and DRAM utilization not measured "
+                "for these ops; reported as empty)",
+                n_time_only_hits,
+            )
         if (tot_mem_rd_cycles > 0 or tot_mem_wr_cycles > 0) and not any_lut:
             # Validate that the memory bandwidth accounting is correct.
             # Skipped when any op uses the LUT, since LUT ops zero out

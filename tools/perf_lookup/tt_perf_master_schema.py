@@ -84,6 +84,24 @@ MASTER_SINGLE_STAT_KEYS = (
 
 MASTER_SINGLE_STAT_KEYS_SET = frozenset(MASTER_SINGLE_STAT_KEYS)
 
+# Stats only the NOC-trace profiling pass measures. A ``time_only`` payload omits them: absent
+# means "not measured", never 0.
+MASTER_NOCTRACE_STAT_KEYS = (
+    "memory_traffic",
+    "mem_util",
+    "noc_util",
+    "noc_multicast_util",
+    "npe_cong_impact_pct",
+)
+MASTER_TIME_ONLY_STAT_KEYS = tuple(k for k in MASTER_SINGLE_STAT_KEYS if k not in MASTER_NOCTRACE_STAT_KEYS)
+
+# Per-payload stats coverage (flat single, ``hybrid.single``, curve, ``hybrid.curve``). A payload
+# without the key is ``full``, so pre-v6 files stay valid.
+MASTER_STATS_COVERAGE_KEY = "stats_coverage"
+MASTER_STATS_COVERAGE_FULL = "full"
+MASTER_STATS_COVERAGE_TIME_ONLY = "time_only"
+MASTER_STATS_COVERAGE_VALUES = (MASTER_STATS_COVERAGE_FULL, MASTER_STATS_COVERAGE_TIME_ONLY)
+
 # Flat single payload keys that are utilization-like percentages / scores (not duration or traffic).
 MASTER_SINGLE_UTIL_STAT_KEYS = frozenset(
     (
@@ -117,9 +135,12 @@ MASTER_YAML_SCHEMA_NAME_KEY = "schema_name"
 # v5: full-arity keys — standard ops keyed on ALL populated inputs (input_3..input_7), so >3-input
 #     ops (PagedFusedUpdateCache, ScaledDotProductAttention) key on every operand instead of a
 #     first-3 truncation. Adds standard-op tuple lengths 30/37/44/51/58; arity<=3 keys unchanged.
-MASTER_YAML_SCHEMA_VERSION = 5
+# v6: time-only entries — a payload may carry ``stats_coverage: time_only`` and omit the NOC-trace
+#     stats; the root carries a ``coverage`` block (entry count per coverage).
+MASTER_YAML_SCHEMA_VERSION = 6
 MASTER_YAML_SCHEMA_VERSION_KEY = "schema_version"
 MASTER_YAML_ENTRIES_KEY = "entries"
+MASTER_YAML_COVERAGE_KEY = "coverage"
 MASTER_YAML_RECORD_KEY_FIELD = "key"
 MASTER_YAML_ENTRY_VALUE_FIELD = "value"
 
@@ -268,6 +289,31 @@ def normalize_flat_single_payload(d: dict) -> dict:
         if not math.isfinite(fv):
             out[uk] = 0.0
     return out
+
+
+def payload_stats_coverage(payload: dict) -> str:
+    """Coverage of one flat-single or curve payload; a payload without the key is ``full``."""
+    return payload.get(MASTER_STATS_COVERAGE_KEY, MASTER_STATS_COVERAGE_FULL)
+
+
+def entry_stats_coverage(val: dict) -> str:
+    """Coverage of one entry ``value``: ``time_only`` if any of its payloads is time-only."""
+    if val.get(MASTER_ENTRY_TYPE_KEY) == MASTER_ENTRY_TYPE_HYBRID:
+        payloads = [p for p in (val.get(MASTER_HYBRID_SINGLE_KEY), val.get(MASTER_HYBRID_CURVE_KEY))
+                    if isinstance(p, dict)]
+    else:
+        payloads = [val]
+    if any(payload_stats_coverage(p) == MASTER_STATS_COVERAGE_TIME_ONLY for p in payloads):
+        return MASTER_STATS_COVERAGE_TIME_ONLY
+    return MASTER_STATS_COVERAGE_FULL
+
+
+def master_coverage_counts(master: dict) -> dict:
+    """Root ``coverage`` block: entry count per coverage value, in a fixed order."""
+    counts = {c: 0 for c in MASTER_STATS_COVERAGE_VALUES}
+    for val in master.values():
+        counts[entry_stats_coverage(val)] += 1
+    return counts
 
 
 def is_real_stat_scalar(x) -> bool:

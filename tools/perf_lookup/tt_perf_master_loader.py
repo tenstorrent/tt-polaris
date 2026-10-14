@@ -4,7 +4,8 @@
 """Load tt-perf master YAML into ``dict[tuple, dict]`` (logical key → entry payload).
 
 Contract: ``doc/YAML_MASTER_FORMAT.md``. CLI and Excel pipeline: ``tools/perf_lookup/tt_perf_mapper.py``. Accepts
-``schema_version`` 1–3 (legacy, emits deprecation warning) or 4 (current); matmul entries must use ``entry_type: hybrid``.
+``schema_version`` 1 up to ``MASTER_YAML_SCHEMA_VERSION`` (older versions emit a deprecation warning); matmul entries
+must use ``entry_type: hybrid``. A payload may be ``stats_coverage: time_only``; see ``tt_perf_master_schema``.
 """
 
 from __future__ import annotations
@@ -29,6 +30,14 @@ try:
         MASTER_HYBRID_SINGLE_KEY,
         MASTER_SINGLE_NUM_CORES_KEY,
         MASTER_SINGLE_STAT_KEYS,
+        MASTER_NOCTRACE_STAT_KEYS,
+        MASTER_STATS_COVERAGE_KEY,
+        MASTER_STATS_COVERAGE_TIME_ONLY,
+        MASTER_STATS_COVERAGE_VALUES,
+        MASTER_TIME_ONLY_STAT_KEYS,
+        MASTER_YAML_COVERAGE_KEY,
+        master_coverage_counts,
+        payload_stats_coverage,
         is_real_stat_scalar,
         normalize_flat_single_payload,
         MASTER_YAML_ENTRIES_KEY,
@@ -55,6 +64,14 @@ except ImportError:
     MASTER_HYBRID_SINGLE_KEY,
     MASTER_SINGLE_NUM_CORES_KEY,
     MASTER_SINGLE_STAT_KEYS,
+    MASTER_NOCTRACE_STAT_KEYS,
+    MASTER_STATS_COVERAGE_KEY,
+    MASTER_STATS_COVERAGE_TIME_ONLY,
+    MASTER_STATS_COVERAGE_VALUES,
+    MASTER_TIME_ONLY_STAT_KEYS,
+    MASTER_YAML_COVERAGE_KEY,
+    master_coverage_counts,
+    payload_stats_coverage,
     is_real_stat_scalar,
     normalize_flat_single_payload,
     MASTER_YAML_ENTRIES_KEY,
@@ -114,30 +131,55 @@ def _validate_num_cores(nc, pair_index: int, ctx: str) -> None:
     )
 
 
+def _validate_stats_coverage(d: dict, pair_index: int, ctx: str) -> str:
+    """Return the payload's stats coverage; reject values outside MASTER_STATS_COVERAGE_VALUES."""
+    cov = payload_stats_coverage(d)
+    if cov not in MASTER_STATS_COVERAGE_VALUES:
+        raise ValueError(
+            f"entries[{pair_index}]['value']{ctx} {MASTER_STATS_COVERAGE_KEY!r} must be one of "
+            f"{list(MASTER_STATS_COVERAGE_VALUES)!r}, got {cov!r}"
+        )
+    return cov
+
+
 def _validate_flat_single_payload(
     d: dict, pair_index: int, ctx: str
 ) -> None:
-    """``num_cores`` plus all ``MASTER_SINGLE_STAT_KEYS``; extra keys → warning only."""
+    """``num_cores`` plus the stat keys of the payload's coverage; extra keys → warning only.
+
+    A ``full`` payload carries all ``MASTER_SINGLE_STAT_KEYS``. A ``time_only`` payload carries
+    ``MASTER_TIME_ONLY_STAT_KEYS`` and none of ``MASTER_NOCTRACE_STAT_KEYS``.
+    """
     if MASTER_SINGLE_NUM_CORES_KEY not in d:
         raise ValueError(
             f"entries[{pair_index}]['value']{ctx} missing {MASTER_SINGLE_NUM_CORES_KEY!r}"
         )
     _validate_num_cores(d[MASTER_SINGLE_NUM_CORES_KEY], pair_index, ctx)
-    required = frozenset((MASTER_SINGLE_NUM_CORES_KEY, *MASTER_SINGLE_STAT_KEYS))
+    cov = _validate_stats_coverage(d, pair_index, ctx)
+    time_only = cov == MASTER_STATS_COVERAGE_TIME_ONLY
+    stat_keys = MASTER_TIME_ONLY_STAT_KEYS if time_only else MASTER_SINGLE_STAT_KEYS
+    required = frozenset((MASTER_SINGLE_NUM_CORES_KEY, *stat_keys))
     got = frozenset(d)
     missing = sorted(required - got)
     if missing:
         raise ValueError(
-            f"entries[{pair_index}]['value']{ctx} single payload missing keys: {missing!r}"
+            f"entries[{pair_index}]['value']{ctx} {cov} single payload missing keys: {missing!r}"
         )
-    extra = sorted(got - required)
+    if time_only:
+        present = sorted(got & frozenset(MASTER_NOCTRACE_STAT_KEYS))
+        if present:
+            raise ValueError(
+                f"entries[{pair_index}]['value']{ctx} time_only single payload must not carry "
+                f"NOC-trace stats: {present!r}"
+            )
+    extra = sorted(got - required - {MASTER_STATS_COVERAGE_KEY})
     for ek in extra:
         warnings.warn(
             f"entries[{pair_index}]['value']{ctx} has unknown key {ek!r} (ignored by tools; "
             f"prefer only {sorted(required)!r})",
             stacklevel=2,
         )
-    for sk in MASTER_SINGLE_STAT_KEYS:
+    for sk in stat_keys:
         v = d[sk]
         if not is_real_stat_scalar(v):
             raise ValueError(
@@ -189,8 +231,15 @@ def _validate_curve_payload(curve: dict, pair_index: int, ctx: str) -> None:
             f"entries[{pair_index}]['value']{ctx} requires {MASTER_CURVE_FAMILY_KEY!r} "
             f"{MASTER_CURVE_FAMILY_LINEAR!r} or {MASTER_CURVE_FAMILY_POWER!r}, got {fam!r}"
         )
+    if _validate_stats_coverage(curve, pair_index, ctx) == MASTER_STATS_COVERAGE_TIME_ONLY:
+        present = sorted(set(curve) & set(MASTER_NOCTRACE_STAT_KEYS))
+        if present:
+            raise ValueError(
+                f"entries[{pair_index}]['value']{ctx} time_only curve payload must not carry "
+                f"NOC-trace stat fits: {present!r}"
+            )
     for k, v in curve.items():
-        if k in (MASTER_ENTRY_TYPE_KEY, MASTER_CURVE_FAMILY_KEY):
+        if k in (MASTER_ENTRY_TYPE_KEY, MASTER_CURVE_FAMILY_KEY, MASTER_STATS_COVERAGE_KEY):
             continue
         _validate_curve_stat_entry(str(k), v, pair_index, f"{ctx} / stat {k!r}")
 
@@ -340,4 +389,14 @@ def load_existing_yaml(path: Path) -> dict[tuple, dict]:
         raise ValueError(
             f"{MASTER_YAML_ENTRIES_KEY!r} must be a list, got {type(ent)}"
         )
-    return _entries_list_to_master(ent)
+    master = _entries_list_to_master(ent)
+    # The root ``coverage`` block is derived from the entries. When present it must agree with them,
+    # so a hand-edited or partially rewritten file cannot misreport how many entries are time-only.
+    if MASTER_YAML_COVERAGE_KEY in raw:
+        declared = raw[MASTER_YAML_COVERAGE_KEY]
+        actual = master_coverage_counts(master)
+        if declared != actual:
+            raise ValueError(
+                f"{MASTER_YAML_COVERAGE_KEY!r} is {declared!r}, but the entries give {actual!r}"
+            )
+    return master

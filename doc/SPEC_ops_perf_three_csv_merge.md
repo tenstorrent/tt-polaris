@@ -1,6 +1,6 @@
 # SPEC: `ops_perf_three_csv_merge.py`
 
-Merge **exactly three** TT-Metal-style ops perf CSV files found under a root directory, optionally filter multi-iteration runs to a single representative iteration, validate, merge row-by-row on shared keys, and write **one** output CSV.
+Merge **exactly three** TT-Metal-style ops perf CSV files (or two, without the noctrace CSV, under `--allow-missing-noctrace`) found under a root directory, optionally filter multi-iteration runs to a single representative iteration, validate, merge row-by-row on shared keys, and write **one** output CSV.
 
 - **Implementation:** stdlib **`csv`** only (no pandas; openpyxl not used). **`loguru`**: non-fatal **warnings** (utilization out-of-range, fpuutil vs vanilla per-row duration tolerance, iteration-arg mismatch) and **info** aggregate summary after a successful merge.
 - **Exit code:** `0` success, `1` on any validation error (message on stderr).
@@ -9,7 +9,7 @@ Merge **exactly three** TT-Metal-style ops perf CSV files found under a root dir
 
 | Flag | Required | Default | Meaning |
 |------|----------|---------|---------|
-| `--input-dir` | yes | — | Root directory; recursively discovers exactly three `ops_perf_results_*.csv` files (falls back to `*.csv` when no name-matched files found). |
+| `--input-dir` | yes | — | Root directory; recursively discovers exactly three `ops_perf_results_*.csv` files, or two with `--allow-missing-noctrace` (falls back to `*.csv` when no name-matched files found). |
 | `--dram-peak-bw-gbps` | yes | — | Peak DRAM bandwidth in **GB/s** (MemTraffic). |
 | `--output` | no | `<input-dir>/merged_ops.csv` | Output CSV path. The filename does not encode iteration metadata (kept runtime-info-invariant for consistency across workloads). |
 | `--duration-rel-tol` | no | `0.05` | Relative tolerance for fpu vs vanilla `DEVICE KERNEL DURATION [ns]`. |
@@ -18,6 +18,7 @@ Merge **exactly three** TT-Metal-style ops perf CSV files found under a root dir
 | `--ops-per-iteration` | no | — | Per-iteration op count (model size). When provided, bypasses marker-based auto-detection and uses fixed-size chunking. Errors if the total row count is not evenly divisible by this value. |
 | `--measured-iteration-indices` | no | — | Comma-separated 0-based iteration indices to consider as candidates (e.g. `3,4,5` to skip warmup/sync). When omitted, all complete iterations are candidates. |
 | `--select-iteration` | no | `median` | How to choose among candidate iterations: `median` (lower-middle by total kernel ns), `min`, `max`, `first`, `last`. |
+| `--allow-missing-noctrace` | no | off | Accept a vanilla CSV and an fpu CSV without the noctrace CSV. See **Missing noctrace CSV**. |
 
 ## Utilization and cell parsing
 
@@ -52,6 +53,16 @@ Process each CSV independently, in order **(1) noctrace → (2) fpu → (3) vani
 Require **exactly one** file in each class. The noctrace header must be an **ordered subsequence** of the **fpu** header — every noctrace column appears in the fpu header in the same relative order, with the fpu-only columns (the perf-counter analysis block) spliced in **anywhere**, not necessarily at the end. (tt-metal interleaves the analysis columns *before* trailing op-type columns such as `TT_DNN_DEVICE_OP_TT_HOST_FUNC [ns]` that all passes share, so a strict prefix relationship does not hold.) **Vanilla** must use the **same column order** as noctrace but may **omit** `FPU Util Median (%)` and/or `SFPU Util Median (%)` only (no other omissions or extras). Required input columns for every file: join keys, `DEVICE KERNEL DURATION [ns]`, `DRAM BW UTIL (%)`, the four NOC-related utilization columns. The **fpu** CSV must include **`FPU Util Median (%)`** or **`SFPU Util Median (%)`** (the same columns that drove its fpu classification). `PM FPU UTIL (%)` is used only as a per-row fallback when writing the output `FPU Util Median (%)_fpuutil` cell, not for classification or header validation. **`DEVICE KERNEL DURATION [ms]`** may be absent in inputs (derived from ns for outputs).
 
 **Ambiguous triple “vanilla”:** If all three files would classify as vanilla (no row has non-zero `DRAM BW UTIL (%)` for step (1), and no file has parseable `FPU Util Median (%)` / `SFPU Util Median (%)` for step (2)), roles are assigned by **sorted full file path**: first → noctrace, second → fpu, third → vanilla. A **`loguru` `warning`** records the mapping.
+
+## Missing noctrace CSV (`--allow-missing-noctrace`)
+
+Long captures can lose the NOC-trace pass while the vanilla and fpu passes succeed. With `--allow-missing-noctrace`:
+
+- Discovery accepts **two** CSV files. Classification must yield exactly one **fpu** and one **vanilla** file. Three files merge exactly as without the flag (byte-identical output).
+- Without the flag, two files are a hard error. The message names the flag.
+- The vanilla header stands in for the noctrace header: the fpu header must contain it as an ordered subsequence, and fpu-only columns are those not in the vanilla header. In tt-metal captures the noctrace and vanilla headers are identical, so the base and fpu-only output columns match a three-file merge.
+- The output **omits** every column that only the noctrace CSV supplies: the whole `_noctrace` block (output step 4) and `MemUtil/Raw`. These columns are omitted, never written blank, because consumers read a blank cell as `0`. All other columns, rows and cells equal those of the three-file merge of the same vanilla and fpu CSVs.
+- One **`loguru` `warning`** lists the omitted columns. The output cannot build a LUT: `tt_perf_mapper.py` requires the DRAM, NOC and NPE columns.
 
 ## Join keys and sorting
 

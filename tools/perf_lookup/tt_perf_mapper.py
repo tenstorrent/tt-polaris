@@ -15,7 +15,8 @@ e.g. LayerNorm). The key includes ``MATH FIDELITY`` after the INPUT_0 slot. Per-
 ``interleavedtosharded`` rows extend to **10** fields (``output_0_memory`` from the OUTPUT_0_MEMORY column). Matmul uses ``entry_type:
 hybrid`` in YAML (``single`` + ``curve`` branches) when combining model and sweep data; see
 ``doc/YAML_MASTER_FORMAT.md``. CLI: repeatable ``--model-run`` and ``--sweep-run`` to merge Excel or CSV in one
-invocation (CSV is read with stdlib ``csv``; Excel ``.xlsx`` / ``.xlsm`` with **openpyxl**). Writes ``schema_name`` ``correqn.tt-perf-master``, ``schema_version`` from ``tt_perf_master_schema.MASTER_YAML_SCHEMA_VERSION`` (currently **4**).
+invocation (CSV is read with stdlib ``csv``; Excel ``.xlsx`` / ``.xlsm`` with **openpyxl**). Writes ``schema_name`` ``correqn.tt-perf-master``, ``schema_version`` from ``tt_perf_master_schema.MASTER_YAML_SCHEMA_VERSION`` (currently **6**). An input without
+the NOC-trace stat columns yields time-only entries (``stats_coverage: time_only``).
 
 Run from repository root: ``python -m tools.perf_lookup.tt_perf_mapper …``, or ``python tools/perf_lookup/tt_perf_mapper.py …`` (bootstrap adds repo root to ``sys.path``).
 """
@@ -70,7 +71,15 @@ from tools.perf_lookup.tt_perf_master_schema import (
     MASTER_SINGLE_NUM_CORES_KEY,
     MASTER_SINGLE_STAT_KEYS,
     MASTER_SINGLE_STAT_KEYS_SET,
+    MASTER_NOCTRACE_STAT_KEYS,
+    MASTER_STATS_COVERAGE_FULL,
+    MASTER_STATS_COVERAGE_KEY,
+    MASTER_STATS_COVERAGE_TIME_ONLY,
+    MASTER_TIME_ONLY_STAT_KEYS,
+    MASTER_YAML_COVERAGE_KEY,
+    master_coverage_counts,
     normalize_flat_single_payload,
+    payload_stats_coverage,
     MASTER_YAML_ENTRIES_KEY,
     MASTER_YAML_ENTRY_VALUE_FIELD,
     MASTER_YAML_RECORD_KEY_FIELD,
@@ -182,6 +191,8 @@ STATS_COLUMNS_REQUIRED = [
 # When missing, vector_pipe_util and matrix_pipe_util default to 0.
 STATS_COLUMNS_OPTIONAL_PIPE_UTIL = [EXCEL_COL_SFPU, EXCEL_COL_FPU]
 STATS_COLUMN_OPTIONAL = EXCEL_COL_MULTICAST_NOC
+# Stat columns only the NOC-trace pass supplies. All absent → time-only entries.
+STATS_COLUMNS_NOCTRACE = [EXCEL_COL_DRAM_BW_UTIL, EXCEL_COL_NOC_UTIL, EXCEL_COL_NPE_CONG, STATS_COLUMN_OPTIONAL]
 
 # Merged three-way ops CSV (e.g. ``ops_perf_three_csv_merge`` output): util columns are suffixed.
 _MERGED_OPS_STAT_ALIASES: tuple[tuple[str, str], ...] = (
@@ -415,7 +426,11 @@ def resolve_core_col(table: InputTable) -> str:
 def validate_columns(
     table: InputTable,
 ) -> tuple[str, str, list[str], list[str], list[str]]:
-    """Return (core_col, duration_col, key_cols, stat_cols_required, stat_cols_optional)."""
+    """Return (core_col, duration_col, key_cols, stat_cols_required, stat_cols_optional).
+
+    When every NOC-trace stat column is absent (a merge without the NOC-trace pass), the input is
+    time-only: ``stat_cols_required`` and ``stat_cols_optional`` are the duration column alone.
+    """
     core_col = resolve_core_col(table)
     duration_col = EXCEL_DURATION_COLUMN
     cs = table.column_set
@@ -427,7 +442,9 @@ def validate_columns(
             f"Key-tuple columns missing: {missing_key}. Available: {list(table.columns)}"
         )
     key_cols = KEY_TUPLE_COLUMN_NAMES
-    missing_stat = [c for c in STATS_COLUMNS_REQUIRED if c not in cs]
+    time_only = not any(c in cs for c in STATS_COLUMNS_NOCTRACE)
+    required = [EXCEL_DURATION_COLUMN] if time_only else STATS_COLUMNS_REQUIRED
+    missing_stat = [c for c in required if c not in cs]
     if missing_stat:
         raise KeyError(
             f"Stats columns missing: {missing_stat}. Available: {list(table.columns)}"
@@ -439,6 +456,16 @@ def validate_columns(
             "These are present in sweep/Excel exports but not in raw profiler CSVs.",
             missing_pipe_util,
         )
+    if time_only:
+        # A merge without the NOC-trace pass (``--allow-missing-noctrace``): build time-only
+        # entries, which omit the NOC-trace stats instead of recording them as 0.
+        logger.warning(
+            "NOC-trace stat columns absent ({}): building time-only entries "
+            "(stats_coverage: time_only) without {}.",
+            STATS_COLUMNS_NOCTRACE,
+            list(MASTER_NOCTRACE_STAT_KEYS),
+        )
+        return core_col, duration_col, key_cols, required, list(required)
     stat_cols = STATS_COLUMNS_REQUIRED.copy()
     if STATS_COLUMN_OPTIONAL in cs:
         stat_cols.append(STATS_COLUMN_OPTIONAL)
@@ -645,8 +672,13 @@ def build_stats_row(
     stat_cols: list[str],
     duration_col: str,
     core_col: str,
+    time_only: bool = False,
 ) -> dict | None:
-    """Build stats dict. None if non-numeric stat (skip row)."""
+    """Build stats dict. None if non-numeric stat (skip row).
+
+    With ``time_only`` (no NOC-trace columns), the dict holds ``MASTER_TIME_ONLY_STAT_KEYS`` only:
+    the NOC-trace stats are omitted, not set to 0.
+    """
     duration_ns = row.get(duration_col)
     if duration_ns is None or is_na(duration_ns):
         return None
@@ -654,6 +686,15 @@ def build_stats_row(
         duration_ns = float(duration_ns)
     except (TypeError, ValueError):
         return None
+    if time_only:
+        time_stats = {
+            MASTER_DURATION_MS_KEY: duration_ns / NS_PER_MS,
+            OUTPUT_KEY_VECTOR_PIPE_UTIL: _stat_float(row.get(EXCEL_COL_SFPU)),
+            OUTPUT_KEY_MATRIX_PIPE_UTIL: _stat_float(row.get(EXCEL_COL_FPU)),
+        }
+        if any(v is None for v in time_stats.values()):
+            return None
+        return {k: time_stats[k] for k in MASTER_TIME_ONLY_STAT_KEYS}
     util_pct = row.get(EXCEL_COL_DRAM_BW_UTIL)
     if util_pct is None or is_na(util_pct) or (isinstance(util_pct, str) and not util_pct.strip()):
         util_pct = 0.0
@@ -910,6 +951,16 @@ def group_and_sanitize(
     return accepted
 
 
+def _time_only_marker(stats: dict) -> dict:
+    """``{stats_coverage: time_only}`` when ``stats`` lacks the NOC-trace stats, else ``{}``.
+
+    Full entries carry no marker, so their YAML is unchanged from earlier schema versions.
+    """
+    if any(k in stats for k in MASTER_NOCTRACE_STAT_KEYS):
+        return {}
+    return {MASTER_STATS_COVERAGE_KEY: MASTER_STATS_COVERAGE_TIME_ONLY}
+
+
 def build_master_dict(
     accepted: list[tuple[tuple, float, dict, str, list]],
     mode: str,
@@ -962,6 +1013,7 @@ def build_master_dict(
                 MASTER_ENTRY_TYPE_KEY: MASTER_ENTRY_TYPE_SINGLE,
                 MASTER_SINGLE_NUM_CORES_KEY: core_key,
                 **rep,
+                **_time_only_marker(rep),
             }
         else:  # curve
             if n_cores < 2:
@@ -1035,6 +1087,7 @@ def build_master_dict(
                 MASTER_ENTRY_TYPE_KEY: MASTER_ENTRY_TYPE_CURVE,
                 MASTER_CURVE_FAMILY_KEY: family,
                 **curve_val,
+                **_time_only_marker(rep_by_core[core_counts[0]]),
             }
             curve_meta[key_t] = {
                 "family": family,
@@ -1104,14 +1157,32 @@ def _matmul_entry_to_hybrid(val: dict) -> dict:
     )
 
 
-def _merge_hybrid_matmul(old: dict, new: dict) -> dict:
-    """Merge two hybrid matmul entries; later ``single`` / ``curve`` branches win."""
+def _keeps_old_payload(old: dict | None, new: dict, key_t: tuple, what: str) -> bool:
+    """True when ``new`` must not replace ``old``: a time-only payload never replaces a full one."""
+    if old is None:
+        return False
+    if (payload_stats_coverage(new) == MASTER_STATS_COVERAGE_TIME_ONLY
+            and payload_stats_coverage(old) == MASTER_STATS_COVERAGE_FULL):
+        logger.warning(
+            "Keeping the existing full {} for key_tuple; the new time-only {} does not replace it: {}",
+            what,
+            what,
+            tuple_to_labeled_key_map(key_t),
+        )
+        return True
+    return False
+
+
+def _merge_hybrid_matmul(old: dict, new: dict, key_t: tuple = ()) -> dict:
+    """Merge two hybrid matmul entries; later ``single`` / ``curve`` branches win.
+
+    Each branch is replaced whole, never merged field by field, so one payload never mixes stats
+    from two captures. A time-only branch does not replace a full one.
+    """
     os_single = old.get(MASTER_HYBRID_SINGLE_KEY)
     ns_single = new.get(MASTER_HYBRID_SINGLE_KEY)
-    if ns_single is not None:
-        merged_single = normalize_flat_single_payload(
-            {**(dict(os_single) if os_single else {}), **dict(ns_single)}
-        )
+    if ns_single is not None and not _keeps_old_payload(os_single, ns_single, key_t, "hybrid.single"):
+        merged_single = normalize_flat_single_payload(dict(ns_single))
     elif os_single is not None:
         merged_single = normalize_flat_single_payload(dict(os_single))
     else:
@@ -1120,7 +1191,11 @@ def _merge_hybrid_matmul(old: dict, new: dict) -> dict:
         merged_single = None
     oc = old.get(MASTER_HYBRID_CURVE_KEY)
     nc = new.get(MASTER_HYBRID_CURVE_KEY)
-    merged_curve = dict(nc) if nc is not None else (dict(oc) if oc is not None else None)
+    merged_curve: dict | None
+    if nc is not None and not _keeps_old_payload(oc, nc, key_t, "hybrid.curve"):
+        merged_curve = dict(nc)
+    else:
+        merged_curve = dict(oc) if oc is not None else None
     out: dict = {MASTER_ENTRY_TYPE_KEY: MASTER_ENTRY_TYPE_HYBRID}
     if merged_single:
         out[MASTER_HYBRID_SINGLE_KEY] = merged_single
@@ -1148,12 +1223,14 @@ def merge_entry_for_key(
                 f"Key {tuple_to_labeled_key_map(key_t)} has existing entry type "
                 f"{old_kind!r} but this run produced {new_kind!r}. Exit."
             )
+        if _keeps_old_payload(old_val, new_val, key_t, "entry"):
+            return dict(old_val)
         return dict(new_val)
     h_new = _matmul_entry_to_hybrid(new_val)
     if old_val is None:
         return h_new
     h_old = _matmul_entry_to_hybrid(old_val)
-    return _merge_hybrid_matmul(h_old, h_new)
+    return _merge_hybrid_matmul(h_old, h_new, key_t)
 
 
 def _merge_entry_kind(val: dict) -> str:
@@ -1319,13 +1396,15 @@ def format_dry_run_report(
 
 
 def serialize_master_for_yaml(master: dict[tuple, dict]) -> dict:
-    """Build YAML document: schema_name, schema_version, entries.
+    """Build YAML document: schema_name, schema_version, coverage, entries.
 
     Each list item is ``{key: labeled_key_map, value: entry_dict}`` (see wire constants).
+    ``coverage`` is recomputed from the entries on every write.
     """
     return {
         MASTER_YAML_SCHEMA_NAME_KEY: MASTER_YAML_SCHEMA_NAME,
         MASTER_YAML_SCHEMA_VERSION_KEY: MASTER_YAML_SCHEMA_VERSION,
+        MASTER_YAML_COVERAGE_KEY: master_coverage_counts(master),
         MASTER_YAML_ENTRIES_KEY: [
             {
                 MASTER_YAML_RECORD_KEY_FIELD: tuple_to_labeled_key_map(k),
@@ -1389,6 +1468,7 @@ def process_excel_to_master(
     except KeyError as e:
         logger.error("{}", e)
         return 2, {}, {}, excel_path
+    time_only = EXCEL_COL_DRAM_BW_UTIL not in stat_required
 
     pad_suffixes = (
         "_W_PAD[LOGICAL]",
@@ -1440,7 +1520,7 @@ def process_excel_to_master(
             )
             continue
         stats = build_stats_row(
-            row, dram_bw_gbps, stat_cols, duration_col, core_col
+            row, dram_bw_gbps, stat_cols, duration_col, core_col, time_only=time_only
         )
         if stats is None:
             logger.warning(

@@ -71,6 +71,10 @@ from tools.perf_lookup.tt_perf_master_schema import (
     MASTER_HYBRID_CURVE_KEY,
     MASTER_HYBRID_SINGLE_KEY,
     MASTER_SINGLE_NUM_CORES_KEY,
+    MASTER_STATS_COVERAGE_FULL,
+    MASTER_STATS_COVERAGE_TIME_ONLY,
+    master_coverage_counts,
+    payload_stats_coverage,
     tuple_to_labeled_key_map,
     MATH_FIDELITY_NA,
 )
@@ -287,6 +291,9 @@ class MasterPerfStats:
     # returns None entirely (analytical fallback in the caller), no MasterPerfStats
     # is produced, so device.py emits "analytical" in the CSV based on the absence.
     hit_source: Optional[str] = None
+    # Coverage of the payload that produced this hit: "full", or "time_only" when the LUT entry
+    # has no NOC-trace stats. For "time_only", memory_traffic and mem_util are None: not measured.
+    stats_coverage: str = MASTER_STATS_COVERAGE_FULL
 
 
 def _eval_curve_value(family: str, a: float, b: float, core_count: int) -> float:
@@ -329,6 +336,17 @@ def _resolve_stat_from_curve(
     if a is None or b is None:
         return None
     return _eval_curve_value(family, float(a), float(b), core_count)
+
+
+def _resolved_payload_coverage(entry_val: dict, entry_type: str, use_hybrid_curve: bool) -> str:
+    """Stats coverage of the payload ``_build_stat_resolver`` reads for this entry."""
+    if entry_type == MASTER_ENTRY_TYPE_HYBRID:
+        curve_sub = entry_val.get(MASTER_HYBRID_CURVE_KEY)
+        if use_hybrid_curve and isinstance(curve_sub, dict):
+            return payload_stats_coverage(curve_sub)
+        single_sub = entry_val.get(MASTER_HYBRID_SINGLE_KEY)
+        return payload_stats_coverage(single_sub) if isinstance(single_sub, dict) else MASTER_STATS_COVERAGE_FULL
+    return payload_stats_coverage(entry_val)
 
 
 def _maybe_warn_single_core_mismatch(
@@ -841,6 +859,17 @@ class OperatorPerfMap:
         self._source_path = yaml_path
         self._use_hybrid_curve = bool(use_hybrid_curve)
         self._device_norm_index: Optional[Dict[tuple, list]] = None
+        self.coverage_counts: Dict[str, int] = master_coverage_counts(self._entries)
+        n_time_only = self.coverage_counts[MASTER_STATS_COVERAGE_TIME_ONLY]
+        if n_time_only:
+            logger.warning(
+                "LUT {} has {} time-only entr{} of {}: hits on them report memory traffic and "
+                "DRAM utilization as not measured (empty), not 0.",
+                yaml_path,
+                n_time_only,
+                "y" if n_time_only == 1 else "ies",
+                len(self._entries),
+            )
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -916,6 +945,7 @@ class OperatorPerfMap:
             key_literal=key_literal if key_literal is not None else key_t,
             key_resolved=key_t,
             hit_source=hit_source,
+            stats_coverage=_resolved_payload_coverage(entry_val, et, self._use_hybrid_curve),
         )
 
     def _build_literal_key_with_tensors(

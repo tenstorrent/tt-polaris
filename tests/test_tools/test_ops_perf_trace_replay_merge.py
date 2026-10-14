@@ -12,6 +12,7 @@ import csv
 
 import pytest
 
+from tools.si_profiling_helpers.ops_perf_three_csv_merge import NOCTRACE_ONLY_OUTPUT_COLUMNS
 from tools.si_profiling_helpers.ops_perf_trace_replay_merge import (
     COL_REPLAY_SESSION_ID,
     COL_TRACE_ID,
@@ -171,6 +172,7 @@ def test_reduce_trace_replay_drops_compile_and_selects_one_session():
     # the default selects the first candidate step -> session '1', ns=100.
     assert {r[COL_REPLAY_SESSION_ID] for r in van} == {'1'}
     assert len(set(_keys(van))) == len(van)
+    assert noc is not None
     assert len(noc) == len(fpu) == len(van)
 
 
@@ -371,6 +373,40 @@ def test_main_drops_signpost_rows_in_trace_replay(tmp_path):
         rows = list(csv.DictReader(fh))
     assert {r['OP CODE'] for r in rows} == {'Matmul', 'Add'}
     assert all(r['OP TYPE'] != 'signpost' for r in rows)
+
+
+@pytest.mark.unit
+def test_main_merges_without_noctrace_with_flag(tmp_path):
+    # A prefill-shaped capture with no NOC-trace pass: the merge keeps the same step and
+    # rows as the three-CSV merge and omits exactly the noctrace-only columns.
+    capture = _prefill_like([['Norm', 'LMHead'], ['Norm', 'LMHead']])
+    for d, files in (('three', ('trace', 'perf', 'raw')), ('two', ('perf', 'raw'))):
+        (tmp_path / d).mkdir()
+        kw = {'trace': {'DRAM BW UTIL (%)': '45.2'}, 'perf': {'FPU Util Median (%)': '62.1'}, 'raw': {}}
+        for name in files:
+            _write_csv(tmp_path / d / f'{name}.csv', [{**r, **kw[name]} for r in capture])
+
+    def merge(d, *extra):
+        out = tmp_path / f'{d}.csv'
+        rc = main(['--input-dir', str(tmp_path / d), '--dram-peak-bw-gbps', '288.0',
+                   '--output', str(out), '--duration-rel-tol', '1e9', *extra])
+        assert rc == 0
+        with out.open(newline='') as fh:
+            return list(csv.reader(fh))
+
+    full = merge('three')
+    two = merge('two', '--allow-missing-noctrace')
+    keep = [i for i, c in enumerate(full[0]) if c not in NOCTRACE_ONLY_OUTPUT_COLUMNS]
+    assert len(full[0]) - len(keep) == len(NOCTRACE_ONLY_OUTPUT_COLUMNS)
+    assert two == [[r[i] for i in keep] for r in full]
+
+
+@pytest.mark.unit
+def test_reduce_trace_replay_without_noctrace_rows():
+    rows = _prefill_like([['Norm'], ['Norm']])
+    noc, fpu, van = reduce_trace_replay(None, list(rows), list(rows))
+    assert noc is None
+    assert _keys(fpu) == _keys(van) == _keys(reduce_trace_replay(list(rows), list(rows), list(rows))[2])
 
 
 @pytest.mark.unit

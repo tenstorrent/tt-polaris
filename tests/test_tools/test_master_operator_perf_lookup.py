@@ -1401,3 +1401,57 @@ def test_device_normalized_fallback_declines_multidevice_ambiguity(tmp_path: Pat
 
     st = m.lookup(op, g, core_count=8)
     assert st is None, "ambiguous multi-device candidates must not be reconciled by the device fallback"
+
+
+def _softmax_time_only_doc(time_only: bool) -> dict:
+    value = _flat_single_value(8, msecs=0.03, mem_util=20.0, memory_traffic=1000.0)
+    if time_only:
+        for k in ("memory_traffic", "mem_util", "noc_util", "noc_multicast_util", "npe_cong_impact_pct"):
+            del value[k]
+        value["stats_coverage"] = "time_only"
+    return {
+        "schema_name": "correqn.tt-perf-master",
+        "schema_version": 6,
+        "entries": [
+            {
+                "key": {
+                    "op_code": "softmax",
+                    "input_0_w_pad_logical": 1,
+                    "input_0_z_pad_logical": 1,
+                    "input_0_y_pad_logical": 2,
+                    "input_0_x_pad_logical": 3,
+                    "input_0_layout": "TILE",
+                    "input_0_datatype": "BFLOAT16",
+                    "input_0_memory": "DEV_1_DRAM_INTERLEAVED",
+                    "math_fidelity": "N/A",
+                },
+                "value": value,
+            }
+        ],
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("time_only", [True, False], ids=["time_only", "full"])
+def test_lookup_hit_reports_stats_coverage(tmp_path: Path, time_only: bool):
+    from tools.perf_lookup.lookup_operator_perf import OperatorPerfMap
+
+    p = tmp_path / "lut.yaml"
+    p.write_text(yaml.dump(_softmax_time_only_doc(time_only), sort_keys=False), encoding="utf-8")
+    m = OperatorPerfMap(p)
+    assert m.coverage_counts == {"full": 0 if time_only else 1, "time_only": 1 if time_only else 0}
+
+    t0 = SimTensor({"name": "a", "shape": [1, 2, 3], "op_in": [], "op_out": []})
+    op = SimpleNamespace(optype="Softmax", precision="BF16", inList=["a"])
+    st = m.lookup(op, SimpleNamespace(_tensors={"a": t0}), core_count=8)
+    assert st is not None
+    assert st.msecs == pytest.approx(0.03)
+    if time_only:
+        # Not measured: absent, never 0.
+        assert st.stats_coverage == "time_only"
+        assert st.memory_traffic is None
+        assert st.mem_util is None
+    else:
+        assert st.stats_coverage == "full"
+        assert st.memory_traffic == pytest.approx(1000.0)
+        assert st.mem_util == pytest.approx(20.0)
