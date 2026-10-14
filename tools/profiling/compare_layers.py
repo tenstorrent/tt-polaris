@@ -37,6 +37,15 @@ except ImportError:
 # Maximum distance to search forward for matching operations
 DEFAULT_MAX_SEARCH_DISTANCE = 10
 
+# Trace-replay step selection is shared with the merge tool (ops_perf_trace_replay_merge, #538), so
+# the report and the merged CSV agree on what one step is. Run as a script, sys.path[0] is
+# tools/profiling and the repo-root package path is absent, hence the fallback.
+try:
+    from tools.si_profiling_helpers import ops_perf_trace_replay_merge as _trace_merge
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tools.si_profiling_helpers import ops_perf_trace_replay_merge as _trace_merge
+
 # Import layer extraction functions
 try:
     from show_layers_polaris import layers_polaris  # type: ignore[import-not-found]
@@ -47,104 +56,99 @@ except ImportError:
     from .show_layers_profiler import layers_profiler  # type: ignore
 
 
-# Trace-replay dedup: HW captures running with METAL_TRACE_REPLAY emit one
-# `(METAL TRACE REPLAY SESSION ID)` column whose value identifies the replay
-# session for each row. The op sequence is repeated once per session, so the
-# raw profiler CSV is N×ops_per_session rows long. compare_layers picks one
-# representative session (median total duration) and discards the rest.
+# Trace-replay dedup: HW captures running with METAL_TRACE_REPLAY tag each replayed
+# row with a `METAL TRACE REPLAY SESSION ID`. The model step repeats once per replay,
+# so the raw profiler CSV holds N steps after a prologue. compare_layers keeps one
+# step (selected as the merge tool does; default: the first candidate) and discards the rest.
 _REPLAY_SESSION_COL = 'METAL TRACE REPLAY SESSION ID'
 _DURATION_NS_COL = 'DEVICE KERNEL DURATION [ns]'
 _SEQNO_COL = 'GLOBAL CALL COUNT'
+_ROW_INDEX_KEY = '__compare_layers_row_index__'  # tags each CSV row with its position
+STEP_SELECT_CHOICES = _trace_merge.SESSION_SELECT_CHOICES
 
 
 @dataclass
 class TraceReplayInfo:
     """Structure detected in a profiler CSV."""
     has_trace_replay: bool
-    n_sessions: int          # number of distinct replay session IDs
-    ops_per_session: int     # ops in the largest session (expected uniform)
-    setup_op_count: int      # rows with no session ID (warmup + trace-capture)
-    selected_session: int    # session ID chosen for comparison (0 if N/A)
-    selected_duration_ns: float  # total device-kernel duration of chosen session
+    n_steps: int             # number of trace-replay steps
+    ops_per_step: int        # ops in the selected step
+    setup_op_count: int      # rows outside every step (prologue + trace-capture rows)
+    selected_step: int       # 1-based step index chosen for comparison (0 if N/A); not a session ID
+    selected_duration_ns: float  # total device-kernel duration of the selected step
 
 
-def _detect_trace_replay(filepath: str) -> Tuple['TraceReplayInfo', Dict[int, List[Tuple[int, float]]]]:
-    """Scan the raw profiler CSV for METAL TRACE REPLAY SESSION ID structure.
+def _detect_trace_replay(
+    filepath: str, select: str = 'first',
+) -> Tuple['TraceReplayInfo', Dict[int, List[Tuple[int, float]]]]:
+    """Scan the raw profiler CSV for trace-replay **steps** and choose one.
 
-    Returns ``(info, sessions)`` where ``sessions`` maps session_id to a list
-    of ``(row_index, duration_ns)`` tuples.  ``row_index`` is the 0-based
-    position of the row in the CSV data (excluding header), which aligns
-    directly with the index in the list returned by ``layers_profiler``.
+    Returns ``(info, steps)`` where ``steps`` maps step number (1-based, capture order) to a list
+    of ``(row_index, duration_ns)`` tuples.  ``row_index`` is the 0-based position of the row in
+    the CSV data (excluding header), which aligns directly with the index in the list returned by
+    ``layers_profiler``.
 
-    Using row index rather than GLOBAL CALL COUNT is necessary because the
-    hardware trace replay re-uses the same GLOBAL CALL COUNT values for every
-    replay session — seqnos are NOT unique across sessions.
+    Steps and the selection come from ops_perf_trace_replay_merge (``split_steps`` /
+    ``select_step``): a step is one replay session of the first replayed trace plus every following
+    row up to that trace's next replay session, capture rows excluded, so eager ops that run after
+    each replay (llama3 prefill's final norm, lm_head and sampling) belong to the step.  ``select``
+    takes the merge tool's ``--select-session`` values; the default ``first`` matches the merge.
+
+    Using row index rather than GLOBAL CALL COUNT is necessary because the hardware trace replay
+    re-uses the same GLOBAL CALL COUNT values for every replay session — seqnos are NOT unique
+    across sessions.
     """
-    sessions: DefaultDict[int, List[Tuple[int, float]]] = defaultdict(list)
-    setup_row_count = 0
-    has_replay_col = False
-
     with open(filepath, 'r') as fh:
-        reader = csv.DictReader(fh)
-        headers = reader.fieldnames or []
-        has_replay_col = _REPLAY_SESSION_COL in headers
-        for row_idx, row in enumerate(reader):
-            dur_raw = (row.get(_DURATION_NS_COL) or '').strip()
-            try:
-                dur_ns = float(dur_raw) if dur_raw else 0.0
-            except ValueError:
-                dur_ns = 0.0
-            sid_raw = (row.get(_REPLAY_SESSION_COL, '') or '').strip() if has_replay_col else ''
-            if sid_raw:
-                try:
-                    sid = int(float(sid_raw))
-                    sessions[sid].append((row_idx, dur_ns))
-                except ValueError:
-                    setup_row_count += 1
-            else:
-                setup_row_count += 1
+        rows = list(csv.DictReader(fh))
+    for row_idx, row in enumerate(rows):
+        row[_ROW_INDEX_KEY] = str(row_idx)
 
-    if not sessions:
+    if not any((row.get(_REPLAY_SESSION_COL) or '').strip() for row in rows):
         return TraceReplayInfo(
             has_trace_replay=False,
-            n_sessions=0,
-            ops_per_session=0,
-            setup_op_count=setup_row_count,
-            selected_session=0,
+            n_steps=0,
+            ops_per_step=0,
+            setup_op_count=len(rows),
+            selected_step=0,
             selected_duration_ns=0.0,
         ), {}
 
-    session_totals = {sid: sum(d for _, d in rows) for sid, rows in sessions.items()}
-    sorted_sids = sorted(session_totals, key=lambda s: session_totals[s])
-    selected_sid = sorted_sids[len(sorted_sids) // 2]
-    ops_per_session = max(len(v) for v in sessions.values())
+    steps = _trace_merge.split_steps(rows)
+    chosen = _trace_merge.select_step(steps, select)
 
+    def _dur(row: Dict[str, str]) -> float:
+        v = _trace_merge.parse_finite_float(row.get(_DURATION_NS_COL))
+        return v if v is not None else 0.0
+
+    by_step = {i + 1: [(int(r[_ROW_INDEX_KEY]), _dur(r)) for r in st] for i, st in enumerate(steps)}
     return TraceReplayInfo(
         has_trace_replay=True,
-        n_sessions=len(sessions),
-        ops_per_session=ops_per_session,
-        setup_op_count=setup_row_count,
-        selected_session=selected_sid,
-        selected_duration_ns=session_totals[selected_sid],
-    ), dict(sessions)
+        n_steps=len(steps),
+        ops_per_step=len(steps[chosen]),
+        setup_op_count=len(rows) - sum(len(st) for st in steps),
+        selected_step=chosen + 1,
+        selected_duration_ns=sum(d for _, d in by_step[chosen + 1]),
+    ), by_step
 
 
 def _maybe_dedup_profiler_layers(
     layers: List[Dict[str, Any]],
     filepath: str,
+    select: str = 'first',
 ) -> List[Dict[str, Any]]:
     """Apply trace-replay deduplication to a profiler layer list if needed.
 
-    Detects trace structure from the raw CSV, picks the median-total-duration
-    replay session, and returns only those layers.  Setup-only ops (warmup,
-    trace-capture) are excluded because they do not contribute to device-only FPS.
+    Detects trace-replay steps in the raw CSV, picks one (``select``, as the merge tool's
+    ``--select-session``), and returns only that step's layers.  Prologue ops (setup, compile
+    run) and trace-capture rows are excluded because they do not contribute to device-only FPS.
+    Raises ``MergeError`` when no representative step can be chosen.
 
     Also performs self-checks:
     - Warns when dedup appears necessary but the session ID column is absent.
-    - Warns when session sizes are uneven (unexpected replay structure).
+    - Warns when step sizes are uneven (e.g. a warmup step with extra ops).
     - Confirms when the file is a clean single-pass run requiring no dedup.
     """
-    info, sessions = _detect_trace_replay(filepath)
+    info, steps = _detect_trace_replay(filepath, select)
 
     if not info.has_trace_replay:
         # Self-check: duplicate GLOBAL CALL COUNT (seqno) values are a reliable
@@ -168,27 +172,27 @@ def _maybe_dedup_profiler_layers(
         return layers
 
     print(
-        f'Trace replay detected: {info.n_sessions} session(s) x {info.ops_per_session} ops, '
-        f'{info.setup_op_count} setup-only rows excluded'
+        f'Trace replay detected: {info.n_steps} step(s) x {info.ops_per_step} ops, '
+        f'{info.setup_op_count} prologue/capture rows excluded'
     )
 
-    session_sizes = {sid: len(rows) for sid, rows in sessions.items()}
-    if len(set(session_sizes.values())) > 1:
+    step_sizes = {step: len(rows) for step, rows in steps.items()}
+    if len(set(step_sizes.values())) > 1:
         print(
-            f'WARNING: replay sessions have uneven op counts: {session_sizes}  '
-            f'- unexpected structure; using largest session size as reference.',
+            f'WARNING: trace-replay steps have uneven op counts: {step_sizes}  '
+            f'- the selected step has the most frequent op sequence.',
             file=sys.stderr,
         )
 
     print(
-        f'Selected session {info.selected_session} '
-        f'(median total duration {info.selected_duration_ns / 1e6:.3f} ms)'
+        f'Selected step {info.selected_step} (select={select!r}, '
+        f'total duration {info.selected_duration_ns / 1e6:.3f} ms)'
     )
 
-    selected_indices = {row_idx for row_idx, _ in sessions[info.selected_session]}
+    selected_indices = {row_idx for row_idx, _ in steps[info.selected_step]}
     deduped = [layer for i, layer in enumerate(layers) if i in selected_indices]
 
-    expected = info.ops_per_session
+    expected = info.ops_per_step
     if len(deduped) != expected:
         print(
             f'WARNING: expected {expected} layers after dedup but got {len(deduped)} '
@@ -318,6 +322,11 @@ def parse_args() -> argparse.Namespace:
         description='Compare Polaris and Profiler CSV layer sequences'
     )
     parser.add_argument('file1', type=str, help='First CSV file (polaris or profiler)')
+    parser.add_argument(
+        '--select-step', choices=STEP_SELECT_CHOICES, default='first',
+        help="Trace-replay captures: which step to compare (same values and default as "
+             "ops_perf_trace_replay_merge.py --select-session). A merged CSV holds one step.",
+    )
     parser.add_argument('file2', type=str, nargs='?', default=None,
                         help='Second CSV file (optional; required for shape comparison)')
     parser.add_argument(
@@ -2049,7 +2058,11 @@ def main() -> int:
         print(f"Loaded {len(layers)} {label.lower()} layers")
 
         if ftype == 'profiler':
-            layers = _maybe_dedup_profiler_layers(layers, str(file1_path))
+            try:
+                layers = _maybe_dedup_profiler_layers(layers, str(file1_path), args.select_step)
+            except _trace_merge.MergeError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                return 1
 
         if args.filter_optype:
             filter_norm = normalize_optype(args.filter_optype)
@@ -2134,12 +2147,16 @@ def main() -> int:
 
     print(f"Loaded {len(layers1)} {label1} layers, {len(layers2)} {label2} layers")
 
-    if type1 == 'profiler':
-        print(f'\n[{label1}] ', end='')
-        layers1 = _maybe_dedup_profiler_layers(layers1, str(file1_path))
-    if type2 == 'profiler':
-        print(f'\n[{label2}] ', end='')
-        layers2 = _maybe_dedup_profiler_layers(layers2, str(file2_path))
+    try:
+        if type1 == 'profiler':
+            print(f'\n[{label1}] ', end='')
+            layers1 = _maybe_dedup_profiler_layers(layers1, str(file1_path), args.select_step)
+        if type2 == 'profiler':
+            print(f'\n[{label2}] ', end='')
+            layers2 = _maybe_dedup_profiler_layers(layers2, str(file2_path), args.select_step)
+    except _trace_merge.MergeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     # Filter by optype if requested
     if args.filter_optype:

@@ -579,3 +579,128 @@ def test_perf_comparison_no_lut_hides_all_lut_columns(capsys):
 
     assert 'LUT1' not in out
     assert 'LUT2' not in out
+
+
+def _write_trace_csv(path, rows):
+    """rows: (op_code, trace_id, session_id, duration_ns or '') -> minimal profiler CSV.
+
+    GLOBAL CALL COUNT is numbered by row; layers_profiler requires it, step selection ignores it.
+    """
+    import csv
+    with open(path, 'w', newline='') as fh:
+        w = csv.writer(fh)
+        w.writerow(['OP CODE', 'GLOBAL CALL COUNT', 'METAL TRACE ID', 'METAL TRACE REPLAY SESSION ID',
+                    'DEVICE KERNEL DURATION [ns]'])
+        w.writerows((op, seqno, *rest) for seqno, (op, *rest) in enumerate(rows, start=1))
+
+
+def _prefill_like_rows(n_steps, tail_durations=None):
+    """Setup + compile + capture prologue, then n replays each followed by an eager tail."""
+    rows = [('Tilize', '', '', 5),                         # setup
+            ('Matmul', '', '', 100), ('Add', '', '', 10),  # compile run
+            ('Matmul', '', '', ''), ('Add', '', '', '')]   # trace capture (no device time)
+    for i in range(n_steps):
+        tail = (tail_durations or [70] * n_steps)[i]
+        rows += [('Matmul', '0', str(i + 1), 100), ('Add', '0', str(i + 1), 10),
+                 ('Matmul', '', '', 50), ('TopK', '', '', tail)]
+    return rows
+
+
+@pytest.mark.unit
+def test_trace_replay_step_keeps_eager_tail(tmp_path):
+    """A step is a replay session of the first trace plus the eager rows after it (#538).
+
+    llama3 prefill traces only the forward; the lm_head and sampling run eagerly after each replay
+    with a blank session id. Selecting by session id alone dropped them.
+    """
+    from tools.profiling.compare_layers import _detect_trace_replay
+    path = tmp_path / 'trace.csv'
+    _write_trace_csv(path, _prefill_like_rows(2))
+
+    info, steps = _detect_trace_replay(str(path))
+    assert info.has_trace_replay and info.n_steps == 2 and info.ops_per_step == 4
+    assert info.setup_op_count == 5                    # setup + compile + capture rows
+    assert [len(v) for v in steps.values()] == [4, 4]
+    assert info.selected_step == 1                  # default 'first', as the merge tool
+    assert info.selected_duration_ns == 230.0          # forward 110 + eager tail 120
+
+
+@pytest.mark.unit
+def test_trace_replay_step_selection_matches_merge_tool(tmp_path):
+    """--select-step takes the merge tool's values; min/max pick among same-signature steps."""
+    from tools.profiling.compare_layers import _detect_trace_replay
+    path = tmp_path / 'trace.csv'
+    _write_trace_csv(path, _prefill_like_rows(3, tail_durations=[90, 60, 70]))
+    assert _detect_trace_replay(str(path), 'first')[0].selected_step == 1
+    assert _detect_trace_replay(str(path), 'min')[0].selected_step == 2
+    assert _detect_trace_replay(str(path), 'max')[0].selected_step == 1
+    assert _detect_trace_replay(str(path), 'median')[0].selected_step == 3
+
+
+@pytest.mark.unit
+def test_trace_replay_step_tie_is_an_error(tmp_path):
+    """Two steps with different op sequences give no representative step: refuse to guess."""
+    from tools.profiling.compare_layers import _detect_trace_replay, _trace_merge
+    path = tmp_path / 'trace.csv'
+    _write_trace_csv(path, [('Matmul', '0', '1', 100), ('Sampling', '', '', 5),
+                            ('Matmul', '0', '2', 100)])
+    with pytest.raises(_trace_merge.MergeError):
+        _detect_trace_replay(str(path))
+
+
+@pytest.mark.unit
+def test_trace_replay_step_on_merged_csv(tmp_path):
+    """A #539-merged CSV is one step: one session's rows followed by its eager tail."""
+    from tools.profiling.compare_layers import _detect_trace_replay
+    path = tmp_path / 'merged.csv'
+    _write_trace_csv(path, [('Matmul', '0', '2', 100), ('Add', '0', '2', 10), ('TopK', '', '', 70)])
+    info, steps = _detect_trace_replay(str(path))
+    assert info.n_steps == 1 and info.ops_per_step == 3 and info.setup_op_count == 0
+
+
+@pytest.mark.unit
+def test_compare_layers_runs_as_script(tmp_path):
+    """Run by path (as run_projections_and_compare does), the repo root is not on sys.path.
+
+    Covers the ops_perf_trace_replay_merge import fallback, which package imports never reach.
+    """
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    script = Path(__file__).resolve().parents[2] / 'tools' / 'profiling' / 'compare_layers.py'
+    env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+    proc = subprocess.run([sys.executable, str(script), '--help'], cwd=tmp_path, env=env,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert '--select-step' in proc.stdout
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('argv, expected', [
+    ([], "Selected step 1 (select='first'"),
+    (['--select-step', 'last'], "Selected step 3 (select='last'"),
+    (['--select-step', 'min'], "Selected step 2 (select='min'"),
+])
+def test_select_step_cli_reaches_dedup(tmp_path, monkeypatch, capsys, argv, expected):
+    """--select-step is parsed and passed through main() to the trace-replay dedup."""
+    import sys
+    from tools.profiling.compare_layers import main
+    path = tmp_path / 'trace.csv'
+    _write_trace_csv(path, _prefill_like_rows(3, tail_durations=[90, 60, 70]))
+    monkeypatch.setenv('POLARIS_BASE_DIR', str(tmp_path))
+    monkeypatch.setattr(sys, 'argv', ['compare_layers.py', *argv, '--perf', str(path)])
+    assert main() == 0
+    assert expected in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_select_step_cli_rejects_unknown_value(monkeypatch, capsys):
+    """Values outside the merge tool's --select-session choices are an argparse error."""
+    import sys
+    from tools.profiling.compare_layers import parse_args
+    monkeypatch.setattr(sys, 'argv', ['compare_layers.py', '--select-step', 'mean', 'x.csv'])
+    with pytest.raises(SystemExit) as exc:
+        parse_args()
+    assert exc.value.code == 2
+    assert "invalid choice: 'mean'" in capsys.readouterr().err
