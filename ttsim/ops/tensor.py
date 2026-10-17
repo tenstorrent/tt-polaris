@@ -238,7 +238,10 @@ class SimTensor:
             elif isinstance(dtype, str):
                 return get_bpe(get_sim_dtype(dtype))
             else:
-                raise TypeError(f"Unsupported dtype type: {type(dtype)}")
+                try:
+                    return np.dtype(dtype).itemsize
+                except Exception:
+                    raise TypeError(f"Unsupported dtype type: {type(dtype)}")
         if itemprec is None:
             assert self.dtype is not None, f"SimTensor({self.name}) has no dtype to calculate nbytes"
             itemsize = typesize(self.dtype)
