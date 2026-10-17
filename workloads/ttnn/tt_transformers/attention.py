@@ -96,7 +96,7 @@ class Attention():
         self.transformation_mats = transformation_mats
         self.use_fused_qkv_op = getattr(configuration, 'use_fused_qkv_op', True)
 
-        self.model_config = None#configuration.get_model_config()
+        self.model_config = configuration.get_model_config()
         self.ccl_topology = configuration.ccl_topology()
         self.is_multichip = configuration.is_multichip
         self.activation_dtype = ttnn.bfloat16
@@ -104,9 +104,15 @@ class Attention():
         self.wo_dtype = ttnn.bfloat16
         self.kv_cache_dtype = ttnn.bfloat16
         self.li_qkv_decode_compute_kernel_cfg = ttnn.bfloat16
-        self.sdpa_decode_compute_kernel_cfg = ttnn.bfloat16
         self.li_o_decode_compute_kernel_cfg = ttnn.bfloat16
-        self.sdpa_prefill_compute_kernel_cfg = ttnn.bfloat16
+        # Real SDPA compute configs (tt-metal compute_kernel_config_hifi2 / _hifi4); the roofline reads
+        # fidelity, fp32 DEST accumulation and the packer flag from them.
+        self.sdpa_decode_compute_kernel_cfg = ttnn.BlackholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi2, math_approx_mode=True,
+            fp32_dest_acc_en=True, packer_l1_acc=True)
+        self.sdpa_prefill_compute_kernel_cfg = ttnn.BlackholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False,
+            fp32_dest_acc_en=True, packer_l1_acc=True)
         self.li_qkv_prefill_compute_kernel_cfg = ttnn.bfloat16
         self.li_o_prefill_compute_kernel_cfg = ttnn.bfloat16
 
@@ -252,10 +258,12 @@ class Attention():
         rot_mats=None,
         page_table=None,
         kv_cache=None,
+        cur_pos=None,
     ) -> ttnn.Tensor:
         """
         x: (seq_len, 1, batch, dim)
         current_pos: (batch_size), current token position in the sequence for each user
+        cur_pos: the same positions as a host list, when the caller knows them
         """
         ###
         # QKV matmuls
@@ -339,28 +347,30 @@ class Attention():
         # For example, a prompt w/ 1 user vs, the same prompt repeated N times for N users, will produce different outputs
         # This is because the SDPA op in decode mode has different number of reductions depending on batch size
         # Which leads to slightly different outputs from attention (due to accumulated errors)
+
+        # cur_pos (host list) rides along with the position tensor so the attended KV length is known.
+        sdpa_decode_kwargs = dict(
+            cur_pos_tensor=current_pos,
+            cur_pos=cur_pos,
+            scale=self.scale,
+            program_config=self.model_config["SDPA_DECODE_PROGCFG"],
+            compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         if page_table:
             attn_output_1G4D = ttnn.transformer.paged_scaled_dot_product_attention_decode(
                 q_heads_1BQD,
                 keys,
                 values,
-                cur_pos_tensor=current_pos,
                 page_table_tensor=page_table,
-                scale=self.scale,
-                program_config=None, #self.model_config["SDPA_DECODE_PROGCFG"],
-                compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                **sdpa_decode_kwargs,
             )
         else:
-            attn_output_1G4D = utils.scaled_dot_product_attention_decode(
+            attn_output_1G4D = ttnn.transformer.scaled_dot_product_attention_decode(
                 q_heads_1BQD,
                 keys,
                 values,
-                cur_pos_tensor=current_pos,
-                scale=self.scale,
-                program_config=None, #self.model_config["SDPA_DECODE_PROGCFG"],
-                compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,  # FIXME: why not L1 height sharded e.g. SCORES_BATCHED_MM_OUTPUT_MEMCFG?
+                **sdpa_decode_kwargs,
             )
         ttnn.deallocate(q_heads_1BQD)
 
@@ -542,14 +552,14 @@ class Attention():
         q_heads_1QSD_8b = ttnn.typecast(q_heads_1QSD, dtype=self.activation_dtype) # or ttnn.bfloat8_b)
         ttnn.deallocate(q_heads_1QSD)
 
-        attn_output_84SD = utils.scaled_dot_product_attention(
+        attn_output_84SD = ttnn.transformer.scaled_dot_product_attention(
             q_heads_1QSD_8b,
             k_heads_1KSD_8b,
             v_heads_1VSD_8b,
             is_causal=True,
             scale=self.scale,
-            compute_kernel_config=None, #self.sdpa_prefill_compute_kernel_cfg,
-            program_config=None, #self.model_config["SDPA_PROGCFG"](seq_len),
+            compute_kernel_config=self.sdpa_prefill_compute_kernel_cfg,
+            program_config=self.model_config["SDPA_PROGCFG"](seq_len),
         )
 
         ttnn.deallocate(q_heads_1QSD_8b)
@@ -607,13 +617,14 @@ class Attention():
 
         return output_11SH
 
-    def __call__(self, 
+    def __call__(self,
         attention_input,
         current_pos=None,
         rot_mats=None,
         user_id=0,
         mode="prefill",
         page_table=None,
+        cur_pos=None,
     ):
         return self.forward(
             attention_input,
@@ -622,6 +633,7 @@ class Attention():
             user_id=user_id,
             mode=mode,
             page_table=page_table,
+            cur_pos=cur_pos,
         )
 
     def forward(
@@ -635,6 +647,7 @@ class Attention():
         chunk_page_table=None,
         chunk_start_idx=None,
         kv_cache=None,
+        cur_pos=None,
     ):
         if mode == "prefill":
             return self.forward_prefill(
@@ -647,4 +660,5 @@ class Attention():
                 kv_cache=kv_cache,
             )
         else:
-            return self.forward_decode(x, current_pos, rot_mats, page_table=page_table, kv_cache=kv_cache)
+            return self.forward_decode(x, current_pos, rot_mats, page_table=page_table, kv_cache=kv_cache,
+                                       cur_pos=cur_pos)

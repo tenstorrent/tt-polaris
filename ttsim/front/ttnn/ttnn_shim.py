@@ -3323,7 +3323,7 @@ def nlp_concat_heads_decode_op(input_tensor, num_heads=None, memory_config=None,
 
 
 def scaled_dot_product_attention_op(q, k, v, *extra_inputs, memory_config=None,
-                                    element_size=2, **attrs):
+                                    element_size=None, **attrs):
     """ScaledDotProductAttention: prefill (q,k,v) or decode/paged (q, k_cache, v_cache, ...).
 
     Output shape always equals q. Extra positional tensor inputs (cur_pos,
@@ -3345,7 +3345,8 @@ def scaled_dot_product_attention_op(q, k, v, *extra_inputs, memory_config=None,
     for t in in_tensors:
         t.op_in.append(op_name)
     op_attrs = {k_: v_ for k_, v_ in attrs.items() if isinstance(v_, (int, float, bool, str))}
-    op_attrs['element_size'] = element_size
+    # Derive from q so a bfp8/bfp4 op is not silently costed as bfloat16 downstream.
+    op_attrs['element_size'] = element_size if element_size is not None else q.element_size()
     opinfo = {
         'name': op_name,
         'optype': 'ScaledDotProductAttention',

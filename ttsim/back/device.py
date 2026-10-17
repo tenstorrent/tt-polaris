@@ -85,6 +85,35 @@ class TTDevice:
     def __getitem__(self, i):
         return self.arch[i]
 
+def resolve_worker_core_count(simcfg_obj) -> int:
+    """Worker cores one op can spread over, for ops priced per core.
+
+    Order: ``worker_core_count`` on the device instance if set; else the ``compute_grid_size``
+    product; else compute IPGroup ``num_units``. tt-metal hands an op its
+    ``compute_with_storage_grid_size``, which can be smaller than the tensix count.
+    """
+    raw = getattr(simcfg_obj, "worker_core_count", None)
+    if raw is not None:
+        try:
+            n = int(raw)
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            pass
+    grid = getattr(simcfg_obj, "compute_grid_size", None)
+    if grid and len(grid) == 2:
+        try:
+            n = int(grid[0]) * int(grid[1])
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            pass
+    try:
+        return int(simcfg_obj.get_ipgroup(iptype="compute").num_units)
+    except Exception:
+        return 0
+
+
 class Device:
     """
         Hard coded for now
@@ -130,6 +159,7 @@ class Device:
         self._operator_lookup_core_count = resolve_operator_lookup_core_count(
             simcfg_obj, simcfg_obj
         )
+        self.worker_core_count = resolve_worker_core_count(simcfg_obj)
         if operator_lookup_hybrid_curve is None:
             _hybrid_curve = bool(getattr(simcfg_obj, "operator_lookup_hybrid_curve", False))
         else:
@@ -263,25 +293,71 @@ class Device:
 
         return
 
+    def _reprice_sdpa(self, op):
+        """Re-price an SDPA op with this device's clock and, when the call carried no program-config
+        grid, its worker core count. Shape inference is device independent, so it prices with the
+        calibration's own grid and clock; the fitted constants stay put (the SKU gate above keeps them
+        on the device they were measured on). Returns None when the op already matches this device."""
+        blob = op.perf_stats.get('sdpa_reprice')
+        if blob is None:
+            return None
+        clock_ghz = self.freq_MHz / 1000.0
+        priced_at = op.perf_stats.get('sdpa_clock_ghz') or 0.0
+        cores = (self.worker_core_count or None) if op.perf_stats.get('sdpa_num_cores_defaulted') else None
+        priced_cores = (op.perf_stats.get('sdpa_config') or {}).get('num_cores')
+        if cores in (None, priced_cores) and abs(priced_at - clock_ghz) < 1e-9:
+            return None
+        from ttsim.perf.roofline_sdpa import reprice
+        try:
+            return reprice(blob, num_cores=cores, clock_ghz=clock_ghz, arch_name=self.devname)
+        except ValueError as e:
+            logger.warning(f"SDPA roofline for {op.name!r} could not be re-priced on {self.name!r} "
+                           f"({e}); keeping the estimate priced at {priced_at} GHz and "
+                           f"{priced_cores} cores.", once=True)
+            return None
+
     def execute_op(self, op):
         if TYPE_CHECKING:
             assert op.perf_stats is not None, f"SimOp {op.name} has no perf_stats set, cannot execute"
 
-        #find compute cycles
-        op.compute_cycles = 0
-        for instr,instr_count in op.perf_stats['instrs'].items():
-            # Enhanced error handling to provide context when instruction lookup fails
-            # (e.g., when an operation needs an instruction not in its primary pipe)
-            try:
-                peak_ipc = self.simconfig_obj.peak_ipc(op.uses_compute_pipe, instr, op.precision)
-            except AssertionError as e:
-                raise AssertionError(
-                    f"Failed to get peak IPC for operation '{op.name}' (optype={op.optype}): "
-                    f"instruction='{instr}', pipe='{op.uses_compute_pipe}', precision='{op.precision}'. "
-                    f"Original error: {e}"
-                ) from e
-            real_ipc = peak_ipc * self.DG_COMPUTE_UTIL_CONSTANT
-            op.compute_cycles += math.ceil(instr_count / real_ipc)
+        # find compute cycles. A fused op may carry a precomputed per-op cycle count
+        # (e.g. the SDPA roofline); otherwise use the generic instrs/IPC lookup.
+        fused_cycles = op.perf_stats.get('fused_compute_cycles')
+        # The SDPA roofline is calibrated for one device only; off that device fall back to the
+        # generic instr estimate rather than booking a cross-arch cost (sinf has no device context).
+        calib_dev = op.perf_stats.get('sdpa_calibrated_arch')
+        calib_sku = op.perf_stats.get('sdpa_calibrated_sku')
+        # Envelope gate, fail closed: both the package and the device instance (the SKU, e.g.
+        # p100a vs p150a) must match the calibration, otherwise use the generic estimate.
+        cross_arch = (calib_dev is not None and calib_dev != self.devname) or \
+                     (calib_sku is not None and calib_sku != self.name)
+        if cross_arch:
+            logger.warning(f"SDPA roofline for {op.name!r} is calibrated for {calib_dev!r} "
+                           f"{calib_sku or ''}, not {self.devname!r} {self.name!r}; using the "
+                           f"generic estimate instead.", once=True)
+        if fused_cycles is not None and not cross_arch:
+            repriced = self._reprice_sdpa(op)
+            if repriced is not None:
+                op.perf_stats.update(repriced)
+                fused_cycles = repriced['fused_compute_cycles']
+            op.compute_cycles = int(math.ceil(fused_cycles))
+            # Flag whether the fused cycles are a floor (lower bound) so the rollup can surface it.
+            op.compute_is_lower_bound = bool(op.perf_stats.get('sdpa_compute_is_floor', False))
+        else:
+            op.compute_cycles = 0
+            for instr,instr_count in op.perf_stats['instrs'].items():
+                # Enhanced error handling to provide context when instruction lookup fails
+                # (e.g., when an operation needs an instruction not in its primary pipe)
+                try:
+                    peak_ipc = self.simconfig_obj.peak_ipc(op.uses_compute_pipe, instr, op.precision)
+                except AssertionError as e:
+                    raise AssertionError(
+                        f"Failed to get peak IPC for operation '{op.name}' (optype={op.optype}): "
+                        f"instruction='{instr}', pipe='{op.uses_compute_pipe}', precision='{op.precision}'. "
+                        f"Original error: {e}"
+                    ) from e
+                real_ipc = peak_ipc * self.DG_COMPUTE_UTIL_CONSTANT
+                op.compute_cycles += math.ceil(instr_count / real_ipc)
 
         # Find memory cycles.
         # NOTE: This calculation is done at the unit of bytes to avoid potential ambiguity of GB (1024 or 1000)
@@ -919,6 +995,12 @@ class Device:
                     'memory_traffic'   : memory_traffic,
                     'mem_util'         : mem_util,
                     'uses_perf_lookup' : uses_perf_lookup,
+                    # True when the cost is an SDPA roofline compute floor (lower bound), not a
+                    # LUT-measured wall-clock. A LUT hit overrides the roofline, so only holds on a miss.
+                    'compute_is_lower_bound': (
+                        bool(getattr(op, 'compute_is_lower_bound', False))
+                        and not uses_perf_lookup
+                    ),
                     # LUT-key trail: ``lut_key`` is the literal key built from the
                     # op + tensor state; ``lut_key_resolved`` is the entry the
                     # lookup chain actually matched after any fallback

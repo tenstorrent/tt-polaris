@@ -109,6 +109,7 @@ def run_llama3(wlname: str, ttnn_device: TTNNDevice, cfg: dict):
             rot_mats=rot_mats,
             mode="decode",
             page_table=page_table_tt,
+            cur_pos=generation_pos,
         )
         tt_output_torch = ttnn.permute(ttnn.to_torch(tt_out), (1, 2, 0, 3)).squeeze(2)#[: model_args.max_batch_size, 0:1, : model_args.vocab_size]
         
@@ -120,6 +121,8 @@ def run_llama3(wlname: str, ttnn_device: TTNNDevice, cfg: dict):
         logger.info(f"Finished running TT model {model_name}.")
         
         ttnn.deallocate(tt_out)
+        # next token: every user is one position further, so SDPA attends one more KV row
+        generation_pos = [p + 1 for p in generation_pos]
     # print("Generating Model Graph...")
     # g = mesh_device.get_graph()
     # g.graph2onnx('ttnn_llama32_model.onnx', do_model_check=False,

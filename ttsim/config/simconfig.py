@@ -489,6 +489,10 @@ class PackageInstanceModel(BaseModel, extra='forbid'):
     operator_lookup_file: Optional[str] = None
     #: Core count for tt-perf master ``single`` / ``curve`` evaluation; if unset, uses compute ``num_units``.
     operator_lookup_core_count: Optional[int] = None
+    #: Worker cores one op can spread over — tt-metal's ``compute_with_storage_grid_size`` product, which is
+    #: smaller than the tensix count when columns are reserved. If unset, uses ``compute_grid_size``, else
+    #: compute ``num_units``. Read by the backend for ops priced per core (see ttsim/back/device.py).
+    worker_core_count: Optional[int] = None
     #: When True, ``entry_type: hybrid`` LUT rows use embedded ``curve`` stats at runtime core count.
     operator_lookup_hybrid_curve: bool = False
     #: Logical compute grid [x, y] = (num_cols, num_rows) — mirrors tt-metal's compute_with_storage_grid_range.
