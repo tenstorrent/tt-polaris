@@ -120,6 +120,14 @@ workloads:
                  img_height: 224,
                  img_width: 224 }
 
+  # generate deepseek-coder-1.3b-fixed.onnx using code in workloads/onnx/examples/:
+  - api: ONNX
+    name: DEEPSEEK-CODER-1.3B
+    basedir: workloads/onnx
+    module : deepseek_coder_onnx_dump.py
+    instances:
+        default : { path: 'deepseek-coder-1.3b-fixed.onnx', seq_len: 128, bs: 1 }
+
   - api: ONNX
     name: PI0FAST_BASE
     basedir: workloads/onnx
