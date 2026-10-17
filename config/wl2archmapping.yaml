@@ -62,7 +62,7 @@ op_rsrc_spec:
              Pad, Permute, Pow,
              QuantizeLinear,
              Range, Reciprocal, ReduceMax, ReduceMean, ReduceMin, ReduceProd, ReduceSum, Relu, Reshard, Reshape, Resize,
-             ScatterND, ScatterElements, Shape, ShardedToInterleaved, Sigmoid, Sin, Slice, Softmax, SoftmaxCrossEntropyLoss, Softplus, Split, Sqrt, Squeeze, Sub, Sum,
+             ScatterND, ScatterElements, Shape, ShardedToInterleaved, Sigmoid, Sin, SkipLayerNormalization, Slice, Softmax, SoftmaxCrossEntropyLoss, Softplus, Split, Sqrt, Squeeze, Sub, Sum,
              Tanh, Tile, Tilize, TilizeWithValPadding, TopK, TorchGather, Transpose, Trilu, Typecast,
              Unsqueeze, Untilize, UntilizeWithUnpadding, Upsample,
              VoxelPooling,
