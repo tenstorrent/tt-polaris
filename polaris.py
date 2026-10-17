@@ -311,7 +311,19 @@ def setup_cmdline_args(argv: list[str] | None = None) -> argparse.Namespace:
             'benefit from analytical fusion. Use --disable-fusion only to debug fusion itself.'
         ),
     )
-
+    parser.add_argument(
+        '--enable_dm_latency',
+        dest='enable_dm_latency',
+        action='store_true',
+        default=False,
+        help=(
+            'Enable the DRAM read-latency model, making memory-read cycles the max of '
+            'the bandwidth-limited cost and the predicted read latency, so small '
+            'transactions are latency-bound rather than bandwidth-bound. Blackhole only '
+            '(requires a read_latency block in the arch spec). Default off preserves the '
+            'existing flat bytes/bandwidth memory model.'
+        ),
+    )
     #cmdline args processing
     args = parser.parse_args(argv)
     check_args(args)
@@ -426,7 +438,8 @@ def do_dryrun(_wl, _dl):
 def execute_wl_on_dev(_wl, _dl, _wspec, _dspec, wlmapspec, _WLG,
                       _odir, study, _enable_memalloc, outputfmt, flag_dump_stats_csv,
                       operator_lookup_hybrid_curve: bool = False,
-                      disable_fusion: bool = False):
+                      disable_fusion: bool = False,
+                      enable_dm_latency: bool = False):
     # TODO: Reduce number of arguments to this function
     study_dir = _odir / study
     stat_dir    = study_dir / 'STATS'
@@ -477,6 +490,7 @@ def execute_wl_on_dev(_wl, _dl, _wspec, _dspec, wlmapspec, _WLG,
             cur_device = Device(
                 dev_obj,
                 operator_lookup_hybrid_curve=use_hybrid_lut_curve,
+                enable_dm_latency=enable_dm_latency,
             )
             cur_device.execute_graph(wlgraph, wlmapspec, disable_fusion=disable_fusion)
 
@@ -553,6 +567,7 @@ def polaris(args: argparse.Namespace | runcfgmodel.PolarisRunConfig) -> int:
             args.dump_stats_csv,
             operator_lookup_hybrid_curve=bool(args.operator_lookup_hybrid_curve),
             disable_fusion=bool(getattr(args, 'disable_fusion', False)),
+            enable_dm_latency=bool(getattr(args, 'enable_dm_latency', False)),
         )
         summary_stats = sorted(summary_stats, key=lambda x: (x['wlname'], x['devname'], x['freq_Mhz'], x['wlinstance'], x['bs']))
 

@@ -129,6 +129,14 @@ class PolarisRunConfig(BaseModel, extra='forbid'):
         description='Skip op fusion in Device.execute_graph (polaris --disable-fusion)',
     )
 
+    enable_dm_latency: Optional[bool] = Field(
+        default=False,
+        description=(
+            'Enable the DRAM read-latency model, so small transactions are latency-bound '
+            'rather than bandwidth-bound (polaris --enable_dm_latency).'
+        ),
+    )
+
     dryrun: Optional[bool] = Field(
         default=False, description='If true, run will not execute any commands, but will only print them'
     )

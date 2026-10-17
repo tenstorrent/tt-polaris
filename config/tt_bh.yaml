@@ -56,6 +56,18 @@ ipblocks:
         freq_MHz  : 1000
         size_GB   : 4
         transfer_rate_GTs : 16.0
+        # DRAM read-latency model HW constants (NoC/fabric clock cycles). Single source
+        # of truth for MemoryReadLatencyModel; consumed by Device when --enable_dm_latency.
+        # Calibrated against the Blackhole DRAM Interleaved Page Read microbenchmark.
+        # See ttsim/config/simconfig.py.
+        read_latency:
+            tdram_cyc            : 375.0   # Empirical DRAM access bucket (row activate + CAS + burst)
+            tdetect_cyc          : 10.0    # Empiricalbarrier-clear tail
+            noc_inbound_bpc      : 62.0    # per-core NoC inbound ceiling (bytes / fclk cycle)
+            delta_issue_cyc      : 38.0    # Empirical per-read issue cost (cyc/read)
+            chop_cyc_per_hop     : 8.0     # NoC cost per hop (cyc)
+            b_channel_bpc        : 24.0    # single-channel effective rate (bytes / fclk cycle)
+            default_hops         : 4       # Empirical gating-channel hop distance (h_gate)
 
 packages:
     -   name: Blackhole
