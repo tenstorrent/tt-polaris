@@ -503,7 +503,9 @@ class UNet2DConditionModel(SimNN.Module):
         timesteps = timestep
         assert sample.shape is not None, \
             "UNet2DConditionModel: input sample tensor shape must be set"
-        timesteps = ttsimF._from_shape(f'{self.name}_timesteps', shape=sample.shape[0])
+        # One timestep per batch element, matching upstream. This passed the bare
+        # dimension before, which raised `Invalid shape type: <class 'int'>`.
+        timesteps = ttsimF._from_shape(f'{self.name}_timesteps', shape=[sample.shape[0]])
         timesteps.set_module(self)
         t_emb = self.time_proj(timesteps)
         return t_emb
