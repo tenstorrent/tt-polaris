@@ -524,6 +524,115 @@ Device.get_exec_stats() (aggregates)
 HLMStats.dump_stats() (formats and outputs)
 ```
 
+### System Architecture Diagram
+
+```mermaid
+flowchart TD
+    subgraph cli["polaris.py (CLI entry point)"]
+        CLI["polaris.py\n--wlspec/-w\n--archspec/-a\n--wlmapspec/-m\n--filterarch / --filterwli"]
+    end
+
+    subgraph cfg["Configuration (YAML)"]
+        WL_YAML["config/all_workloads.yaml\n(workload registry)"]
+        ARCH_YAML["config/tt_wh.yaml / tt_bh.yaml\n(arch specs + LUT path)"]
+        MAP_YAML["config/wl2archmapping.yaml\n(fusion / dtype / removal)"]
+        LUT_YAML["*_lut_vN.yaml\n(profiled timing data)"]
+    end
+
+    subgraph front["Frontends (ttsim/front/)"]
+        TTNN["TTNN Shim\nttsim/front/ttnn/\n(op.py, tensor.py, device.py)\nBuilds SimOp graph\nfrom ttnn.* API calls"]
+        ONNX["ONNX Parser\nttsim/front/onnx/"]
+        FUNC["Functional API\nttsim/front/functional/"]
+    end
+
+    subgraph graph["Graph Layer (ttsim/graph/)"]
+        WLG["WorkloadGraph\nNetworkX DAG of\nSimOp nodes + SimTensor edges\n(topological order by seqno)"]
+    end
+
+    subgraph back["Backend (ttsim/back/)"]
+        DEV["Device.execute_graph()\nApplies WL2ArchMap transforms:\n• dtype assignment\n• op fusion / removal\n• compute pipe assignment"]
+        LUT_LOOKUP["_try_operator_perf_lookup()\nkey = op_code + shapes +\nlayout + dtype + memory\n(+shard_layout for halo/ITS v4)"]
+        ANALYTICAL["Analytical models\n(fallback on LUT miss)"]
+        STATS["HLMStats.dump_stats()\nCSV / JSON / reports"]
+    end
+
+    subgraph tools["Profiling Tools (tools/profiling/ + tools/perf_lookup/)"]
+        CMP["compare_layers.py\nPolaris CSV vs HW profiler CSV\n--perf --by-lut-key --xlsx"]
+        MAPPER["tt_perf_mapper.py\nHW profiler CSV → LUT YAML"]
+        LFC["lfc_downloader.sh\nLFC ↔ local cache"]
+    end
+
+    CLI -->|"loads"| WL_YAML
+    CLI -->|"loads"| ARCH_YAML
+    CLI -->|"loads"| MAP_YAML
+    ARCH_YAML -->|"operator_lookup_file"| LUT_YAML
+
+    WL_YAML -->|"dispatches workload fn"| TTNN
+    WL_YAML -->|"dispatches workload fn"| ONNX
+    WL_YAML -->|"dispatches workload fn"| FUNC
+
+    TTNN -->|"get_graph()"| WLG
+    ONNX -->|"get_graph()"| WLG
+    FUNC -->|"get_graph()"| WLG
+
+    WLG -->|"passed to backend"| DEV
+    MAP_YAML -->|"WL2ArchMap"| DEV
+    LUT_YAML -->|"OperatorPerfMap"| LUT_LOOKUP
+
+    DEV --> LUT_LOOKUP
+    LUT_LOOKUP -->|"hit"| STATS
+    LUT_LOOKUP -->|"miss → fallback"| ANALYTICAL
+    ANALYTICAL --> STATS
+
+    STATS -->|"opstats CSV"| CMP
+    LFC -->|"merged_ops CSV"| CMP
+    LFC -->|"merged_ops CSV"| MAPPER
+    MAPPER -->|"new LUT YAML"| LUT_YAML
+```
+
+<details><summary>Text fallback (if mermaid does not render)</summary>
+
+```
+  polaris.py CLI
+       │ loads
+  ┌────┴──────────────────────────┐
+  │  config/all_workloads.yaml    │
+  │  config/tt_{wh,bh}.yaml  ────────► *_lut_vN.yaml (OperatorPerfMap)
+  │  config/wl2archmapping.yaml   │
+  └────┬──────────────────────────┘
+       │ dispatches workload fn
+  ┌────▼──────────────────────────────────────────────┐
+  │  FRONTENDS  (ttsim/front/)                        │
+  │  TTNN Shim  │  ONNX Parser  │  Functional API     │
+  │  (op.py builds SimOp graph from ttnn.* API calls) │
+  └────────────────────┬──────────────────────────────┘
+                       │ get_graph()
+              ┌────────▼──────────┐
+              │  WorkloadGraph    │
+              │  (NetworkX DAG:   │
+              │  SimOp + SimTensor│
+              │  topo by seqno)   │
+              └────────┬──────────┘
+                       │ execute_graph()
+  ┌────────────────────▼──────────────────────────────┐
+  │  BACKEND  (ttsim/back/device.py)                  │
+  │  • Apply WL2ArchMap (dtype/fusion/removal)        │
+  │  • _try_operator_perf_lookup()                    │
+  │      hit → use LUT msecs + util                   │
+  │      miss → analytical fallback                   │
+  │  • HLMStats.dump_stats() → CSV / JSON             │
+  └───────────────────────────────────────────────────┘
+                       │ opstats CSV
+  ┌────────────────────▼──────────────────────────────┐
+  │  PROFILING TOOLS  (tools/)                        │
+  │  compare_layers.py   — Polaris vs HW profiler CSV │
+  │  tt_perf_mapper.py   — HW profiler CSV → LUT YAML │
+  │  lfc_downloader.sh   — LFC ↔ local cache          │
+  └───────────────────────────────────────────────────┘
+```
+
+</details>
+
 ### Key Design Patterns
 
 1. **Registry Pattern**: `SimOpDescRegistry` for operation descriptions
