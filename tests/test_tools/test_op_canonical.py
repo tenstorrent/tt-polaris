@@ -38,6 +38,13 @@ from tools.profiling.op_canonical import (
         ("FoldDeviceOperation", "fold"),
         ("ConcatDeviceOperation", "concat"),
         ("EmbeddingDeviceOperation", "embedding"),
+        ("CopyDeviceOperation", "copy"),
+        # ttnn.experimental.nlp_create_qkv_heads: same canonical as the shim's CreateQKVHeads.
+        ("NlpCreateHeadsDeviceOperation", "createqkvheads"),
+        # Distinct head-split kernels keep their own canonical, never createqkvheads.
+        ("NlpCreateHeadsBoltzDeviceOperation", "nlpcreateheadsboltz"),
+        ("NlpCreateHeadsSegformerDeviceOperation", "nlpcreateheadssegformer"),
+        ("NlpCreateHeadsVitDeviceOperation", "nlpcreateheadsvit"),
     ],
 )
 def test_profiler_device_operation_suffix_stripping(raw, expected):
@@ -260,3 +267,10 @@ def test_resolve_conv_subtype_string_attrs():
     sliding_window_true = 'SlidingWindowConfig { kernel_size: [2, 2], is_transpose = true }'
     assert _resolve_conv_subtype(sliding_window_false) == 'conv2d'
     assert _resolve_conv_subtype(sliding_window_true) == 'convtranspose'
+
+
+@pytest.mark.unit
+def test_prefill_qkv_head_split_profiler_and_shim_share_canonical():
+    # The LUT key must match between the profiler op and the shim op for the same call
+    # (ttnn.experimental.nlp_create_qkv_heads), or a lookup can never hit.
+    assert normalize_profiler_opcode("NlpCreateHeadsDeviceOperation") == normalize_polaris_optype("CreateQKVHeads")
