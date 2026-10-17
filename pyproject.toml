@@ -19,6 +19,7 @@ exclude = [
     "(?:^|/)reference/",
     # Generated and scratch output directories. Not source.
     "^__.*/",
+    "^doc/_build/",
 
     # --- Temporary. Backlog: these paths do not pass the checker yet. ---
     # Remove an entry once its path reports no errors.
