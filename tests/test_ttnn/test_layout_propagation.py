@@ -129,6 +129,21 @@ def test_untilize_outputs_row_major():
     assert out.get_layout() == Layout.ROW_MAJOR_LAYOUT
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize('in_dt,out_dt', [
+    (ttnn.bfloat8_b, ttnn.bfloat16),   # row-major cannot hold a block float
+    (ttnn.bfloat16, ttnn.bfloat16),
+    (ttnn.uint32, ttnn.uint32),
+])
+def test_untilize_output_dtype(in_dt, out_dt):
+    """tt-metal untilize_output_dtype (data_movement/common/common.hpp): BFLOAT8_B -> BFLOAT16, else
+    unchanged (WH n150 llama3 prefill capture: Untilize [1,1,32,128256] BFLOAT8_B -> BFLOAT16)."""
+    device = _make_device()
+    x = ttnn.zeros([1, 1, 32, 128], dtype=in_dt, layout=ttnn.TILE_LAYOUT, device=device)
+    out = ttnn.untilize(x)
+    assert out._ttnn_dtype == out_dt
+
+
 # ---------------------------------------------------------------------------
 # matmul / linear — output follows the (TILE) activation
 #

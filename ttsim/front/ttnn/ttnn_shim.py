@@ -1107,9 +1107,13 @@ def untilize(input_tensor, memory_config=None, use_multicore=True,
     # (Un)tilize is elementwise on data; preserve the ttnn dtype (e.g. UINT32, which is stored as
     # INT32 numpy) so downstream LUT keys read the true dtype — else a uint32 index tensor is
     # mis-keyed INT32 (cf. the typecast layout/dtype preservation fix).
+    # Except BFLOAT8_B: row-major cannot hold a block float, so HW untilize emits BFLOAT16
+    # (tt-metal data_movement/common/common.hpp untilize_output_dtype, used by
+    # untilize_device_operation.cpp compute_output_specs; WH n150 llama3 prefill capture:
+    # Untilize [1,1,32,128256] BFLOAT8_B -> BFLOAT16).
     src_dt = getattr(input_tensor, "_ttnn_dtype", None)
     if src_dt is not None:
-        out._ttnn_dtype = src_dt
+        out._ttnn_dtype = DataType.BFLOAT16 if src_dt == DataType.BFLOAT8_B else src_dt
     # Emit an Untilize SimOp so the op appears in the graph (HW UntilizeDeviceOperation), matching
     # the silicon capture. Previously untilize was metadata-only (only the perf _tracker ran, no
     # graph node), so e.g. the decode sampling-tail untilize was profiler-only.
