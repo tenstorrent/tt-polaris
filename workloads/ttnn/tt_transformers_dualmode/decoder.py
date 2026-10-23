@@ -131,14 +131,24 @@ class TransformerBlock:
         # vs the capture, netting 1 fewer 32x4096 reshard at the final-norm boundary. Match tt-metal.
         if decode:
             attn_out = ttnn.reshard(attn_out, wcfg)     # attn out -> residual spec (capture Reshard row 21)
-        h = ttnn.add(x, attn_out, memory_config=None)   # residual #1
+        # Prefill: tt-metal skip_mem_cfg is DRAM; residual #2 passes activation_dtype or bf16, and residual #1
+        # passes dtype=None, i.e. input_a's dtype, which is also activation_dtype or bf16 (model.forward
+        # typecasts x to activation_dtype before each layer; embedding output is bf16). The shim's None
+        # defaults sharded the output and took the bf8 attn_out dtype, which leaked bf8 into ff_norm + the
+        # MLP keys, so prefill spells both out.
+        res_kw: dict[str, object]
+        if decode:
+            res_kw = {'memory_config': None}
+        else:
+            res_kw = {'memory_config': ttnn.DRAM_MEMORY_CONFIG, 'dtype': self.args.activation_dtype or ttnn.bfloat16}
+        h = ttnn.add(x, attn_out, **res_kw)   # residual #1
         ttnn.deallocate(attn_out)
         if decode:
             h = ttnn.reshard(h, wcfg)                    # residual -> ff_norm spec (capture Reshard row 43)
 
         ff_in = self.ff_norm(h, mode)
         ff_out = self.feed_forward.forward(ff_in, mode)
-        out = ttnn.add(h, ff_out, memory_config=None)   # residual #2 (MLP out added directly, per tt-metal)
+        out = ttnn.add(h, ff_out, **res_kw)   # residual #2 (MLP out added directly, per tt-metal)
         if decode:
             out = ttnn.reshard(out, wcfg)                # block out -> next-norm spec (capture Reshard row 51)
         return out

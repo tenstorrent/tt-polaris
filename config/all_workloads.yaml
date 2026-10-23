@@ -189,7 +189,23 @@ workloads:
     basedir: workloads/ttnn/llama3_dualmode
     module : run_llama3_dualmode@test_llama3_prefill.py
     instances:
-      llama3_8b_dualmode_prefill: { bs: 1, model_name: llama3-8B }
+      # One instance per silicon capture, all at tt-metal f8c634a (bs=1, seq_len=128, max_seq_len=1024, one
+      # generated token). Full prefill step: the traced forward plus the eager tail tt-metal runs after each
+      # replay (runtime-bound last-token slice, norm, lm_head, Copy, greedy force-argmax sampler Untilize ->
+      # ArgMax). rope_trace_prefill_seq_lens are the traced prefill lengths tt-metal pads the rope tables for
+      # (Llama-3.1-8B on N150 and P100: [128, 1024] -> [1,1,2048,128]). The model settings are the same on both
+      # chips; the lm_head column split is done by the backend per arch.
+      #
+      # Blackhole p100a: run with -a config/tt_bh_llama3.yaml --filterarch p100a. Only capture: 1 layer.
+      # MATCHES llama3-prefill-b1-l1-t1-f8c634a-blackhole-p100a-261018 (44 ops; lm_head 8 x 16032).
+      llama3_8b_dualmode_prefill_bh: { bs: 1, model_name: llama3-8B, n_layers: 1, max_generated_tokens: 1, max_seq_len: 1024, rope_trace_prefill_seq_lens: [128, 1024]}
+      # Wormhole n150: run with -a config/tt_wh_llama3.yaml --filterarch n150 (lm_head 3 x 42752).
+      # MATCHES llama3-prefill-b1-f8c634a-wormhole_b0-n150_L-261019 (1 layer, 34 ops; captured with tracy
+      # --no-op-info-cache, so every op records its own shapes). The 2- and 6-layer instances check layer scaling
+      # against -261013 (54 / 134 ops; captured without that flag, so only their totals are compared).
+      llama3_8b_dualmode_prefill_wh: { bs: 1, model_name: llama3-8B, n_layers: 1, max_generated_tokens: 1, max_seq_len: 1024, rope_trace_prefill_seq_lens: [128, 1024]}
+      llama3_8b_dualmode_prefill_wh_2L: { bs: 1, model_name: llama3-8B, n_layers: 2, max_generated_tokens: 1, max_seq_len: 1024, rope_trace_prefill_seq_lens: [128, 1024]}
+      llama3_8b_dualmode_prefill_wh_6L: { bs: 1, model_name: llama3-8B, n_layers: 6, max_generated_tokens: 1, max_seq_len: 1024, rope_trace_prefill_seq_lens: [128, 1024]}
 
   - api: TTNN
     name: llama3_dualmode_decode

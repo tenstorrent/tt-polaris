@@ -77,7 +77,7 @@ class LMHead:
                 for sz in self.split_sizes
             ]
 
-    def forward(self, x):
+    def forward(self, x, mode='decode'):
         # lm_head matmul explicitly downcasts its output to bfp8 (tt-metal lm_head.py:
         # dtype=lm_head_dtype, default bfloat8_b) so the downstream ShardedToInterleaved
         # sees a bf8 activation in the capture — pass it rather than inheriting bf16.
@@ -96,19 +96,34 @@ class LMHead:
         # Each column chunk is a DRAM-sharded matmul (chunk-N-wide weight) -> DRAM-sharded program
         # config on HW (see model_config.dram_matmul_config). Program config is per-chunk since split
         # sizes may be uneven (last chunk = remainder).
+        # Prefill stages each chunk to L1 interleaved and concats in L1 (tt-metal f8c634a lm_head.py:
+        # to_memory_config(output, get_lm_head_sharded_output_mem_config()) = L1_MEMORY_CONFIG without a
+        # prefetcher; captures: ShardedToInterleaved -> L1_INTERLEAVED, Concat in L1). The default (None)
+        # is DRAM on HW, where a last-dim concat of DRAM chunks lowers to Transposes + a height Concat.
+        # Decode keeps None: its HW path is pinned to its own capture and left unchanged here.
+        chunk_memcfg = ttnn.L1_MEMORY_CONFIG if mode == 'prefill' else None
+        # Prefill chunks run tt-metal's hifi2_fp16 (BH p100a 261018 and WH n150 261015 captures: HiFi2/
+        # approx 0/fp32 0/packer 1).
+        chunk_ckc = (self.args.compute_kernel_config_hifi2_fp16 if mode == 'prefill'
+                     else self.args.compute_kernel_config_hifi2)
         outputs = []
         for w, sz in zip(self.output_weights, self.split_sizes):
             lm_head_pc = self.args.lm_head_decode_program_config(sz)
             # DRAM-sharded matmul needs a sharded output (tt-metal get_lm_head_output_mem_config
             # decode = L1_WIDTH_SHARDED, no-prefetcher); the following sharded_to_interleaved undoes it.
-            o = ttnn.linear(x, w, compute_kernel_config=self.args.compute_kernel_config_hifi2,
+            o = ttnn.linear(x, w, compute_kernel_config=chunk_ckc,
                             program_config=lm_head_pc, memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                             dtype=lm_head_dtype)
-            o = ttnn.sharded_to_interleaved(o, memory_config=None)  # capture STS rows 54/56/58
+            o = ttnn.sharded_to_interleaved(o, memory_config=chunk_memcfg)  # capture STS rows 54/56/58
             outputs.append(o)
         # combine the column chunks back to full vocab (capture Concat row 59)
-        output = outputs[0] if len(outputs) == 1 else ttnn.concat(outputs, dim=-1)
+        if len(outputs) == 1:
+            output = outputs[0]
+        elif mode == 'prefill':
+            output = ttnn.concat(outputs, dim=-1, memory_config=ttnn.L1_MEMORY_CONFIG)
+        else:
+            output = ttnn.concat(outputs, dim=-1)
         return tt_all_reduce(output)  # identity (single-chip)
 
-    def __call__(self, x):
-        return self.forward(x)
+    def __call__(self, x, mode='decode'):
+        return self.forward(x, mode=mode)

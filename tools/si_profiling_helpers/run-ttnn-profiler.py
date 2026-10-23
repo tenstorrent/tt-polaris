@@ -509,6 +509,7 @@ def run_profiler(
     show_output: bool = False,
     dryrun: bool = False,
     op_support_count: int = 100000,
+    no_op_info_cache: bool = False,
     log_path: str | None = None,
     dram_drop_guard: bool = True,
     status: "RunStatus | None" = None,
@@ -527,6 +528,9 @@ def run_profiler(
         show_output (bool): If True, display command stdout/stderr in real-time
         dryrun (bool): If True, show commands without executing
         op_support_count (int): Maximum number of ops tracy will profile
+        no_op_info_cache (bool): If True, pass --no-op-info-cache to tracy so every op's full info
+            (input/output tensor shapes) is recorded, not reused from the first op with the same
+            program hash
 
     Returns:
         subprocess.CompletedProcess or None: Result object or None if dryrun
@@ -540,6 +544,10 @@ def run_profiler(
     # surfacing later as a confusing merge row-count mismatch).
     argv = [sys.executable, '-m', 'tracy', '-p', '-r', '-v', '--check-exit-code',
             f'--op-support-count={op_support_count}', '-o', output_dir]
+    if no_op_info_cache:
+        # tracy deletes TT_METAL_PROFILER_NO_CACHE_OP_INFO from the environment unless it gets this
+        # flag (tt-metal tools/tracy/__main__.py), so exporting the variable has no effect.
+        argv.append('--no-op-info-cache')
     if collect_noc_traces:
         argv.append('--collect-noc-traces')
     if collect_perf_counters:
@@ -957,6 +965,14 @@ def main() -> int:
         default=100000,
         help='Maximum number of ops tracy will profile (default: 100000)',
     )
+    parser.add_argument(
+        '--no-op-info-cache',
+        action='store_true',
+        help='Pass --no-op-info-cache to tracy in every pass: record each op\'s full info instead of '
+             'reusing it from the first op with the same program hash. Without it, ops that share a '
+             'program hash but differ in tensor shape are reported with the first op\'s shapes '
+             '(seen on WH n150 llama3 prefill: the second residual add recorded as [1,1,32,64]).',
+    )
     args = parser.parse_args()
 
     command = args.command
@@ -1054,6 +1070,7 @@ def main() -> int:
             collect_noc_traces=False, collect_perf_counters=False,
             enable_logging=enable_logging, show_output=show_output, dryrun=args.dryrun,
             op_support_count=args.op_support_count,
+            no_op_info_cache=args.no_op_info_cache,
             log_path=os.path.join(output_dir, 'raw_results_typescript.txt'),
             dram_drop_guard=dram_guard, status=status, step_name='raw',
         )
@@ -1068,6 +1085,7 @@ def main() -> int:
                 collect_noc_traces=False, collect_perf_counters=True,
                 enable_logging=enable_logging, show_output=show_output, dryrun=args.dryrun,
                 op_support_count=args.op_support_count,
+                no_op_info_cache=args.no_op_info_cache,
                 log_path=os.path.join(output_dir, 'perf_results_typescript.txt'),
                 dram_drop_guard=dram_guard, status=status, step_name='perf',
             )
@@ -1080,6 +1098,7 @@ def main() -> int:
                 collect_noc_traces=True, collect_perf_counters=False,
                 enable_logging=enable_logging, show_output=show_output, dryrun=args.dryrun,
                 op_support_count=args.op_support_count,
+                no_op_info_cache=args.no_op_info_cache,
                 log_path=os.path.join(output_dir, 'trace_results_typescript.txt'),
                 dram_drop_guard=dram_guard, status=status, step_name='trace',
             )
