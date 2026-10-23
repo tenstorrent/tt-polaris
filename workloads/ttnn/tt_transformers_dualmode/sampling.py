@@ -127,3 +127,17 @@ def sample_decode(logits, device, max_top_k=32, num_splits=2):
     # (uint32, DRAM). Pass it so the sim emits the arity-6 op the capture records.
     out_tok = _dummy([1, 1, 1, batch], device, ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
     return ttnn.sampling(topk_values, global_indices, k=k_t, p=p_t, temp=temp_t, output_tensor=out_tok)
+
+
+def sample_argmax(logits):
+    """logits ``[1, 1, batch, vocab]`` -> greedy token ids, via tt-metal's force-argmax path.
+
+    tt-metal f8c634a tt_sampling.py forward(): when every user is greedy (k=1, p in {0,1}, temp=1)
+    and the model allows it, sampling skips top-k / top-p / RNG and runs _untilize_for_argmax then
+    ttnn.argmax(dim=-1, keepdim=False). For llama3 the vocab (128256) needs no trim slice and fits
+    one untilize program (<= 2 * TOPK_MAX_WIDTH), so the device ops are Untilize -> ArgMax (BH p100a
+    261018 and WH n150 261015 captures: Untilize [1,1,32,128256] BFLOAT8_B -> BFLOAT16, ArgMax ->
+    UINT32). No preallocated output: the captures' ArgMax has a single input.
+    """
+    x = ttnn.untilize(logits, use_multicore=True)
+    return ttnn.argmax(x, dim=-1, keepdim=False)

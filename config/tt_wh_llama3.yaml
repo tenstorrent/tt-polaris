@@ -1,0 +1,118 @@
+# SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+ipblocks:
+    -   name: tensix
+        iptype: compute
+        l2_cache:
+            num_banks: 32
+            bytes_per_clk_per_bank: 64
+        pipes:
+        -   name: matrix
+            num_units   : 1
+            freq_MHz    : 1000
+            instructions:
+            -   {name: add, tpt: { int8: 2048, bf16: 512, fp16: 512, fp8: 2048,}}
+            -   {name: sub, tpt: { int8: 2048, bf16: 512, fp16: 512, fp8: 2048,}}
+            -   {name: mul, tpt: { int8: 2048, bf16: 512, fp16: 512, fp8: 2048,}}
+            -   {name: mac, tpt: { int8: 2048, bf16: 512, fp16: 512, fp8: 2048,}}
+        -   name: vector
+            num_units   : 1
+            freq_MHz    : 1000
+            instructions:
+            -   {name: add,   tpt: { int32: 32., fp32: 32. }}
+            -   {name: sub,   tpt: { int32: 32., fp32: 32. }}
+            -   {name: mul,   tpt: { int32: 32., fp32: 32. }}
+            -   {name: div,   tpt: { int32: 32., fp32: 32. }}
+            -   {name: mac,   tpt: { int32: 32., fp32: 32. }}
+            -   {name: tanh,  tpt: { int32: 32., fp32: 32. }}
+            -   {name: log,   tpt: { int32: 32., fp32: 32. }}
+            -   {name: exp,   tpt: { int32: 32., fp32: 32. }}
+            -   {name: sqrt, tpt: { int32: 32., fp32: 32. }}
+            -   {name: rsqrt, tpt: { int32: 32., fp32: 32. }}
+            -   {name: reciprocal, tpt: { int32: 32., fp32: 32. }}
+            -   {name: cmp,   tpt: { int32: 32., fp32: 32. }}
+            -   {name: mov,   tpt: { int32: 32., fp32: 32. }}
+            -   {name: max,   tpt: { int32: 32., fp32: 32. }}
+            -   {name: sin, tpt: { int32: 32., fp32: 32. }}
+            -   {name: cos, tpt: { int32: 32., fp32: 32. }}
+
+    -   name: gddr6
+        iptype: memory
+        technology: GDDR
+        data_bits : 32
+        data_rate : 8
+        freq_MHz  : 750
+        size_GB   : 2
+        transfer_rate_GTs : 12.0
+
+# llama3 per-workload arch config: n150 points at the llama3-specific LUT (whb0_n150_llama3_lut_v1,
+# built from the WH n150 prefill capture llama3-prefill-b1-f8c634a-wormhole_b0-n150_L-261019: 1 layer, first
+# replay session, captured with tracy --no-op-info-cache so every op records its own shapes).
+# ResNet/VGG/ViT keep the shared whb0_n150_lut_v5 via config/tt_wh.yaml.
+packages:
+    -   name: Wormhole
+        instances:
+        -   name: n150
+            operator_lookup_file: whb0_n150_llama3_lut_v1.yaml
+            # Logical tensix grid (x, y) — see doc/TTNN_SHIM_ARCHITECTURE.md §17.
+            # Source: tt-metal/tt_metal/core_descriptors/wormhole_b0_80_arch_eth_dispatch.yaml
+            # (end=[7, 9] → 8×10 physical). n150 has one row harvested → 8×9 = 72 cores
+            # (matches num_units below).
+            compute_grid_size: [8, 9]
+            ipgroups:
+            -   ipname: tensix
+                iptype: compute
+                num_units   : 72
+                ramp_penalty: 50
+                ip_overrides:
+                    pipes.matrix.freq_MHz: 1000
+                    pipes.vector.freq_MHz: 1000
+            -   ipname: gddr6
+                iptype: memory
+                num_units: 6
+        -   name: n300
+            ipgroups:
+            -   ipname: tensix
+                iptype: compute
+                num_units   : 128
+                ramp_penalty: 100
+                ip_overrides:
+                    pipes.matrix.freq_MHz: 1000
+                    pipes.vector.freq_MHz: 1000
+            -   ipname: gddr6
+                iptype: memory
+                num_units: 12
+
+#from https://tenstorrent.com/hardware/wormhole
+# Specification,     n150s,     n150d,    n300s,    n300d
+# Part Number,       TC-02001,  TC-02002, TC-02003, TC-02004
+# Wormholes,         1,         1,        2,        2
+# AI Clock (GHz),    1.0,       1.0,      1.0,      1.0
+# Tensix Cores,      72,        72,       128,      128
+# SRAM/Tensix(MB),   1.5,       1.5,      1.5,      1.5
+# SRAM(MB),          108,       108,      192,      192
+# MemTech,           GDDR6,     GDDR6,    GDDR6,    GDDR6
+# MemSize(GB),       12,        12,       24,       24
+# MemSpeed(GT/s),    12,        12,       12,       12
+# MemBW(GB/s),       288,       288,      576,      576
+# TFLOPS (FP8),      262,       262,      466,      466 -- this works for freq = 885 MHz
+# TFLOPS (FP16),     74,        74,       131,      131 -- this works for freq = 1000 MHz
+# TFLOPS (BLOCKFP8), 148,       148,      262,      262 -- this works for freq = 1000 MHz
+# TBP(W),            160,       160,      300,      300
+# C2C(G),            N/A,       N/A,      200,      200
+# Dims,              DimB,      DimA,     DimB,     DimA
+# Dimsp,             DimB+,     N/A,      DimB+,    N/A
+# Cooling,           Passive,   Fan,      Passive,  Fan
+
+# Glossary
+#     Fan         : Active (Axial Fan)
+#     DimA (WxDxH): 52.2mm x 256.0mm x 111.0mm'
+#     DimB (WxDxH): 36.0mm x 254.0mm x 111.0mm'
+#     DimB+(WxDxH): 36.0mm x 393.5mm x 114.0mm' (with cooling kit)
+#     C2C         : Internal Chip to Chip
+#     TBP         : Total Board Power
+
+# Common Specs
+#     Connectivity                : 2x Warp 100 Bridge; 2x QSFP-DD 200G (Active)*
+#     External Power              : 1x 4+4-pin EPS12V
+#     System Interface PCI Express: 4.0x16 PCI Express
