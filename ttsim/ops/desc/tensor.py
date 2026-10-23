@@ -425,7 +425,8 @@ def slice_sinf(iTList, oTList, op, **kwargs):
     dataT = iTList[0]
     # ttnn-style slice: arity-1, output bounds carried as an 'output_shape' attr (not starts/ends
     # tensor inputs like the ONNX form). The HW SliceDeviceOperation is arity-1; keep the key arity-1.
-    if len(iTList) == 1 and "output_shape" in op.attrs:
+    # With runtime bounds (use_tensor_args) inputs 1-2 are the start/end tensors, not ONNX data.
+    if "output_shape" in op.attrs and (len(iTList) == 1 or op.attrs.get("use_tensor_args")):
         out_shape = [int(i) for i in op.attrs["output_shape"]]
         Y = oTList[0]
         Y.shape = out_shape
