@@ -64,6 +64,22 @@ def get_rot_transformation_mat(dhead=32, device=None, datatype=None):
     return _dummy((1, 1, TILE, TILE), device, datatype)
 
 
+def prefill_rope_table_len(max_seq_len, trace_prefill_seq_lens=None):
+    """Rows of the traced prefill cos/sin tables (tt-metal f8c634a model._get_trace_rope_table_len).
+
+    From f8c634a tt-metal pads the prefill RoPE tables so every traced prefill length can slice a
+    fixed-width window: round_up(max_seq_len + max(lens), lcm(lens)). Llama-3.1-8B traces
+    [128, 1024] on N150 and P100 (model_config.get_trace_prefill_supported_seq_lens), so max_seq_len
+    1024 -> 2048 (BH p100a 261018 and WH n150 261015 captures: RotaryEmbeddingLlama cos/sin
+    [1,1,2048,128]). With no lens (a model/device that traces no prefill lengths) the table is max_seq_len.
+    """
+    if not trace_prefill_seq_lens:
+        return max_seq_len
+    align = math.lcm(*trace_prefill_seq_lens)
+    min_len = max_seq_len + max(trace_prefill_seq_lens)
+    return ((min_len + align - 1) // align) * align
+
+
 def get_prefill_rot_mat(head_dim, mesh_device, seq_len, theta, scale_factor, orig_context_len, start_pos=0):
     """Prefill rot_mats = [cos, sin], each (1,1,seq_len,head_dim) (tt-metal common.py:445-451)."""
     cos_gathereds = _dummy((1, 1, seq_len, head_dim), mesh_device, ttnn.bfloat16)

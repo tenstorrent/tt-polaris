@@ -101,6 +101,9 @@ class Attention:
         # DecodersPrecision.performance KV_CACHE=BFP8; capture confirms BFLOAT8_B). Was hardcoded bf16.
         self.kv_cache_dtype = configuration.kv_cache_dtype
         self.activation_dtype = ttnn.bfloat16
+        # Prefill follows tt-metal's `activation_dtype or <default>` against the ModelArgs override
+        # (None for llama3); self.activation_dtype above is the decode setting.
+        self.prefill_activation_dtype = configuration.activation_dtype
         # qkv / o / sdpa run at HiFi2 in decode under the performance preset (tt-metal
         # DecodersPrecision default: LI_QKV_DECODE / LI_O_DECODE / SDPA_DECODE = HIFI2).
         self.compute_kernel_config_hifi2 = configuration.compute_kernel_config_hifi2
@@ -157,9 +160,12 @@ class Attention:
                 raise ValueError(f'seq_len {seq_len} must be divisible by {self.MAX_QKV_MM_SEQ_LEN}')
             x_11SH = ttnn.reshape(x_11SH, [1, seq_len // self.MAX_QKV_MM_SEQ_LEN, self.MAX_QKV_MM_SEQ_LEN, -1])
 
-        # Fused QKV projection (capture op 25)
+        # Fused QKV projection (capture op 25). tt-metal: li_qkv_prefill_compute_kernel_cfg (HiFi2) and
+        # get_attn_qkv_mm_mem_config(PREFILL) = DRAM; the shim's None default would shard the output.
         xqkv_fused = ttnn.linear(
-            x_11SH, self.wqkv, memory_config=None, compute_kernel_config=None, program_config=None,
+            x_11SH, self.wqkv, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_kernel_config_hifi2,
+            program_config=self.args.attn_qkv_prefill_program_config(seq_len),
         )
         xqkv_fused = tt_all_reduce(xqkv_fused)  # identity (single-chip)
         if seq_len > self.MAX_QKV_MM_SEQ_LEN:
@@ -169,7 +175,7 @@ class Attention:
         # Split into heads (capture op 26)
         q_heads_pre, k_heads_pre, v_heads = ttnn.experimental.nlp_create_qkv_heads(
             xqkv_fused, num_heads=self.n_local_heads, num_kv_heads=self.n_local_kv_heads,
-            transpose_k_heads=False, memory_config=None,
+            transpose_k_heads=False, memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         q_heads_pre = self.q_norm(q_heads_pre, mode='prefill')
         k_heads_pre = self.k_norm(k_heads_pre, mode='prefill')
@@ -201,24 +207,38 @@ class Attention:
         ttnn.experimental.paged_fill_cache(kc[1], v_heads_8b, page_table=page_table, batch_idx=user_id)
 
         # Prefill SDPA on the in-flight heads (capture op 36)
-        q_heads_8b = ttnn.typecast(q_heads, dtype=self.activation_dtype)
+        # tt-metal attention.py forward_prefill: typecast(q, self.activation_dtype or bfloat8_b); the
+        # llama3 perf preset leaves activation_dtype None -> bf8 (BH p100a prefill capture: typecast
+        # [1,32,128,128] BF16 -> BF8 and SDPA input_0 BF8). self.activation_dtype (bf16) is the
+        # decode setting and made this a bf16->bf16 no-op, dropping the op.
+        q_heads_8b = ttnn.typecast(q_heads, dtype=self.prefill_activation_dtype or ttnn.bfloat8_b)
         ttnn.deallocate(q_heads)
+        # sdpa_prefill_compute_kernel_cfg = compute_kernel_config_hifi4 (DecodersPrecision SDPA_PREFILL =
+        # HIFI4) and get_attn_sdpa_program_config(PREFILL), tt-metal f8c634a. The captures key SDPA
+        # fidelity as N/A, so the shim keeps None and its LUT key is unchanged.
         attn_output = ttnn.transformer.scaled_dot_product_attention(
             q_heads_8b, k_heads_8b, v_heads_8b, is_causal=True, scale=self.scale,
-            compute_kernel_config=None, program_config=None,
+            compute_kernel_config=None if IS_POLARIS else self.args.compute_kernel_config_hifi4,
+            program_config=self.args.attn_sdpa_prefill_program_config(seq_len),
         )
         ttnn.deallocate(q_heads_8b)
         ttnn.deallocate(k_heads_8b)
         ttnn.deallocate(v_heads_8b)
 
-        attn_output = ttnn.reshape(attn_output, [1, self.n_local_heads, -1, self.head_dim])
+        # batch-1 SDPA output is already [1, n_heads, S, head_dim]; on HW that reshape is a free view
+        # (no profiler row), while the shim lowers a TILE reshape to Untilize+TilizeWithValPadding.
+        # Skip it when the shape already matches so both paths emit nothing here.
+        target = [1, self.n_local_heads, attn_output.shape[-2], self.head_dim]
+        if list(attn_output.shape) != target:
+            attn_output = ttnn.reshape(attn_output, target)
 
         # Concat heads (capture op 37)
-        attn_output = ttnn.experimental.nlp_concat_heads(attn_output, memory_config=None)
-        # Output projection (capture op 38)
+        attn_output = ttnn.experimental.nlp_concat_heads(attn_output, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        # Output projection (capture op 38): li_o_prefill_compute_kernel_cfg (HiFi2), DRAM output.
         output = ttnn.linear(
-            attn_output, self.wo, compute_kernel_config=None, dtype=self.activation_dtype,
-            program_config=None, memory_config=None,
+            attn_output, self.wo, compute_kernel_config=self.compute_kernel_config_hifi2,
+            dtype=self.prefill_activation_dtype or ttnn.bfloat8_b,
+            program_config=self.args.attn_wo_prefill_program_config(seq_len), memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         ttnn.deallocate(attn_output)
         return tt_all_reduce(output)  # identity (single-chip)
