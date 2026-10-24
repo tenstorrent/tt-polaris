@@ -10,8 +10,11 @@ Layout, shard, and transformer head op descriptors:
 Used by the TTNN front-end tracking-only operator APIs (*_op helpers) in ttnn_shim.
 """
 
+import math
+import os
+
 from ttsim.ops.desc.registry import register_ops
-from ttsim.ops.tensor import _coerce_shape_to_list, require_shape_list
+from ttsim.ops.tensor import _BLOCK_FLOAT_TILE_BYTES, _coerce_shape_to_list, require_shape_list
 
 TILE_HEIGHT = 32
 TILE_WIDTH = 32
@@ -708,6 +711,87 @@ def _passthrough_perf(in_shapes, out_shape, elem_size):
     }
 
 
+# ---------------------------------------------------------------------------
+# POC (POLARIS_POC_KV): size KV-cache ops by the cache region they touch, not the whole cache.
+# Paged cache layout: [num_blocks, kv_heads, block_size, head_dim]; decode K/V input: [1, users, kv_heads, head_dim].
+# ---------------------------------------------------------------------------
+
+def _poc_kv_enabled() -> bool:
+    return bool(os.environ.get('POLARIS_POC_KV'))
+
+
+def _poc_kv_pos() -> int:
+    pos = os.environ.get('POLARIS_POC_KV_POS')
+    if pos is None:
+        raise ValueError('POLARIS_POC_KV requires POLARIS_POC_KV_POS (decode position, e.g. max_seq_len - 1)')
+    return int(pos)
+
+
+def _poc_elem_bytes(t, elem_size) -> float:
+    """Bytes per element: the tensor's TT dtype size when POLARIS_POC_BYTES is on, else element_size."""
+    tt = getattr(t, '_ttnn_dtype', None)
+    if os.environ.get('POLARIS_POC_BYTES') and tt is not None:
+        if tt.name in _BLOCK_FLOAT_TILE_BYTES:
+            return _BLOCK_FLOAT_TILE_BYTES[tt.name] / (TILE_HEIGHT * TILE_WIDTH)
+        return float(tt.itemsize)
+    return float(elem_size)
+
+
+def _poc_side_input_bytes(tensors, elem_size) -> float:
+    return sum(_nelems(t.shape) * _poc_elem_bytes(t, elem_size) for t in tensors if t.shape)
+
+
+def _poc_kv_update_perf(iTList, elem_size):
+    """PagedFusedUpdateCache: read-modify-write the cache tiles holding the new token, per user, head, cache."""
+    k_cache, k_in, v_cache, v_in = iTList[:4]
+    users = int(k_in.shape[-3])
+    kv_heads, head_dim = int(k_cache.shape[1]), int(k_cache.shape[-1])
+    tile_elems = users * kv_heads * math.ceil(head_dim / TILE_WIDTH) * TILE_HEIGHT * TILE_WIDTH
+    cache_bytes = tile_elems * (_poc_elem_bytes(k_cache, elem_size) + _poc_elem_bytes(v_cache, elem_size))
+    in_bytes = cache_bytes + _poc_side_input_bytes([k_in, v_in, *iTList[4:]], elem_size)
+    return {
+        'inElems': 2 * tile_elems + sum(_nelems(t.shape) for t in [k_in, v_in, *iTList[4:]] if t.shape),
+        'outElems': 2 * tile_elems,
+        'inBytes': int(in_bytes),
+        'outBytes': int(cache_bytes),
+        'instrs': {'mov': 2 * tile_elems},
+    }
+
+
+def _poc_kv_fill_perf(iTList, elem_size):
+    """PagedFillCache: write the input's tiles into the cache (prefix length comes from the input)."""
+    cache, inp = iTList[0], iTList[1]
+    shp = [int(d) for d in inp.shape]
+    lead = _nelems(shp[:-2])
+    tile_elems = lead * math.ceil(shp[-2] / TILE_HEIGHT) * math.ceil(shp[-1] / TILE_WIDTH) * TILE_HEIGHT * TILE_WIDTH
+    out_bytes = tile_elems * _poc_elem_bytes(cache, elem_size)
+    return {
+        'inElems': sum(_nelems(t.shape) for t in iTList[1:] if t.shape),
+        'outElems': tile_elems,
+        'inBytes': int(_poc_side_input_bytes(iTList[1:], elem_size)),
+        'outBytes': int(out_bytes),
+        'instrs': {'mov': tile_elems},
+    }
+
+
+def _poc_kv_sdpa_decode_perf(iTList, oTList, elem_size):
+    """SDPA decode: read K and V for positions 0..cur_pos (tile-rounded); QK^T + PV MACs and softmax exp."""
+    q, k_cache, v_cache = iTList[0], iTList[1], iTList[2]
+    users, q_heads = int(q.shape[-3]), int(q.shape[-2])
+    kv_heads, head_dim = int(k_cache.shape[1]), int(k_cache.shape[-1])
+    positions = TILE_HEIGHT * math.ceil((_poc_kv_pos() + 1) / TILE_HEIGHT)
+    kv_elems = users * kv_heads * positions * head_dim
+    kv_bytes = kv_elems * (_poc_elem_bytes(k_cache, elem_size) + _poc_elem_bytes(v_cache, elem_size))
+    out = oTList[0]
+    return {
+        'inElems': 2 * kv_elems + sum(_nelems(t.shape) for t in [q, *iTList[3:]] if t.shape),
+        'outElems': _nelems(out.shape),
+        'inBytes': int(kv_bytes + _poc_side_input_bytes([q, *iTList[3:]], elem_size)),
+        'outBytes': int(_nelems(out.shape) * _poc_elem_bytes(out, elem_size)),
+        'instrs': {'mac': 2 * users * q_heads * positions * head_dim, 'exp': users * q_heads * positions},
+    }
+
+
 def rotary_embedding_llama_sinf(iTList, oTList, op, **kwargs):
     """Shape inference for RotaryEmbeddingLlama (prefill): output = in0 (x) shape.
 
@@ -818,6 +902,9 @@ def paged_fill_cache_sinf(iTList, oTList, op, **kwargs):
     oTList[0].dtype = cache.dtype
 
     elem_size = op.attrs.get('element_size', 2)
+    if _poc_kv_enabled():
+        op.perf_stats = _poc_kv_fill_perf(iTList, elem_size)
+        return
     op.perf_stats = _passthrough_perf([t.shape for t in iTList], cache_shape, elem_size)
     return
 
@@ -844,6 +931,9 @@ def paged_fused_update_cache_sinf(iTList, oTList, op, **kwargs):
     oTList[1].dtype = v_cache.dtype
 
     elem_size = op.attrs.get('element_size', 2)
+    if _poc_kv_enabled():
+        op.perf_stats = _poc_kv_update_perf(iTList, elem_size)
+        return
     in_elems = sum(_nelems(t.shape) for t in iTList if t.shape)
     out_elems = _nelems(k_cache_shape) + _nelems(v_cache_shape)
     op.perf_stats = {
@@ -954,6 +1044,9 @@ def sdpa_sinf(iTList, oTList, op, **kwargs):
     oTList[0].dtype = Q.dtype
 
     elem_size = op.attrs.get('element_size', 2)
+    if _poc_kv_enabled() and len(iTList) >= 4:  # decode (cur_pos present); prefill SDPA unchanged
+        op.perf_stats = _poc_kv_sdpa_decode_perf(iTList, oTList, elem_size)
+        return
     op.perf_stats = _passthrough_perf([t.shape for t in iTList], q_shape, elem_size)
     return
 
