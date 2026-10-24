@@ -265,7 +265,13 @@ class SimTensor:
                     and ttnn_dtype.name in _BLOCK_FLOAT_TILE_BYTES):
                 if poc_bytes == 'naive':
                     return int(self.nelems() * ttnn_dtype.itemsize)
-                return _tile_exact_nbytes(list(self.shape), _BLOCK_FLOAT_TILE_BYTES[ttnn_dtype.name])
+                tile_bytes = _BLOCK_FLOAT_TILE_BYTES[ttnn_dtype.name]
+                # Tile padding applies only to tensors stored tiled in their logical shape. Row-major
+                # block-float tensors (e.g. conv weights in OIHW) are re-laid-out before tiling on HW,
+                # so padding their logical last two dims would overstate them; count exponent overhead only.
+                if getattr(getattr(self, 'layout', None), 'name', '') != 'TILE_LAYOUT':
+                    return int(self.nelems() * tile_bytes / (_TILE * _TILE))
+                return _tile_exact_nbytes(list(self.shape), tile_bytes)
             assert self.dtype is not None, f"SimTensor({self.name}) has no dtype to calculate nbytes"
             itemsize = typesize(self.dtype)
         else:
