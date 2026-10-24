@@ -2,11 +2,28 @@
 # SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 import functools, operator
+import math
+import os
 import warnings
 from typing import Any, Optional, Union
 
 import numpy as np
 from ttsim.utils.types import get_bpe, get_sim_dtype
+
+# Bytes per 32x32 tile for TT block-float formats: mantissas + one shared exponent byte per 16 values.
+# tt-metal tt_backend_api_types.hpp: Bfp8_b = 256*4 + 16*4, Bfp4_b = 128*4 + 16*4.
+_BLOCK_FLOAT_TILE_BYTES = {'BFLOAT8_B': 1088, 'BFLOAT4_B': 576}
+_TILE = 32
+
+
+def _tile_exact_nbytes(shape: list, tile_bytes: int) -> int:
+    """Bytes of a tiled tensor: last two dims rounded up to whole 32x32 tiles."""
+    dims = [int(d) for d in shape] or [1]
+    if len(dims) == 1:
+        dims = [1] + dims
+    lead = functools.reduce(operator.mul, dims[:-2], 1)
+    return lead * math.ceil(dims[-2] / _TILE) * math.ceil(dims[-1] / _TILE) * tile_bytes
+
 
 class Shape:
     """
@@ -240,6 +257,15 @@ class SimTensor:
             else:
                 raise TypeError(f"Unsupported dtype type: {type(dtype)}")
         if itemprec is None:
+            # POC (POLARIS_POC_BYTES): TT block-float dtypes map to np.float32, so the numpy itemsize
+            # counts them at 4 B/elem. Size them by their tt-metal tile format instead.
+            poc_bytes = os.environ.get('POLARIS_POC_BYTES')
+            ttnn_dtype = getattr(self, '_ttnn_dtype', None)
+            if (poc_bytes and self.shape is not None and ttnn_dtype is not None
+                    and ttnn_dtype.name in _BLOCK_FLOAT_TILE_BYTES):
+                if poc_bytes == 'naive':
+                    return int(self.nelems() * ttnn_dtype.itemsize)
+                return _tile_exact_nbytes(list(self.shape), _BLOCK_FLOAT_TILE_BYTES[ttnn_dtype.name])
             assert self.dtype is not None, f"SimTensor({self.name}) has no dtype to calculate nbytes"
             itemsize = typesize(self.dtype)
         else:
