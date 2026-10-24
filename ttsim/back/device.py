@@ -106,6 +106,7 @@ class Device:
         simcfg_obj,
         *,
         operator_lookup_hybrid_curve: Optional[bool] = None,
+        ignore_lut: bool = False,
     ):
         compute_ips = [ipg for ipg in simcfg_obj.ipgroups if ipg.iptype == 'compute']
         memory_ips  = [ipg for ipg in simcfg_obj.ipgroups if ipg.iptype == 'memory']
@@ -134,7 +135,9 @@ class Device:
             _hybrid_curve = bool(getattr(simcfg_obj, "operator_lookup_hybrid_curve", False))
         else:
             _hybrid_curve = bool(operator_lookup_hybrid_curve)
-        if hasattr(simcfg_obj, 'operator_lookup_file') and simcfg_obj.operator_lookup_file:
+        if ignore_lut:
+            logger.info("Operator performance lookup disabled (--ignore-lut); using the analytical model for all ops")
+        elif hasattr(simcfg_obj, 'operator_lookup_file') and simcfg_obj.operator_lookup_file:
             lookup_file = simcfg_obj.operator_lookup_file
             if lookup_file.startswith('lfc://'):
                 try:

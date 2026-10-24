@@ -311,6 +311,13 @@ def setup_cmdline_args(argv: list[str] | None = None) -> argparse.Namespace:
             'benefit from analytical fusion. Use --disable-fusion only to debug fusion itself.'
         ),
     )
+    parser.add_argument(
+        '--ignore-lut',
+        dest='ignore_lut',
+        action='store_true',
+        default=False,
+        help='Do not load the operator perf LUT named in the arch config; every op uses the analytical model.',
+    )
 
     #cmdline args processing
     args = parser.parse_args(argv)
@@ -426,7 +433,8 @@ def do_dryrun(_wl, _dl):
 def execute_wl_on_dev(_wl, _dl, _wspec, _dspec, wlmapspec, _WLG,
                       _odir, study, _enable_memalloc, outputfmt, flag_dump_stats_csv,
                       operator_lookup_hybrid_curve: bool = False,
-                      disable_fusion: bool = False):
+                      disable_fusion: bool = False,
+                      ignore_lut: bool = False):
     # TODO: Reduce number of arguments to this function
     study_dir = _odir / study
     stat_dir    = study_dir / 'STATS'
@@ -477,6 +485,7 @@ def execute_wl_on_dev(_wl, _dl, _wspec, _dspec, wlmapspec, _WLG,
             cur_device = Device(
                 dev_obj,
                 operator_lookup_hybrid_curve=use_hybrid_lut_curve,
+                ignore_lut=ignore_lut,
             )
             cur_device.execute_graph(wlgraph, wlmapspec, disable_fusion=disable_fusion)
 
@@ -553,6 +562,7 @@ def polaris(args: argparse.Namespace | runcfgmodel.PolarisRunConfig) -> int:
             args.dump_stats_csv,
             operator_lookup_hybrid_curve=bool(args.operator_lookup_hybrid_curve),
             disable_fusion=bool(getattr(args, 'disable_fusion', False)),
+            ignore_lut=bool(getattr(args, 'ignore_lut', False)),
         )
         summary_stats = sorted(summary_stats, key=lambda x: (x['wlname'], x['devname'], x['freq_Mhz'], x['wlinstance'], x['bs']))
 
