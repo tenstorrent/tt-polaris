@@ -129,6 +129,11 @@ class PolarisRunConfig(BaseModel, extra='forbid'):
         description='Skip op fusion in Device.execute_graph (polaris --disable-fusion)',
     )
 
+    ignore_lut: Optional[bool] = Field(
+        default=False,
+        description='Do not load the operator perf LUT; every op uses the analytical model (polaris --ignore-lut)',
+    )
+
     dryrun: Optional[bool] = Field(
         default=False, description='If true, run will not execute any commands, but will only print them'
     )
