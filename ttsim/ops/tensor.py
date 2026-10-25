@@ -271,7 +271,10 @@ class SimTensor:
                 # so padding their logical last two dims would overstate them; count exponent overhead only.
                 if getattr(getattr(self, 'layout', None), 'name', '') != 'TILE_LAYOUT':
                     return int(self.nelems() * tile_bytes / (_TILE * _TILE))
-                return _tile_exact_nbytes(list(self.shape), tile_bytes)
+                # Conv-path activations carry a logical NCHW shape but are stored NHWC-flattened
+                # ([1, 1, N*H*W, C], recorded as hw_shape); tile padding follows the stored shape.
+                tiled_shape = self.hw_shape if self.hw_shape is not None else list(self.shape)
+                return _tile_exact_nbytes(list(tiled_shape), tile_bytes)
             assert self.dtype is not None, f"SimTensor({self.name}) has no dtype to calculate nbytes"
             itemsize = typesize(self.dtype)
         else:
