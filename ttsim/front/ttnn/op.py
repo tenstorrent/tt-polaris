@@ -624,17 +624,45 @@ def slice_spec_out_shape(in_shape, slice_spec):
 
 
 def as_pp(args_list, kwargs_dict):
+    # Real ttnn takes the input positionally or as input_tensor=.
+    if "input_tensor" in kwargs_dict:
+        assert not args_list, "ttnn.slice: input given both positionally and as input_tensor="
+        args_list = (kwargs_dict.pop("input_tensor"),)
     input_tensor = require_ttnn_tensor(args_list[0], "ttnn.slice input")
-    slice_spec = kwargs_dict.get("slice", None)
-    assert (
-        slice_spec is not None
-    ), "ttnn.slice requires 'slice' attribute specifying indices"
-
     in_shape = require_shape_list(
         input_tensor.shape, "ttnn.slice input shape must be set"
     )
-    kwargs_dict["output_shape"] = slice_spec_out_shape(in_shape, slice_spec)
-    return (input_tensor,), kwargs_dict
+    slice_spec = kwargs_dict.get("slice", None)
+    starts, ends = kwargs_dict.pop("starts", None), kwargs_dict.pop("ends", None)
+    if starts is None and ends is None:
+        assert (
+            slice_spec is not None
+        ), "ttnn.slice requires 'slice' attribute specifying indices"
+        kwargs_dict["output_shape"] = slice_spec_out_shape(in_shape, slice_spec)
+        return (input_tensor,), kwargs_dict
+
+    # Runtime bounds: ttnn.slice(input_tensor, starts=<tensor>, ends=<tensor>, slice_dim=, num_devices=).
+    # The HW SliceDeviceOperation takes the bound tensors as inputs 1-2 (use_tensor_args), so the
+    # capture keys it arity-3, and it sizes the output from slice_dim / num_devices alone, never from
+    # the bound values (tt-metal slice_device_operation.cpp compute_output_specs, use_tensor_args path).
+    assert isinstance(starts, Tensor) and isinstance(ends, Tensor), \
+        "ttnn.slice: starts and ends must both be tensors (runtime bounds) or both be omitted"
+    slice_dim, num_devices = kwargs_dict.get("slice_dim"), kwargs_dict.get("num_devices")
+    assert slice_dim is not None and num_devices is not None, \
+        "ttnn.slice: slice_dim and num_devices must be provided for tensor args path"
+    assert 0 <= slice_dim < len(in_shape), \
+        f"ttnn.slice: slice_dim ({slice_dim}) must be less than tensor rank ({len(in_shape)})"
+    assert in_shape[slice_dim] % num_devices == 0, \
+        f"ttnn.slice: dim {slice_dim} (size={in_shape[slice_dim]}) must be evenly divisible by num_devices ({num_devices})"
+    out_shape = list(in_shape)
+    out_shape[slice_dim] //= num_devices
+    if slice_spec is not None:
+        spec_shape = slice_spec_out_shape(in_shape, slice_spec)
+        assert spec_shape == out_shape, \
+            f"ttnn.slice: slice= gives {spec_shape} but slice_dim/num_devices give {out_shape}"
+    kwargs_dict["output_shape"] = out_shape
+    kwargs_dict["use_tensor_args"] = 1
+    return (input_tensor, starts, ends), kwargs_dict
 
 
 def topk_pp(args_list, kwargs_dict):

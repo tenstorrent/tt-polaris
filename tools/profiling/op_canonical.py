@@ -65,6 +65,7 @@ PROFILER_PREFIX_RULES: tuple[tuple[str, str], ...] = (
     ("Sdpa", "scaleddotproductattention"),
     # decode sampling-tail ops — canonical = lowercased shim optype (sim/HW agree).
     ("TopK", "topk"),
+    ("ArgMax", "argmax"),
     ("ManualSeed", "manualseed"),
     ("Sampling", "sampling"),
     ("PlusOne", "plusone"),
