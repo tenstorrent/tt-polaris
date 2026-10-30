@@ -162,7 +162,19 @@ POLARIS_SYNONYMS: Dict[str, str] = {
     "nlpconcatheads": "concatheads",
     "untilizewithvalunpadding": "untilizewithunpadding",  # TT-Polaris uses "Val", profiler uses plain form
     "conv": "conv2d",  # TT-Polaris emits op.type='Conv'; LUT op_code='conv2d'
-    "maxpool": "pool2d",  # TT-Polaris emits op.type='MaxPool'; profiler/LUT uses 'Pool2D' → 'pool2d'
+    # tt-metal has ONE Pool2D device op, parameterised by pool type, so silicon
+    # logs max- and average-pooling identically as 'Pool2D'.  TT-Polaris models
+    # them ONNX-style as two SimOps.  Both must canonicalise to the hardware name
+    # or they cannot match a profiler row or a LUT entry.
+    #
+    # 'maxpool' was mapped from the start; 'averagepool' was not, which is why
+    # ResNet-50's global average pool (between the last bottleneck and fc) keyed
+    # as ('averagepool', ...) and missed — and why compare_layers showed pool2d
+    # 1 on the TT-Polaris side against 2 on hardware.  No LUT in __ext/hlm-lut
+    # contains an 'averagepool' key, so this rename can only turn misses into
+    # hits; nothing was relying on the old spelling.
+    "maxpool": "pool2d",
+    "averagepool": "pool2d",
 }
 
 # ---------------------------------------------------------------------------

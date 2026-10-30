@@ -520,6 +520,54 @@ workloads:
     instances:
       vgg_unet_bh_b1_perf_report: { bs: 1, model_name: vgg-unet-bh-b1-perf-report }
 
+  # ----- ResNet-50 (224x224) — Wormhole (n150) -----
+  #
+  # Canonical entry point (tt-metal models/README.md rows 65-67):
+  #   models/demos/vision/classification/resnet50/ttnn_resnet/tt/ttnn_functional_resnet50.py
+  # WH and BH share one model, so it lives in resnet50/common/ and only the
+  # runners are split per arch.
+  #
+  # bs 16 is the canonical device-perf batch on BOTH arches — not a placeholder.
+  # Upstream skips bs<=2, bs==8 and WH bs==20 outright
+  # (tt-metal/models/demos/vision/classification/resnet50/ttnn_resnet/tests/common/resnet50_test_infra.py:196-201).
+  # Canonical operating point: act/weight dtype bfloat8_b, MathFidelity.LoFi.
+  #
+  # Reference silicon device-perf to compare the projection against:
+  #   WH n150  6335.0     fps  (tt-metal/models/demos/vision/classification/resnet50/wormhole/tests/test_perf_device_resnet50.py:16)
+  #   BH       11864.3138 fps  (tt-metal/models/demos/vision/classification/resnet50/blackhole/tests/test_perf_device_resnet50.py:16)
+  # The 4,700 / 12,600 fps in models/README.md are HOST end-to-end figures from
+  # test_perf_e2e_resnet50.py and are NOT the comparable numbers.
+
+  - api: TTNN
+    name: resnet50_wh_device_perf
+    basedir: workloads/ttnn/resnet50/wh
+    module : run_resnet50_e2e_entry@test_resnet50_device_perf_wh.py
+    instances:
+      resnet50_wh_b16_device_perf: { bs: 16, model_name: resnet50-wh-b16-device-perf }
+
+  - api: TTNN
+    name: resnet50_wh_perf_report
+    basedir: workloads/ttnn/resnet50/wh
+    module : run_resnet50_perf_device@test_resnet50_device_perf_wh.py
+    instances:
+      resnet50_wh_b16_perf_report: { bs: 16, model_name: resnet50-wh-b16-perf-report }
+
+  # ----- ResNet-50 (224x224) — Blackhole (p100a) -----
+
+  - api: TTNN
+    name: resnet50_bh_device_perf
+    basedir: workloads/ttnn/resnet50/bh
+    module : run_resnet50_e2e_entry@test_resnet50_device_perf_bh.py
+    instances:
+      resnet50_bh_b16_device_perf: { bs: 16, model_name: resnet50-bh-b16-device-perf }
+
+  - api: TTNN
+    name: resnet50_bh_perf_report
+    basedir: workloads/ttnn/resnet50/bh
+    module : run_resnet50_perf_device@test_resnet50_device_perf_bh.py
+    instances:
+      resnet50_bh_b16_perf_report: { bs: 16, model_name: resnet50-bh-b16-perf-report }
+
 
   - api: TTNN
     name: PI0

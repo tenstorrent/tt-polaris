@@ -69,7 +69,8 @@ _HALO_EXT_Y: dict[tuple[int, int, int, int, int, int, bool], int] = {
 # some halo positions emit a different extended-y on other arches because
 # ``determine_parallel_config`` picks a workload-specific ``num_cores_nhw``.
 # Applied by the annotation pass in ttsim/back/device.py at execute_graph time, when
-# the back Device's instance name is known. See doc/TTNN_SHIM_ARCHITECTURE.md §17.
+# the back Device's instance name is known -- see
+# ``ttsim/back/device.py::Device._annotate_halo_y_pad_logical``.
 _HALO_EXT_Y_OVERRIDES_BY_DEVICE: dict[
     str, dict[tuple[int, int, int, int, int, int, bool], int]
 ] = {
@@ -85,6 +86,153 @@ _HALO_EXT_Y_OVERRIDES_BY_DEVICE: dict[
         # different num_cores → HW captures y=88408 (verified against
         # __refrun_cache/vgg_unet/bh/p100a/merged_ops_dualref_260519.csv convtranspose entry).
         (16384, 128, 2, 2, 0, 0, True): 88408,
+
+        # --- ResNet-50 (batch 16), verified against
+        # __refrun_cache/resnet50/bh/p100a/merged_ops_resnet50-02b76a9-blackhole-p100a-260816.csv
+        # Each value is that capture's HaloDeviceOperation OUTPUT_0_Y_PAD[LOGICAL],
+        # which the capture also shows is exactly the following Conv2dDeviceOperation's
+        # INPUT_0_Y_PAD[LOGICAL].  The trailing comment records the halo row's own
+        # SlidingWindowConfig num_cores_nhw and how many positions share the key;
+        # extended_y == num_cores_nhw * max_out_nsticks_per_core in every row, so
+        # these become derivable once sliding_window::get_num_elems_per_core is
+        # ported.
+        (211600,   16, 4, 4, 0, 0, False): 274204,  # conv1 (post-fold 4x4), 98 cores
+        (200704,   64, 3, 3, 1, 1, False): 247450,  # maxpool halo,          98 cores
+        ( 50176,   64, 3, 3, 1, 1, False):  76860,  # layer1 3x3 (x3),      105 cores
+        ( 50176,  128, 3, 3, 1, 1, False):  82845,  # layer2.0 3x3,         105 cores
+        ( 50176,  256, 1, 1, 0, 0, False):  56175,  # layer2.0 downsample,  105 cores
+        ( 12544,  128, 3, 3, 1, 1, False):  25480,  # layer2 3x3 (x3),       98 cores
+        ( 12544,  256, 3, 3, 1, 1, False):  27538,  # layer3.0 3x3,          98 cores
+        ( 12544,  512, 1, 1, 0, 0, False):  12830,  # layer3.0 downsample,   10 cores
+        (  3136,  256, 3, 3, 1, 1, False):  10192,  # layer3 3x3 (x5),       98 cores
+        (  3136,  512, 3, 3, 1, 1, False):   5410,  # layer4.0 3x3,          10 cores
+        (  3136, 1024, 1, 1, 0, 0, False):   3870,  # layer4.0 downsample,   10 cores
+        # The two stage-4 keys are the only ones whose capture cell is
+        # "800[784]" rather than "N[N]": the profiler column is PADDED[LOGICAL]
+        # and 16*7*7 = 784 pads to 800.  The annotation pass keys on N*H*W from
+        # the halo's logical input shape, i.e. 784, so these must be 784 — keying
+        # them on 800 (as a first pass did) makes both lookups silently miss.
+        (   784,  512, 3, 3, 1, 1, False):   1620,  # layer4 3x3 (x2),        9 cores
+        (   784, 2048, 7, 7, 0, 0, False):    784,  # avgpool halo,           1 core
+    },
+
+    # WH n150 (grid 8x9), ResNet-50 batch 16.  Verified against
+    # __refrun_cache/resnet50/wh/n150/merged_ops_resnet50-02b76a9-wormhole_b0-n150_L-260916.csv
+    # — same derivation as the p100a block: each value is that capture's
+    # HaloDeviceOperation OUTPUT_0_Y_PAD[LOGICAL], keyed on the halo's LOGICAL
+    # input (nhw, channels) and window geometry.
+    #
+    # Nothing transfers from p100a: the grid is 8x9 rather than 12x10, so
+    # num_cores_nhw differs at every position and so does every extended y.
+    # Compare (50176, 64, 3, 3, 1, 1): 105 cores -> 76860 on p100a,
+    # 56 cores -> 64960 here.
+    "n150": {
+        (211600,   16, 4, 4, 0, 0, False): 228160,  # conv1 (post-fold 4x4), 64 cores
+        (200704,   64, 3, 3, 1, 1, False): 211520,  # maxpool halo,          64 cores
+        ( 50176,   64, 3, 3, 1, 1, False):  64960,  # layer1 3x3 (x3),       56 cores
+        ( 50176,  128, 3, 3, 1, 1, False):  61656,  # layer2.0 3x3,          56 cores
+        ( 50176,  256, 1, 1, 0, 0, False):  46984,  # layer2.0 downsample,   56 cores
+        ( 12544,  128, 3, 3, 1, 1, False):  20160,  # layer2 3x3 (x3),       56 cores
+        ( 12544,  256, 3, 3, 1, 1, False):  15784,  # layer3.0 3x3,           8 cores
+        ( 12544,  512, 1, 1, 0, 0, False):  13368,  # layer3.0 downsample,    8 cores
+        (  3136,  256, 3, 3, 1, 1, False):   4592,  # layer3 3x3 (x5),        8 cores
+        (  3136,  512, 3, 3, 1, 1, False):   5089,  # layer4.0 3x3,           7 cores
+        (  3136, 1024, 1, 1, 0, 0, False):   3647,  # layer4.0 downsample,    7 cores
+        (   784,  512, 3, 3, 1, 1, False):   1680,  # layer4 3x3 (x2),        7 cores
+        (   784, 2048, 7, 7, 0, 0, False):    784,  # avgpool halo,           1 core
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Capture-derived Move suppression
+# ---------------------------------------------------------------------------
+#
+# WHY THIS IS NEEDED
+#
+# tt-metal calls ``ttnn::move`` after a halo whenever ``reallocate_halo_output``
+# is set (``tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d.cpp:297-299``; it defaults True and ResNet-50's stem
+# conv1
+# leaves it unset, so the call happens).  But ``tt-metal/ttnn/cpp/ttnn/operations/data_movement/move/move.cpp:69-76``
+# only DISPATCHES
+# a MoveDeviceOperation when the reallocation lands at a different address::
+#
+#     if (move_within_same_mem_space and input_address == output_tensor.buffer()->address()) {
+#         log_debug(..., "WARNING: No space to move the tensor. ...");
+#         return output_tensor;              // no op dispatched
+#     }
+#
+# That is an L1 free-list decision taken at runtime.  Polaris has no allocator,
+# so it models the call site and emits a Move wherever tt-metal would *call*
+# ``ttnn::move``; silicon emits one only where the address actually changes.
+#
+# On ResNet-50 p100a b16 that is one extra Move, at the stem conv1 — the capture
+# goes straight from Halo (row 7) to Conv2d (row 8).  It is the most expensive
+# single error left in that workload: ~0.047 ms, because no LUT entry exists to
+# hit (hardware never runs the op) so it takes an analytical estimate.
+#
+# Re-gating the shim's Move on ``reallocate_halo_output`` instead of
+# ``deallocate_activation`` does NOT fix it — measured independently on the
+# p100a and n150 lines.  The stem's flag is True either way.  The suppression is
+# an allocator fact, not a config fact, so a capture-derived list is the only
+# mechanism that closes it.
+#
+# SCOPE AND LIMITS
+#
+# Keyed by SKU — the arch-spec device instance name, the same key
+# ``_HALO_EXT_Y_OVERRIDES_BY_DEVICE`` above uses.  An earlier version keyed on
+# ``device.architecture`` instead, because the consumer (``_with_halo`` in the
+# front-end shim) could reach the arch but not the instance name, which only the
+# backend has.  That was too coarse to be safe: config/tt_bh.yaml declares
+# ``p150a`` and ``p150b`` next to ``p100a``, and an arch key handed all three the
+# allocator outcome measured on exactly one of them.  Since the entries encode an
+# L1 free-list result, and the p150 cards have a different DRAM size and memory
+# bandwidth (tt_bh.yaml:9-11), that is precisely the assumption the table must not
+# make.
+#
+# The front-end now gets the SKU from ``Device.capture_sku``, which the workload
+# declares (``device.set_capture_sku('p100a')``).  A device that declares nothing
+# misses the table entirely and emits the Move, which is the un-suppressed,
+# tt-metal-call-site behaviour — wrong by one op against a capture that shows
+# none, but wrong in the direction that does not silently import another card's
+# measurements.
+#
+# Unlike the halo extended-Y table, this one has no derivation waiting behind
+# it.  Those values are a deterministic function of the sliding-window config
+# and retire once ``sliding_window::get_num_elems_per_core`` is ported.  These
+# encode an allocator outcome observed in ONE capture: a different batch size,
+# L1 budget or upstream op order can change the address and make the same
+# position dispatch a Move.  Entries are therefore per-shape and deliberately
+# narrow, and neither line has yet been checked against a silicon run — treat
+# every entry as provisional.
+#
+# Key: (nhw, channels) of the halo output AS SEEN AT EMISSION TIME.
+#
+# That is the PRE-annotation value.  `_annotate_halo_y_pad_logical` runs in the
+# backend, after the graph is built, and writes the halo-extended y onto the
+# tensor as `y_pad_logical`; `_shape_wzyx` then prefers it when building the LUT
+# key.  So the stem conv1's Move reads (274204, 16) in a key dump but the guard
+# in `_with_halo` — which runs at emission — sees (211600, 16).  Key on the
+# latter.  It is also the more stable identity: 211600 is the halo INPUT nhw and
+# is exactly the key this same position uses in
+# _HALO_EXT_Y_OVERRIDES_BY_DEVICE above.
+_HALO_MOVE_SUPPRESSED_BY_SKU: dict[str, set[tuple[int, int]]] = {
+    "p100a": {
+        # ResNet-50 b16 stem conv1.  Capture rows 7 -> 8 are Halo -> Conv2d with
+        # no Move between them; polaris emitted one whose LUT key reads
+        # (1, 1, 274204, 16) post-annotation.
+        (211600, 16),
+    },
+    "n150": {
+        # Same position, same geometry (the fold and conv1 are arch-independent
+        # at 115x115x16, batch 16 -> 211600).  The n150 capture records NO Move
+        # anywhere in the network at all — 108 rows, move class absent — so the
+        # stem's ttnn::move no-ops there too.  Evidence: the n150 compare-layers
+        # report for merged_ops_resnet50-02b76a9-wormhole_b0-n150_L-260803.csv,
+        # whose By-Layer-Type census is
+        #   conv2d 20 | matmul 34 | halo 22 | transpose 4 | pool2d 2 | add 16
+        #   reshard 5 | pad 2 | slice 1 | tilize 1 | untilizewithunpadding 1
+        (211600, 16),
     },
 }
 
@@ -443,7 +591,7 @@ def nlp_create_qkv_heads_sinf(iTList, oTList, op, **kwargs):
     return
 
 
-def _halo_ext_y(in_shape: list[int], attrs: dict) -> 'int | None':
+def _halo_ext_y(in_shape: list[int], attrs: dict, sku: 'str | None' = None) -> 'int | None':
     """Look up the halo-extended Y dimension from _HALO_EXT_Y.
 
     ``in_shape`` is the NCHW logical shape [N, C, H, W] of the Halo input.
@@ -451,7 +599,29 @@ def _halo_ext_y(in_shape: list[int], attrs: dict) -> 'int | None':
     ``_with_halo`` in ``ttsim/front/ttnn/op.py``.
 
     Returns the extended Y (= max_out_nsticks_per_core × num_cores_nhw) or
-    None when the combination is not in the table (e.g. MaxPool 2×2).
+    None when the combination is in neither table (e.g. MaxPool 2×2).
+
+    Lookup order is ``_HALO_EXT_Y`` first, then this device's block of
+    ``_HALO_EXT_Y_OVERRIDES_BY_DEVICE``.  Base-first is deliberate and is NOT
+    the precedence the name "overrides" implies: that table was added for the
+    back-end LUT-key pass, where it genuinely overrides, and two of its p100a
+    rows disagree with the base table.  Reading it first here would silently
+    move those two vgg_unet positions.  Consulting it second is purely
+    additive -- it can only turn a None into a value.
+
+    Why it is consulted at all: the base table carries no ResNet-50 row (13 of
+    p100a's 15 and all 13 of n150's live only in the per-device block), so
+    without this fallback every ResNet-50 halo took the passthrough branch in
+    ``halo_sinf`` and was costed at its logical size.  That understates the
+    analytical projection by ~6% on the LUT_OFF path while leaving LUT_ON
+    correlation untouched, because ``y_pad_logical`` from the back-end pass
+    overwrites Y in the key either way -- i.e. the error is invisible exactly
+    where this port is measured.
+
+    This is a narrowing of the gap, not a fix for it.  A SKU outside the
+    per-device table still gets None here AND no back-end annotation, so its
+    halos miss; closing that needs the derivation from
+    ``sliding_window::get_num_elems_per_core`` that retires both tables.
     """
     if len(in_shape) < 4:
         return None
@@ -469,7 +639,13 @@ def _halo_ext_y(in_shape: list[int], attrs: dict) -> 'int | None':
     pH = int(pad[0]) if hasattr(pad, '__getitem__') else int(pad)
     pW = int(pad[1]) if hasattr(pad, '__getitem__') else int(pad)
 
-    return _HALO_EXT_Y.get((nhw, C, kH, kW, pH, pW, is_tp))
+    key = (nhw, C, kH, kW, pH, pW, is_tp)
+    ext_y = _HALO_EXT_Y.get(key)
+    if ext_y is not None:
+        return ext_y
+    if sku is None:
+        return None
+    return _HALO_EXT_Y_OVERRIDES_BY_DEVICE.get(sku, {}).get(key)
 
 
 def halo_sinf(iTList, oTList, op, **kwargs):
@@ -498,7 +674,16 @@ def halo_sinf(iTList, oTList, op, **kwargs):
     elem_size = op.attrs.get('element_size', 2)
     elems = _nelems(in_shape)  # logical NCHW element count (inElems)
 
-    ext_y = _halo_ext_y(in_shape, attrs)
+    # Resolved the same way bidir_bcast reaches a device (ttsim/ops/desc/helpers.py:488):
+    # only the ttnn shim attaches one (ttsim/front/ttnn/tensor.py:207), so an ONNX or
+    # functional graph yields None and keeps the base-table-only behaviour.
+    #
+    # capture_sku, not the back-end device name: the back-end pass keys on
+    # ``Device.name`` from the arch spec (ttsim/back/device.py:728) and the two
+    # strings coincide only by naming convention.  capture_sku is the one that
+    # states which card a table row was measured on.
+    _sku = getattr(getattr(X, 'device', None), 'capture_sku', None)
+    ext_y = _halo_ext_y(in_shape, attrs, _sku)
     if ext_y is not None:
         # Halo extracts beyond the logical NCHW input — the output buffer
         # carries the halo-extended physical layout [1, 1, ext_y, C].

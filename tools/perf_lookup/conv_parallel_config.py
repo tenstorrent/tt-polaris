@@ -4,7 +4,7 @@
 """TT-Polaris-side mimic of tt-metal's conv2d parallel-config picker.
 
 Used by the conv-input channel-padding annotation pass (see
-``doc/TTNN_SHIM_ARCHITECTURE.md`` §17). Given a conv's input shape and the
+``ttsim/back/device.py::Device._annotate_conv_x_pad_logical``). Given a conv's input shape and the
 device's logical compute grid, returns the same ``(num_cores_nhw, num_cores_c,
 padded_channels)`` that ``determine_parallel_config`` in
 ``tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp`` would pick.
@@ -36,7 +36,8 @@ def _round_up(a: int, b: int) -> int:
 
 
 def find_closest_largest_divisor_with_num_padding(num: int, start_divisor: int) -> int:
-    """Port of ``find_closest_largest_divisor_with_num_padding`` (conv2d_utils.cpp:55).
+    """Port of ``find_closest_largest_divisor_with_num_padding``
+    (``tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp:55``).
 
     Walks divisors downward from ``start_divisor`` until the padding overhead
     becomes less than one shard's worth. Returns the picked divisor (which
@@ -56,7 +57,9 @@ def find_closest_largest_divisor_with_num_padding(num: int, start_divisor: int) 
 def find_closest_largest_divisor_with_num_padding_and_mult(
     num: int, start_divisor: int, mult: int
 ) -> int:
-    """Port of ``find_closest_largest_divisor_with_num_padding_and_mult`` (conv2d_utils.cpp:65)."""
+    """Port of ``find_closest_largest_divisor_with_num_padding_and_mult``
+    (``tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp:65``).
+    """
     if start_divisor <= 0:
         raise ValueError(f"start_divisor must be positive, got {start_divisor}")
     if mult <= 0:
@@ -83,7 +86,8 @@ def determine_block_sharded_channel_padding(
     """Return ``(num_cores_nhw, num_cores_c, padded_input_channels)`` for BLOCK_SHARDED conv2d.
 
     Mirrors the BLOCK_SHARDED branch of ``determine_parallel_config`` in
-    ``conv2d_utils.cpp:188-204``. Only the *padding* values are returned (callers
+    ``tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp:188-204``. Only the *padding* values are returned
+    (callers
     don't need the full ``ParallelConfig`` struct yet).
 
     Args:

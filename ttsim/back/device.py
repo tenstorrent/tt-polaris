@@ -519,15 +519,13 @@ class Device:
         carries the same padded x — without this, the upstream Move's LUT key uses
         unpadded channels and analytical-fallbacks (over-estimating duration).
 
-        See doc/TTNN_SHIM_ARCHITECTURE.md §17.
+        Consumed by ``tools/perf_lookup/lookup_operator_perf.py`` when it builds the
+        LUT key: a tagged tensor contributes its padded X instead of its logical one.
         """
         grid = getattr(self.simconfig_obj, "compute_grid_size", None)
         if grid is None or len(grid) != 2:
             return  # arch doesn't declare a grid — leave tensors alone (no-op fallback)
 
-        from tools.perf_lookup.conv_parallel_config import (
-            determine_block_sharded_channel_padding,
-        )
         from ttsim.front.ttnn.buffer import TensorMemoryLayout
 
         # Backward-propagation traverses Move-class passthrough ops only.  Halo is excluded
@@ -567,6 +565,52 @@ class Device:
                 cur_name = u_inList[0]
             return count
 
+        # Halo is walked here but NOT in _propagate_backward: this only asks a
+        # question about provenance, it tags nothing, so the reason Halo is
+        # excluded above does not apply.
+        reshard_chain_ops = passthrough_ops_backward | {"Halo", "Tilize", "Untilize"}
+
+        def _reshard_feeds(start_tensor_name: str) -> bool:
+            """Did the front end materialise a Reshard on the way into this conv?
+
+            tt-metal takes the input's parallel config as-is and recomputes it only
+            when a reshard fires (tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp:750-751)::
+
+                ParallelConfig parallel_config = input_tensor_parallel_config;
+                if (conv_config.reshard_if_not_optimal || needs_shard_or_reshard) { ... }
+
+            A Reshard in the chain means that recompute already happened and the
+            shard spec on the conv's input IS the recomputed one, so reading the
+            spec is exact.  With no Reshard the spec is whatever produced the
+            tensor upstream — the PRE-reshard config — and reading it silently
+            reports the wrong capacity for any conv that hardware does reshard.
+            That is the vgg_unet p100a case: op[59]'s chain is
+            Move <- Halo <- ITS <- STI <- Concat, its spec gives 8 cores x 128 =
+            1024, and the capture (bh_p100a_lut_v6, y=1632) records 1056 — 11
+            cores x 96, the resharded config.  So fall back to recomputing.
+            """
+            cur_name = start_tensor_name
+            for _ in range(32):  # cycle guard; real chains are 1-5 deep
+                cur_t = wlgraph._tensors.get(cur_name)
+                if cur_t is None:
+                    return False
+                producers = getattr(cur_t, "op_out", None) or []
+                if len(producers) != 1:
+                    return False
+                upstream_op = wlgraph.get_op(producers[0])
+                if upstream_op is None:
+                    return False
+                optype = getattr(upstream_op, "optype", "")
+                if optype == "Reshard":
+                    return True
+                if optype not in reshard_chain_ops:
+                    return False
+                u_inList = getattr(upstream_op, "inList", None) or []
+                if not u_inList:
+                    return False
+                cur_name = u_inList[0]
+            return False
+
         grid_xy = (int(grid[0]), int(grid[1]))
         tagged_convs = 0
         tagged_propagations = 0
@@ -594,19 +638,69 @@ class Device:
                 if in_shape is None or len(in_shape) == 0:
                     continue
                 in_channels = int(in_shape[1])  # NCHW: index 1 is channels
-            out_hw = getattr(out_t, "hw_shape", None)
-            if out_hw is None or len(out_hw) < 3:
-                continue  # need output N*H*W; skip rather than guess
-            out_nhw = int(out_hw[2])
-            try:
-                _, _, padded_channels = determine_block_sharded_channel_padding(
-                    input_channels=in_channels,
-                    output_nhw=out_nhw,
-                    compute_grid_size=grid_xy,
+            # Read the padded channel capacity off the shard spec the conv was
+            # ACTUALLY handed, rather than recomputing what a fresh parallel config
+            # would have chosen and then guessing whether a reshard intervened.
+            #
+            # tt-metal recomputes the parallel config — and so applies this channel
+            # padding — only when a reshard fires
+            # (tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp:750-751)::
+            #
+            #     ParallelConfig parallel_config = input_tensor_parallel_config;
+            #     if (conv_config.reshard_if_not_optimal || needs_shard_or_reshard) { ... }
+            #
+            # An earlier version evaluated the right-hand predicate here and dropped
+            # the reshard_if_not_optimal half.  Both halves were unusable at this
+            # point: by the time this back-end pass runs, ``in_t`` is whatever the
+            # front end left on the conv's input, so if _maybe_emit_conv_input_reshard
+            # inserted a Reshard then ``mc`` is that Reshard's OUTPUT — already well
+            # formed.  needs_shard_or_reshard can then only answer "no", and a forced
+            # BLOCK reshard would skip its own padding.
+            #
+            # The spec dissolves the question.  create_sharded_memory_config_from_
+            # parallel_config stores (nhw_shard, channel_shard), so the capacity the
+            # conv sees is num_cores_channels * channel_shard — the outcome, not the
+            # intent.  Inherited pre-layer4 BLOCK on 8 channel cores gives
+            # 8 * 128 = 1024, matching the capture; a forced reshard onto 11 cores
+            # gives 11 * 96 = 1056.  Both correct, with no predicate.
+            spec = getattr(mc, "shard_spec", None)
+            spec_shape = getattr(spec, "shape", None) if spec is not None else None
+            # Narrowed inline rather than through a ``use_spec`` bool: the type
+            # checker cannot carry "this flag is True" back to "spec is not
+            # None", so the reads below would be Any | None.
+            if (
+                spec is not None
+                and spec_shape is not None
+                and len(spec_shape) >= 2
+                and _reshard_feeds(inList[0])
+            ):
+                try:
+                    from ttsim.front.ttnn.conv_sharding import get_num_cores_channels
+                    num_cores_c = get_num_cores_channels(
+                        spec.grid, mc.memory_layout, spec.orientation,
+                    )
+                    padded_channels = int(num_cores_c) * int(spec_shape[1])
+                except Exception as e:  # pragma: no cover - keep the pass best-effort
+                    logger.debug("channel capacity unavailable ({}); skipping", e)
+                    continue
+            else:
+                # No Reshard upstream: do tt-metal's recompute ourselves, from the
+                # compute grid.  This is the pre-review path, unchanged.
+                from tools.perf_lookup.conv_parallel_config import (
+                    determine_block_sharded_channel_padding,
                 )
-            except ValueError:
-                continue
-            if padded_channels != in_channels:
+                out_hw = getattr(out_t, "hw_shape", None)
+                if out_hw is None or len(out_hw) < 3:
+                    continue  # need output N*H*W; skip rather than guess
+                try:
+                    _, _, padded_channels = determine_block_sharded_channel_padding(
+                        input_channels=in_channels,
+                        output_nhw=int(out_hw[2]),
+                        compute_grid_size=grid_xy,
+                    )
+                except ValueError:
+                    continue
+            if padded_channels > in_channels:
                 in_t.x_pad_logical = padded_channels
                 tagged_convs += 1
                 tagged_propagations += _propagate_backward(inList[0], padded_channels)
@@ -629,7 +723,7 @@ class Device:
         the arch-specific values; when an entry exists for the current device, this pass
         writes ``y_pad_logical`` onto the halo output tensor AND propagates it forward through
         passthrough ops (Move, ITS, STI, Reshard) to the downstream conv input.  See
-        doc/TTNN_SHIM_ARCHITECTURE.md §17 (D.2b).
+        the sibling of ``_annotate_conv_x_pad_logical`` above, for the Y axis.
         """
         device_name = getattr(self, "name", None)
         if not device_name:

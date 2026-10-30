@@ -164,13 +164,15 @@ class SimTensor:
         # x_pad_logical: padded channel count for LUT key construction when this tensor feeds
         # a BLOCK_SHARDED conv2d/conv_transpose2d.  Set by the Device.execute_graph annotation
         # pass (post-shim, post-arch-load) via determine_block_sharded_channel_padding.
-        # See doc/TTNN_SHIM_ARCHITECTURE.md §17. None when the tensor doesn't participate in
+        # Written by ttsim/back/device.py's annotation pass; None when the tensor
+        # doesn't participate in
         # a BLOCK_SHARDED conv input chain; LUT key builders then fall back to shape's X dim.
         self.x_pad_logical: int | None = None
         # y_pad_logical: halo-extended Y stick count override for LUT key construction.
         # Set by the Device.execute_graph annotation pass when an arch-specific halo
         # extension differs from the base _HALO_EXT_Y table (e.g. BH p100a's d2.conv1
-        # picks num_cores_nhw=10 → y=5620 vs WH's y=5280).  See doc/TTNN_SHIM_ARCHITECTURE.md §17.
+        # picks num_cores_nhw=10 → y=5620 vs WH's y=5280).  Written by
+        # ttsim/back/device.py::Device._annotate_halo_y_pad_logical.
         self.y_pad_logical: int | None = None
         SimTensor.set_shape(self, cfg.get('shape'))   # Other classes that subclass might override set_shape
 

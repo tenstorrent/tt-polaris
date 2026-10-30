@@ -17,8 +17,12 @@ cfg: {...} ────────► gcfg ────────────
 
 ### Code Locations
 
-- **Dispatch Logic**: `polaris.py:111-126` (TTNN workload dispatch)
-- **Reference Implementation**: `workloads/ttnn/resnet50/ttnn_functional_resnet50.py:1371-1402`
+- **Dispatch Logic**: `polaris.py:165-180` (the `wlg == 'TTNN'` branch of `get_wlgraph`)
+- **Reference Implementation**: `workloads/ttnn/resnet50/bh/test_resnet50_device_perf_bh.py:210-214`
+  — the entry point named by `config/all_workloads.yaml:560`.  The model it drives lives in
+  `workloads/ttnn/resnet50/common/ttnn_functional_resnet50.py`; the entry point is deliberately
+  thin, because ResNet-50 is dual-mode and the same model module runs under the shim and under
+  real `ttnn`.
 - **Configuration Examples**: `config/all_workloads.yaml`
 - **User Guide**: `doc/user_guide.md` (see "TTNN Workload Development Guide" section)
 
@@ -72,14 +76,15 @@ def run_<model_name>(wlname: str, device: TTNNDevice, cfg: dict):
    ```yaml
    workloads:
      - api: TTNN
-       name: "Resnet50"
-       basedir: workloads/ttnn/resnet50
-       module: run_resnet50@ttnn_functional_resnet50.py
+       name: resnet50_bh_device_perf
+       basedir: workloads/ttnn/resnet50/bh
+       module : run_resnet50_e2e_entry@test_resnet50_device_perf_bh.py
        instances:
-         default:
-           batch_size: 8
-           num_channels: 3
+         resnet50_bh_b16_device_perf: { bs: 16, model_name: resnet50-bh-b16-device-perf }
    ```
+
+   `basedir` is per-arch because the two SKUs differ in arch string, capture SKU and compute
+   grid; the shared model and preprocessing sit in `workloads/ttnn/resnet50/common/`.
 
 2. **TT-Polaris Dispatch** (`polaris.py:111-126`):
    ```python
@@ -102,33 +107,31 @@ def run_<model_name>(wlname: str, device: TTNNDevice, cfg: dict):
 
 3. **Workload Implementation**:
    ```python
-   def run_resnet50(wlname: str, device: TTNNDevice, cfg: dict):
-       # Extract configuration with defaults
-       batch_size = cfg.get('batch_size', 8)
-       num_channels = cfg.get('num_channels', 3)
-       
-       # Create tensors using provided device
-       input_tensor = ttnn.Tensor(
-           shape=[batch_size, num_channels, 224, 224],
-           dtype=ttnn.bfloat16,
-           device=device  # Use provided device, don't create new one
-       )
-       
-       # Implement model
-       output = model(input_tensor, device, ...)
-       
-       return output
+   def run_resnet50_e2e_entry(wlname: str, device, cfg: dict):
+       """all_workloads.yaml entry point for resnet50_bh_device_perf."""
+       # Extract configuration with defaults — the key is whatever the YAML
+       # instance sets; this workload's instances use `bs`.
+       batch_size = cfg.get('bs', DEFAULT_BATCH_SIZE)
+
+       # Build and run on the provided device; don't open your own.
+       return run_resnet50_e2e(device, batch_size=batch_size)
    ```
+
+   The real work happens one level down in `run_resnet50_e2e`, which constructs the test infra
+   (`workloads/ttnn/resnet50/bh/resnet50_test_infra_polaris_bh.py`) and calls its `run()`.  That
+   infra is where the device's arch, capture SKU and compute grid are declared, and where the
+   workload's shim-gate opt-ins are applied — see `doc/shim_gates.md`.
 
 ## Documentation Updates Made
 
 ### 1. Function Docstring
-- **File**: `workloads/ttnn/resnet50/ttnn_functional_resnet50.py:1372-1392`
+- **File**: `workloads/ttnn/resnet50/bh/test_resnet50_device_perf_bh.py:210-214`
+  (Wormhole counterpart: `workloads/ttnn/resnet50/wh/test_resnet50_device_perf_wh.py:206-210`)
 - **Content**: Added comprehensive docstring following Option 2 format
 - **Details**: Documents parameter contract, polaris.py invocation, and usage
 
 ### 2. Dispatch Comments
-- **File**: `polaris.py:116-119`
+- **File**: `polaris.py:170-174`
 - **Content**: Added inline comments explaining parameter flow
 - **Details**: Clarifies wln→wlname mapping and parameter purposes
 
@@ -194,8 +197,10 @@ def run_<model_name>(wlname: str, device: TTNNDevice, cfg: dict):
 ## References
 
 - **Main User Guide**: `doc/user_guide.md` - Complete TTNN workload guide
-- **Reference Implementation**: `workloads/ttnn/resnet50/ttnn_functional_resnet50.py`
-- **TT-Polaris Dispatch**: `polaris.py:78-139` - `get_wlgraph()` function
+- **Reference Implementation**: `workloads/ttnn/resnet50/` - entry points in `bh/` and `wh/`,
+  shared model in `workloads/ttnn/resnet50/common/ttnn_functional_resnet50.py`
+- **Shim Gates**: `doc/shim_gates.md` - the opt-in flags the ResNet-50 infras enable
+- **TT-Polaris Dispatch**: `polaris.py:132-235` - `get_wlgraph()` function
 - **TTNN API**: `ttsim/front/ttnn/` - TTNN tensor and operation implementations
 - **Configuration Schema**: `tools/workloads.py` - Pydantic models for workload configs
 
