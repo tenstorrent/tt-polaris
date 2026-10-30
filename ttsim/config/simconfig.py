@@ -496,8 +496,9 @@ class PackageInstanceModel(BaseModel, extra='forbid'):
     ignore_lut: bool = False
     #: Logical compute grid [x, y] = (num_cols, num_rows) — mirrors tt-metal's compute_with_storage_grid_range.
     #: Used by the conv2d parallel-config helper to compute BLOCK_SHARDED channel padding (see
-    #: doc/TTNN_SHIM_ARCHITECTURE.md §17). Optional — only required for arches that participate in
-    #: the LUT-key channel-padding pass; otherwise TT-Polaris falls back to unpadded channels.
+    #: ttsim/back/device.py::Device._annotate_conv_x_pad_logical).  Optional — only
+    #: required for arches that participate in the LUT-key channel-padding pass;
+    #: otherwise TT-Polaris falls back to unpadded channels.
     compute_grid_size: Optional[List[int]] = None
 
     def get_ipgroup(self, iptype: str) -> IPGroupModel:

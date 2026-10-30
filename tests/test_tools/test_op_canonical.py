@@ -260,3 +260,59 @@ def test_resolve_conv_subtype_string_attrs():
     sliding_window_true = 'SlidingWindowConfig { kernel_size: [2, 2], is_transpose = true }'
     assert _resolve_conv_subtype(sliding_window_false) == 'conv2d'
     assert _resolve_conv_subtype(sliding_window_true) == 'convtranspose'
+
+
+# ── pooling: averagepool / maxpool -> pool2d ─────────────────────────────
+
+@pytest.mark.unit
+@pytest.mark.parametrize('spelling', ['averagepool', 'AveragePool', 'maxpool', 'MaxPool'])
+def test_pooling_canonicalises_to_pool2d(spelling) -> None:
+    """tt-metal has ONE Pool2D device op, parameterised by pool type.
+
+    Polaris models max- and average-pooling ONNX-style as two SimOps, so both
+    must canonicalise to the hardware name or neither can match a profiler row or
+    a LUT entry. ``maxpool`` was mapped from the start; ``averagepool`` was not,
+    which is why ResNet-50's global average pool keyed as ('averagepool', ...)
+    and missed, and why compare_layers showed pool2d 1 against hardware's 2.
+
+    Only spellings that actually occur are listed; see the ``avgpool`` test below.
+    """
+    assert normalize_polaris_optype(spelling) == 'pool2d'
+
+
+@pytest.mark.unit
+def test_avgpool_is_deliberately_not_mapped() -> None:
+    """``avgpool`` is NOT canonicalised, and that is the intended state.
+
+    An ``"avgpool": "pool2d"`` entry was added alongside ``averagepool`` as a
+    defensive alias, then removed: no Polaris front end emits that spelling
+    (``ttsim/ops/desc`` registers ``AveragePool``, ONNX uses ``AveragePool`` /
+    ``GlobalAveragePool``) and no capture contains it -- the sibling test below
+    asserts no LUT carries an ``avgpool`` key either.  A canonicalisation entry
+    with no evidence behind it is a silent rename waiting to collide with a real
+    future op code, which is the same argument this change makes against
+    speculative branches elsewhere.
+
+    Pinned as a negative so the alias is not re-added without evidence.
+    """
+    assert normalize_polaris_optype('avgpool') == 'avgpool'
+
+
+@pytest.mark.unit
+def test_averagepool_rename_can_only_turn_misses_into_hits() -> None:
+    """No LUT in __ext/hlm-lut carries an 'averagepool' key, so nothing was
+    relying on the old spelling. Asserted rather than assumed, because the
+    opposite would mean this rename broke somebody else's lookups."""
+    import glob
+
+    import yaml
+
+    luts = glob.glob('__ext/hlm-lut/*.yaml')
+    if not luts:
+        pytest.skip('no LUTs present (LFC cache)')
+    for path in luts:
+        with open(path) as f:
+            doc = yaml.safe_load(f)
+        codes = {e['key'].get('op_code') for e in (doc.get('entries') or [])}
+        assert 'averagepool' not in codes, f'{path} has an averagepool key'
+        assert 'avgpool' not in codes, f'{path} has an avgpool key'
