@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 from enum import Enum, auto
-from typing import Tuple
+from typing import Optional, Sequence
 
 class TensorMemoryLayout(Enum):
     INTERLEAVED    = auto()
@@ -50,17 +50,29 @@ class ShardSpec:
     The grid can be any grid-like object (CoreGrid, CoreRangeSet, tuple, etc.)
     and is stored as-is for later extraction by call sites.
     """
-    def __init__(self, grid, shape: Tuple[int, int],
+    def __init__(self, grid, shape: Optional[Sequence[int]],
                  orientation: ShardOrientation = ShardOrientation.ROW_MAJOR):
         """Initialize ShardSpec.
 
         Args:
             grid: Core grid specification (CoreGrid, CoreRangeSet, or grid-like object)
-            shape: (height, width) shard dimensions
+            shape: (height, width) shard dimensions, as a tuple or list, or
+                None when the shard shape is unknown.  Both spellings and the
+                None case are live -- see the normalisation note below.
             orientation: ROW_MAJOR or COL_MAJOR core traversal order
         """
         self.grid = grid
-        self.shape = shape
+        # Normalised to a tuple so equality does not depend on how the caller
+        # spelled it.  ``__eq__`` below compares ``self.shape == other.shape``,
+        # and ``(448, 64) != [448, 64]`` in Python -- so a tuple-built spec
+        # could never equal a list-built one describing the same shard.  Both
+        # spellings are live: the conv_sharding / memory builders use tuples,
+        # while ViT constructs ``ShardSpec(grid, [N * H * W // n_cores, C], ...)``
+        # at six call sites.  That is a second route to the false inequality
+        # ``CoreRangeSet.__eq__`` was added to close -- MemoryConfig.__eq__
+        # compares shard_spec, so two byte-identical sharded configs would
+        # compare unequal and fire a spurious Reshard.
+        self.shape = tuple(shape) if shape is not None else None
         self.orientation = orientation
 
     def __repr__(self):

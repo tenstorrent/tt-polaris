@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Any
+
 from ttsim.ops.tensor import SimTensor
+from ttsim.utils.shim_gates import bcast_hw_shape_propagation_enabled
 
 import math
 from loguru import logger
@@ -411,7 +414,7 @@ def unary_fwd(iTList, oTList, op, **kwargs):
         #Hardmax         : Hardmax(x, axis) = 1 if x == first_max_val_along_xis else 0; TODO: account for axis
         optype2instr[xopname] = {'cmp': X.nelems(), 'mov': X.nelems()}
     optype2instr['LeakyRelu']['add'] = X.nelems()
-    
+
     # Relu6: min(max(0, x), 6) — two comparisons and a move
     optype2instr["Relu6"] = {"cmp": 2 * X.nelems(), "mov": X.nelems()}
 
@@ -434,11 +437,116 @@ def unary_fwd(iTList, oTList, op, **kwargs):
     return
 
 
+def _propagate_bcast_hw_shape(X0: Any, X1: Any, Y: Any) -> None:
+    """Carry the NHWC-flattened ``hw_shape`` across an elementwise binary.
+
+    Every other data-movement sinf propagates ``hw_shape`` — Move, Reshard,
+    InterleavedToSharded, ShardedToInterleaved all do (``ttsim/ops/desc/ttsim_layout.py``).
+    ``bidir_bcast`` did not, so ResNet-50's residual ``Add`` dropped the
+    flattened form and every op downstream of it keyed on logical NCHW
+    ``(16, 1024, 14, 14)`` where the LUT records ``(1, 1, 3136, 1024)`` — one
+    missing line cascading into roughly 27 mis-keyed rows.
+
+    Takes ``X0``'s view unconditionally, guarded only on the logical shape being
+    unchanged, which is the same rule the parallel WH implementation uses for
+    every shape-preserving op.  An earlier version also handled two further
+    cases — the operands carrying *different* views (decline), and one carrying
+    it while the other is a true broadcast (take the one that has it).  Neither
+    has ever fired: instrumenting every workload with the gate on shows the only
+    case that occurs is both operands carrying the SAME view, 16 times, from
+    ResNet-50's residual adds.  Speculative branches that no capture exercises
+    are worse than no branches, so they are gone; the shape guard below is what
+    actually keeps a reshaping broadcast from inheriting a stale view.
+
+    Gated per-device (``Device.propagate_bcast_hw_shape``) rather than applied
+    unconditionally: it changes the LUT key of every elementwise binary in every
+    workload, and polaris builds all workload graphs in one process.  See
+    ``ttsim/utils/shim_gates.py::set_bcast_hw_shape_propagation``.
+
+    NOTE on where this lives.  ``bidir_bcast`` is registered under ``ai.onnx``
+    and is reached by all THREE front ends -- onnx, functional and ttnn -- so a
+    ttnn-only behaviour sits here only because ttnn's ``add`` reuses the shared
+    ``Add`` optype (``ttsim/front/ttnn/op.py:1012``).  The device check below is what
+    keeps the other two out; see FUTURE-RISK(onnx-device) there for when that
+    stops being true.
+
+    The structurally clean fix is a ttnn-domain binary optype in
+    ``ttsim/ops/desc/ttsim_layout.py`` under ``com.tenstorrent.ttnn``, which the onnx and
+    functional loaders have no registration for and so cannot reach.  It was
+    prototyped and backed out as too large for this change: the optype is
+    load-bearing in four places at once.  ``tools/profiling/op_canonical.py`` normalises it in
+    three tables and the new name has to normalise IDENTICALLY (``Sub`` maps to
+    ``sub``, not ``subtract`` -- easy to get wrong); the LUT keys ResNet-50's 16
+    residual adds under ``add``, including the ``add_output_as_input2``
+    fallback; ``ttsim/front/ttnn/op.py:176`` branches on ``optype in ["Add", "Sub", "Mul"]`` for
+    scalar operands; and ``_binary_compute_funcs`` below keys constant folding
+    off it.  The registry is also keyed by opname ALONE (``ttsim/ops/desc/registry.py:13``)
+    with layout ops registering LAST (``ttsim/ops/desc/__init__.py:32``), so the ttnn
+    binary cannot reuse the name ``Add`` -- it would overwrite the ONNX entry
+    rather than sit beside it.
+    """
+    dev = getattr(X0, 'device', None) or getattr(X1, 'device', None)
+    if dev is None:
+        # ONNX/functional exclusion.  ``bidir_bcast`` is registered under
+        # ``ai.onnx`` and serves all THREE front ends -- onnx, functional
+        # (ttsim/front/functional/op.py:981) and ttnn (ttsim/front/ttnn/op.py:1012 binds
+        # ``add`` to the shared ``Add`` optype) -- so a ttnn-only behaviour has
+        # to exclude the other two itself.
+        #
+        # "Has a device" is the discriminator because today only the ttnn shim
+        # attaches one: ``SimTensor`` has no ``device`` attribute, so an ONNX or
+        # functional graph resolves ``dev`` to None and returns here.  Returning
+        # BEFORE the gate is deliberate -- the gate alone is not an exclusion.
+        # ONNX conv/maxpool/matmul sinfs do set ``hw_shape``
+        # (ttsim/ops/desc/nn.py:276, 427, 587; ttsim/ops/desc/math.py:601), so
+        # there is something real to propagate, and
+        # ``TTSIM_PROPAGATE_BCAST_HW_SHAPE=1`` or a device-less
+        # ``set_bcast_hw_shape_propagation(True)`` would otherwise turn it on
+        # for every pure-ONNX model.
+        #
+        # The env var still reaches ttnn graphs: it seeds the module default,
+        # which a device-carrying tensor reads through the getattr fallback.
+        #
+        # FUTURE-RISK(onnx-device): this guard is INERT the moment ``SimTensor``
+        # gains a ``device`` attribute, or the ONNX loader starts attaching one.
+        # ``dev`` then becomes non-None for ONNX tensors, the gate resolves
+        # through the process-wide default again, and the exclusion is gone.
+        #
+        # The failure is SILENT -- no exception.  The symptom is that ONNX
+        # graphs re-key every elementwise binary onto the NHWC-flat view, so
+        # ops downstream of an Add look up a LUT key hardware never recorded:
+        # LUT misses that fall back to analytical estimates, and a
+        # compare-layers report whose shapes no longer match the profiler.
+        #
+        # Nothing currently FAILS when that happens -- the existing
+        # ``test_no_device_on_either_operand_is_not_an_error`` runs with the
+        # process-wide gate at its default False, so it passes with or without
+        # this guard.  If you are here because ONNX gained devices, the two
+        # durable fixes are: require an explicit per-device override here (drop
+        # the process-wide layer for this one gate), or give the ttnn shim its
+        # own binary optype under ``com.tenstorrent.ttnn`` -- see the NOTE in
+        # the docstring above for the four sites that second one touches.
+        return
+    if not bcast_hw_shape_propagation_enabled(dev):
+        return
+    if getattr(Y, 'hw_shape', None) is not None:
+        return
+    src = getattr(X0, 'hw_shape', None)
+    if src is None:
+        return
+    # Only when the op preserves the logical shape; a genuinely reshaping
+    # broadcast must not inherit X0's view.
+    if list(getattr(X0, 'shape', [])) != list(getattr(Y, 'shape', [])):
+        return
+    Y.hw_shape = list(src)
+
+
 def bidir_bcast(iTList, oTList, op, **kwargs):
     X0,X1, Y = iTList[0], iTList[1], oTList[0]
     assert X0.check_shape(), f"Input tensor-0 shape not defined: {X0}"
     assert X1.check_shape(), f"Input tensor-1 shape not defined: {X1}"
     Y.shape = bidirectional_broadcast_shape_inference(X0.shape, X1.shape)
+    _propagate_bcast_hw_shape(X0, X1, Y)
 
     # Compute actual data if inputs have data
     _binary_compute_funcs = {
