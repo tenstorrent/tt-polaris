@@ -535,7 +535,7 @@ class Device:
         # padding applies to the POST-halo path that feeds the conv.  Walking through Halo
         # would tag the pre-halo tensor with the post-halo padded x and miss the Halo LUT.
         passthrough_ops_backward = frozenset(
-            {"Move", "InterleavedToSharded", "ShardedToInterleaved", "Reshard"}
+            {"Move", "Copy", "InterleavedToSharded", "ShardedToInterleaved", "Reshard"}
         )
 
         def _propagate_backward(start_tensor_name: str, padded: int) -> int:
@@ -640,7 +640,7 @@ class Device:
         if not overrides:
             return
 
-        passthrough_ops = frozenset({"Move", "InterleavedToSharded", "ShardedToInterleaved", "Reshard"})
+        passthrough_ops = frozenset({"Move", "Copy", "InterleavedToSharded", "ShardedToInterleaved", "Reshard"})
         tagged_halos = 0
         tagged_propagations = 0
 

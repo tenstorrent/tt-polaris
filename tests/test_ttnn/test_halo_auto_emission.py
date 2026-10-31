@@ -574,3 +574,46 @@ def test_to_memory_config_interleaved_to_sharded_no_sti():
 
     seq = _op_sequence(device)
     assert len(seq) == 0, f"Expected no ops (interleaved→sharded not a reshard), got {[s[0] for s in seq]}"
+
+
+# ---------------------------------------------------------------------------
+# to_memory_config: interleaved→different-interleaved emits Copy (tt-metal prim::copy fallback)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_to_memory_config_interleaved_l1_to_dram_emits_one_copy():
+    device = _make_device()
+    x = _make_tensor("x", [1, 1, 32, 128256], device)
+    l1 = MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.L1)
+    dram = MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.DRAM)
+    x._memory_config = l1
+
+    out = ttnn.to_memory_config(x, dram)
+
+    seq = _op_sequence(device)
+    assert [s[0] for s in seq] == ["Copy"]
+    assert out is not x
+    assert out._memory_config == dram
+    assert x._memory_config == l1  # the input tensor is not relabelled
+    assert out.logical_shape().as_list() == x.logical_shape().as_list()
+
+
+@pytest.mark.unit
+def test_to_memory_config_same_interleaved_no_ops():
+    device = _make_device()
+    x = _make_tensor("x", [1, 1, 32, 64], device)
+    dram = MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.DRAM)
+    x._memory_config = dram
+
+    out = ttnn.to_memory_config(x, MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.DRAM))
+
+    assert _op_sequence(device) == []
+    assert out is x
+
+
+@pytest.mark.unit
+def test_copy_optype_matches_profiler_canonical():
+    # The LUT key must match between the shim op and the profiler's CopyDeviceOperation.
+    from tools.profiling.op_canonical import normalize_polaris_optype, normalize_profiler_opcode
+
+    assert normalize_polaris_optype("Copy") == normalize_profiler_opcode("CopyDeviceOperation")
