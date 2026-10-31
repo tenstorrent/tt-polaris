@@ -16,9 +16,27 @@ from loguru import logger
 from ttsim.ops.op import SimOp
 from ttsim.ops.tensor import Shape, require_shape_list
 
-from .buffer import BufferType, TensorMemoryLayout
+# Gate STATE lives in ttsim/utils/shim_gates.py, not here, so that bidir_bcast
+# in ttsim/ops/desc/helpers.py can read one without ttsim.ops importing
+# ttsim.front -- see that module's docstring for the cycle that back-edge
+# closed.  Only the accessors THIS module calls are imported; setters are
+# imported from shim_gates directly by whoever sets them (the workload infras
+# and the gate tests).
+from ttsim.utils.shim_gates import (
+    conv_input_reshard_enabled,
+    conv_math_fidelity_in_key_enabled,
+    halo_output_dtype_promotion_enabled,
+    memory_config_propagation_enabled,
+    move_on_reallocate_halo_output_enabled,
+    tilize_before_matmul_enabled,
+)
+
+from typing import Any, Optional, Sequence, Union
+
+from .buffer import BufferType, ShardOrientation, TensorMemoryLayout
 from .memory import MemoryConfig
 from .tensor import DataType, Layout, Tensor, generate_new_op_name, require_ttnn_tensor, zeros
+from .types import TILE_HEIGHT, TILE_WIDTH
 
 
 class MathFidelity(Enum):
@@ -208,7 +226,7 @@ def single_output_immediate_op(optype, /, preprocess=None):
         opinfo["outList"] = [C.name]
 
         opobj = SimOp(opinfo)
-        perf_stats = opobj.get_perf_counts(new_args, [C])
+        opobj.get_perf_counts(new_args, [C])
         opobj.update_tensor_counts(new_args, [C])
 
         _propagate_ttnn_dtype(tensor_args, [C])
@@ -265,8 +283,7 @@ def multiple_output_immediate_op(optype, /, preprocess=None):
         opinfo["outList"] = [C.name for C in out_tensors]
 
         opobj = SimOp(opinfo)
-        perf_stats = opobj.get_perf_counts(new_args, out_tensors)
-        # print(f"{optype}:: {perf_stats}")
+        opobj.get_perf_counts(new_args, out_tensors)
         opobj.update_tensor_counts(new_args, out_tensors)
 
         _propagate_ttnn_dtype(tensor_args, out_tensors)
@@ -418,6 +435,14 @@ def layer_norm_pp(args_list, kwargs_dict):
         return (input_tensor, weight_tensor), kwargs_dict
 
 
+# Single-slot stash for the math fidelity conv2d_pp saw, read by
+# _matmul_1x1_with_hw_fields immediately afterwards.  A module-level slot rather
+# than a return value because conv2d_pp's signature is fixed by
+# single_output_immediate_op's preprocess contract.  Safe because graph building
+# is single-threaded and the read happens in the same call.
+_CONV_PP_MATH_FIDELITY: dict = {'last': None}
+
+
 def conv2d_pp(args_list, kwargs_dict):
     input_tensor = require_ttnn_tensor(
         kwargs_dict["input_tensor"], "ttnn.conv2d input_tensor"
@@ -431,11 +456,43 @@ def conv2d_pp(args_list, kwargs_dict):
     strides = kwargs_dict.get("stride", (1, 1))
     padding_size = kwargs_dict["padding"][0]
     pads = [padding_size for i in range(4)]
+
+    # Rebuilding kwargs from scratch (below) is what discarded `compute_config`,
+    # and with it the math fidelity.  The consequence: every 1x1 conv lowered to
+    # a MatMul keyed math_fidelity='N/A' while the p100a capture recorded 'LoFi'
+    # — 33 of ResNet-50's 34 matmuls, six of them differing in that field alone.
+    # (`ttnn.linear` already carries it, which is why the fc matmul is the one
+    # that does not have this problem.)
+    #
+    # Gated per-device: `matmul` is the only op_code any LUT keys under a real
+    # fidelity, and the LUTs disagree with each other — bh_p100a_lut_v6 carries
+    # both 'LoFi' x14 (resnet50) and 'N/A' x9 (ViT/VGG).  Emitting the true value
+    # unconditionally would fix the first group and break the second.  The
+    # `math_fidelity -> N/A` lookup fallback added alongside this covers the
+    # second group; the gate keeps workloads that have not been re-verified on
+    # their current behaviour regardless.
+    # Stash the fidelity rather than writing it into the key here.  The capture's
+    # convention is per-op-code, not per-call: it records `matmul` under the real
+    # fidelity ('LoFi') and `conv2d` under 'N/A'.  conv2d_pp serves BOTH the Conv
+    # path and the 1x1-lowered MatMul path, so attaching it unconditionally put
+    # 'LoFi' on conv2d keys the LUT records as 'N/A' — adding a differing field
+    # to all 20 conv misses.  `_matmul_1x1_with_hw_fields` applies it to the
+    # matmul only; see _CONV_PP_MATH_FIDELITY.
+    _mf_name = None
+    _cfg = kwargs_dict.get("compute_config") or kwargs_dict.get("compute_kernel_config")
+    if _cfg is not None:
+        _mf = getattr(_cfg, "math_fidelity", None)
+        if _mf is None and isinstance(_cfg, MathFidelity):
+            _mf = _cfg
+        if _mf is not None:
+            _mf_name = _mf.name
+
     kwargs_dict = {
         "pads": pads,
         "kernel_shape": list(kwargs_dict["kernel_size"]),
         "strides": list(strides),
     }
+    _CONV_PP_MATH_FIDELITY['last'] = _mf_name
     return (input_tensor, weight_tensor, bias_tensor), kwargs_dict
 
 
@@ -541,6 +598,7 @@ def rms_norm(
 
 
 def max_pool2d_pp(args_list, kwargs_dict):
+    kwargs_dict_in = kwargs_dict
     input_tensor = require_ttnn_tensor(
         kwargs_dict["input_tensor"], "ttnn.max_pool2d input_tensor"
     )
@@ -562,6 +620,20 @@ def max_pool2d_pp(args_list, kwargs_dict):
         "dilations": list(dilation),
         "ceil_mode": ceil_mode,
     }
+    # This preprocessor rebuilds kwargs from scratch, which silently dropped
+    # ``dtype``.  In real ttnn it names the pool's OUTPUT dtype, and
+    # single_output_immediate_op already applies it — ResNet-50's avg_pool2d
+    # passes dtype=bfloat8_b (tt-metal
+    # tt-metal/models/demos/vision/classification/resnet50/ttnn_resnet/tt/ttnn_functional_resnet50.py:904) and the
+    # capture's
+    # Pool2D row 111 duly
+    # records out=BFLOAT8_B against a BFLOAT16 input, so dropping it left the
+    # whole fc tail keyed on BFLOAT16.  Same failure mode as conv2d_pp dropping
+    # compute_config.  Forwarded only when present, so pools that do not pass it
+    # are unaffected.
+    for _passthrough in ("dtype", "output_dtype"):
+        if _passthrough in kwargs_dict_in:
+            kwargs_dict[_passthrough] = kwargs_dict_in[_passthrough]
     return (input_tensor,), kwargs_dict
 
 
@@ -1060,10 +1132,15 @@ def pad_channels_nchw(input_tensor: 'Tensor', target_channels: int) -> 'Tensor':
     via the second Transpose's ``hw_shape``.  See ``permute_reshape_to_nhwc_flat``.
     """
     in_shape = list(input_tensor.shape)  # type: ignore[arg-type]
-    assert len(in_shape) == 4 and in_shape[1] < target_channels, (
-        f"pad_channels_nchw: NCHW input with C<target required; "
-        f"got shape={in_shape}, target={target_channels}"
-    )
+    # ValueError, not assert: ``python -O`` strips asserts at COMPILE time, so a
+    # stripped build has no check at all.  Public through the ttnn namespace
+    # (workloads/ttnn/vgg_unet/common/ttnn_vgg_unet.py:294), so this validates a
+    # CALLER's input.  Under ``-O`` the rank half would fall through to the unpack
+    # below, and the C<target half would silently produce a NEGATIVE pad_amount.
+    if not (len(in_shape) == 4 and in_shape[1] < target_channels):
+        raise ValueError(
+            f"pad_channels_nchw: NCHW input with C<target required; "
+            f"got shape={in_shape}, target={target_channels}")
     N, _, H, W = in_shape
     pad_amount = target_channels - in_shape[1]
     out_shape = [N, target_channels, H, W]
@@ -1205,20 +1282,192 @@ def permute_reshape_to_nhwc_flat(input_tensor: 'Tensor') -> 'Tensor':
     so TT-Polaris's conv shape inference continues to operate in NCHW.
     """
     in_shape = list(input_tensor.shape)  # type: ignore[arg-type]
-    assert len(in_shape) == 4, (
-        f"permute_reshape_to_nhwc_flat expects rank-4 NCHW input; got shape={in_shape}"
-    )
+    # ValueError, not assert: ``python -O`` strips asserts at COMPILE time.  Public
+    # through the ttnn namespace
+    # (workloads/ttnn/vgg_unet/common/ttnn_vgg_unet.py:295, the line after
+    # pad_channels_nchw), so this validates a CALLER's input.
+    if len(in_shape) != 4:
+        raise ValueError(
+            f"permute_reshape_to_nhwc_flat expects rank-4 NCHW input; got shape={in_shape}")
     N, C, H, W = in_shape
     t1 = _emit_entry_transpose(input_tensor, [1, H, C, W])
     t2 = _emit_entry_transpose(t1, [1, 1, N * H * W, C])
     return t2
 
 
+def _emit_dm_op_4d(input_tensor: 'Tensor', optype: str, out_shape: list,
+                   attrs: dict | None = None,
+                   hw_shape: list | None = None) -> 'Tensor':
+    """Emit an arity-1 data-movement SimOp with an explicit rank-4 output shape.
+
+    Used to build op sequences whose logical shapes must track a tt-metal C++
+    decomposition exactly (see ``fold_transpose_sharded_nchw``).  Arity-1 keeps
+    the LUT key a 9-tuple, matching how the profiler records Pad / Transpose /
+    Slice; ``perf_stats`` is populated here because these ops' ONNX-style shape
+    inference expects extra tensor inputs (a pads/starts tensor) that hardware
+    does not dispatch.
+
+    ``hw_shape`` is left ``None`` by default on purpose: ``_shape_wzyx`` in
+    ``tools/perf_lookup/lookup_operator_perf.py`` prefers ``hw_shape`` over the
+    logical shape when building a key, and the profiler records these ops under
+    their logical rank-4 shape.
+    """
+    in_shape = [int(d) for d in require_shape_list(
+        input_tensor.shape, 'data-movement op input shape must be set')]
+    out_shape = [int(d) for d in out_shape]
+    op_name = generate_new_op_name()
+    out_tensor = Tensor(
+        name=op_name + '.out',
+        shape=out_shape,
+        dtype=input_tensor.dtype,
+        layout=input_tensor.get_layout(),
+        op_out=[op_name],
+        device=input_tensor.device,
+    )
+    if hw_shape is not None:
+        out_tensor.hw_shape = list(hw_shape)
+    input_tensor.op_in.append(op_name)
+
+    opinfo = {
+        'name': op_name,
+        'optype': optype,
+        'inList': [input_tensor.name],
+        'outList': [out_tensor.name],
+        'attrs': dict(attrs or {}),
+    }
+    opobj = SimOp(opinfo)
+
+    elem_size = input_tensor.element_size()
+    n_in = 1
+    for d in in_shape:
+        n_in *= d
+    n_out = 1
+    for d in out_shape:
+        n_out *= d
+    opobj.perf_stats = {
+        'inElems': n_in,
+        'outElems': n_out,
+        'inBytes': n_in * elem_size,
+        'outBytes': n_out * elem_size,
+        'instrs': {'mov': n_out},
+    }
+    # Pre-populating perf_stats short-circuits SimOp.get_perf_counts(), which
+    # would otherwise snapshot shapes after inference; mirror that snapshot.
+    opobj._frozen_input_shapes = [list(in_shape)]
+    opobj._frozen_output_shapes = [list(out_shape)]
+    opobj.update_tensor_counts([input_tensor], [out_tensor])
+
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
+    _propagate_memory_config([input_tensor], [out_tensor])
+
+    input_tensor.device.add_op(opobj)  # type: ignore[union-attr]
+    return out_tensor
+
+def relabel_shape(tensor: 'Tensor', shape: list) -> 'Tensor':
+    """Rewrite a tensor's *logical* shape in place, emitting no SimOp.
+
+    Models ``ttnn::experimental::view`` — a free regrouping of elements that
+    hardware performs with no profiler row. Safe because the producing op's
+    ``perf_stats`` and frozen shapes are snapshotted at emission and its LUT key
+    is built from its *input*, so neither moves; only valid for a tensor
+    consumed exactly once, which is the case at every call site here.
+
+    Returns the same tensor object, for call-site readability.
+    """
+    shape = [int(d) for d in shape]
+    tensor.shape = Shape(shape)
+    return tensor
+
+def fold_transpose_sharded_nchw(input_tensor: 'Tensor', stride_h: int, stride_w: int,
+                                *, pad_h: int, pad_w: int, pad_c: int) -> 'Tensor':
+    """Height-sharded transpose-fold, mirroring tt-metal row-for-row.
+
+    Reproduces ``fold_with_transpose_sharded_`` in
+    ``ttnn/cpp/ttnn/operations/data_movement/fold/fold.cpp``, which for a
+    height-sharded input dispatches::
+
+        Pad -> Transpose(2,3) -> Pad -> Transpose(1,2) -> view
+             -> Transpose(2,3) -> view -> Transpose(1,2) -> Slice
+
+    The two ``ttnn::experimental::view`` calls are free, so hardware records
+    **seven** rows.  Verified against the resnet50 refruns: WH n150 b16 and
+    BH p100a b16/b32 all open with
+    Pad, Transpose, Pad, Transpose, Transpose, Transpose, Slice and the exact
+    intermediate shapes this function produces.
+
+    Distinct from ``fold`` above, which assumes an NHWC input with end-only
+    padding and cannot express this model's NCHW + symmetric-padding fold.
+    ``fold`` is left untouched so ViT's ``Fold`` SimOp is unaffected.
+
+    The returned tensor deliberately carries a **logical NCHW** shape
+    ``[N, C*sh*sw, H_out, W_out]`` with an NHWC-flat ``hw_shape``
+    ``[1, 1, N*H_out*W_out, C*sh*sw]``.  Hardware's fold output is NHWC, but
+    polaris's ``conv_sinf`` requires NCHW; the trailing Slice is the
+    convention-handoff point.  Both LUT keys stay correct because a key is
+    built from an op's *input* (the Slice's input is NHWC, matching hardware)
+    and the downstream Halo reads ``hw_shape``.
+    """
+    in_shape = [int(d) for d in require_shape_list(
+        input_tensor.shape, 'fold input shape must be set')]
+    # ValueError, not assert: ``python -O`` strips asserts at COMPILE time, and a
+    # stripped build would reach the rank-4 unpack below with no diagnostic.
+    if len(in_shape) != 4:
+        raise ValueError(f'fold expects rank-4 NCHW input, got {in_shape}')
+    N, C, H, W = in_shape
+
+    padded_c = C + pad_c
+    padded_h = H + 2 * pad_h
+    padded_w = W + 2 * pad_w
+    padded_h32 = ((padded_h + TILE_HEIGHT - 1) // TILE_HEIGHT) * TILE_HEIGHT
+    padded_w32 = ((padded_w + TILE_HEIGHT - 1) // TILE_HEIGHT) * TILE_HEIGHT
+    out_h = padded_h // stride_h
+    out_w = padded_w // stride_w
+    out_c = padded_c * stride_h * stride_w
+
+    # 1. pad input tensor: {n, padded_c, padded_h32, w}
+    x = _emit_dm_op_4d(input_tensor, 'Pad', [N, padded_c, padded_h32, W],
+                       attrs={'pads': [0, 0, pad_h, 0, 0, pad_c, 0, 0],
+                              'mode': 'constant', 'value': 0})
+    # 2. transpose(2, 3)
+    x = _emit_dm_op_4d(x, 'Transpose', [N, padded_c, W, padded_h32],
+                       attrs={'perm': [0, 1, 3, 2]})
+    # 3. pad tensor W dim: {n, padded_c, padded_h32, padded_w32}
+    x = _emit_dm_op_4d(x, 'Pad', [N, padded_c, padded_w32, padded_h32],
+                       attrs={'pads': [0, 0, pad_w, 0, 0, 0, 0, 0],
+                              'mode': 'constant', 'value': 0})
+    # 4. transpose(1, 2)
+    x = _emit_dm_op_4d(x, 'Transpose', [N, padded_w32, padded_c, padded_h32],
+                       attrs={'perm': [0, 2, 1, 3]})
+    # 5. view -> {n, w/stride_w, c*stride_w, h}  (ttnn::experimental::view; free,
+    #    no profiler row, but it IS what the next Transpose sees — the capture's
+    #    row-4 input is [n, padded_w32/sw, padded_c*sw, padded_h32], so relabel
+    #    rather than feeding the next op the pre-view shape).
+    x = relabel_shape(x, [N, padded_w32 // stride_w, padded_c * stride_w, padded_h32])
+    # 6. transpose(2, 3)
+    x = _emit_dm_op_4d(x, 'Transpose',
+                       [N, padded_w32 // stride_w, padded_h32, padded_c * stride_w],
+                       attrs={'perm': [0, 1, 3, 2]})
+    # 7. view -> {n, w, h/stride_h, c*stride_h}  (free, as above)
+    x = relabel_shape(x, [N, padded_w32 // stride_w, padded_h32 // stride_h, out_c])
+    # 8. transpose(1, 2)
+    x = _emit_dm_op_4d(x, 'Transpose',
+                       [N, padded_h32 // stride_h, padded_w32 // stride_w, out_c],
+                       attrs={'perm': [0, 2, 1, 3]})
+    # 9. slice to the logical fold output {n, target_h, target_w, target_c},
+    #    handing back an NCHW logical shape (see docstring).
+    x = _emit_dm_op_4d(x, 'Slice', [N, out_c, out_h, out_w],
+                       attrs={'output_shape': [N, out_h, out_w, out_c]},
+                       hw_shape=[1, 1, N * out_h * out_w, out_c])
+    return x
+
+
 def _with_halo(op_fn, is_transpose: bool = False, move_before_conv: bool = False):
     """Return a wrapper that auto-emits a Halo SimOp before the main op.
 
-    Halo is skipped for 1×1 kernels: hardware implements those as matmul
-    and never dispatches a halo extraction step.
+    Halo is skipped only when the conv is lowered to a matmul — kernel 1×1 AND
+    stride 1 AND padding 0 AND dilation 1 AND not width-sharded, mirroring
+    tt-metal's use_matmul_for_1x1_conv. A 1×1 conv at stride 2 stays a real
+    convolution on hardware and does get a halo.
 
     When the input has an interleaved memory config, an InterleavedToSharded
     SimOp is emitted first, matching the hardware dispatch where conv/pool
@@ -1244,7 +1493,36 @@ def _with_halo(op_fn, is_transpose: bool = False, move_before_conv: bool = False
             ks = (ks, ks)
         ks = tuple(ks)
         kwargs['kernel_size'] = ks
-        if ks != (1, 1):
+
+        # Halo is skipped only when the conv is actually LOWERED TO A MATMUL,
+        # which is a narrower condition than "the kernel is 1x1".  tt-metal's
+        # use_matmul_for_1x1_conv (tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp:519-531) requires
+        #   kernel 1x1 AND stride 1 AND padding 0 AND dilation 1 AND not width-sharded
+        # A 1x1 conv at stride 2 therefore stays a real convolution on hardware
+        # and DOES get a halo.  This gate previously tested the kernel alone, so
+        # ResNet-50's three 1x1 stride-2 downsample convs were emitted with no
+        # Halo — Halo 19 against the capture's 22 — while bh_p100a_lut_v6 carries
+        # halo entries keyed exactly kernel=1x1 stride=2x2 padding=0x0, i.e.
+        # silicon does dispatch them.
+        # Normalise scalars into kwargs BEFORE the branch, not inside it.  Call
+        # sites pass `stride=1` as readily as `stride=(1, 1)`, and downstream
+        # preprocessors do `list(stride)` / `padding[0]`.  While this lived
+        # inside the non-1x1 branch, a 1x1 conv with a scalar stride reached
+        # conv2d_pp un-normalised and died with "'int' object is not iterable".
+        _st = _norm_pair(kwargs.get('stride'), (1, 1))
+        _pd = _norm_pair(kwargs.get('padding'), (0, 0))
+        _dl = _norm_pair(kwargs.get('dilation'), (1, 1))
+        kwargs['stride'], kwargs['padding'], kwargs['dilation'] = _st, _pd, _dl
+        _cfg = kwargs.get('conv_config')
+        _lowered_to_matmul = _lowers_to_matmul(ks, _st, _pd, _dl, _cfg)
+
+        # Input-side Reshard (+Move), ahead of BOTH branches — hardware runs it
+        # before the halo for a real conv (capture 59->60->61->62) and before the
+        # tilize for a matmul-lowered one (11->12->13, 17->18->19->20).  Gated;
+        # see set_conv_input_reshard.
+        args, kwargs = _maybe_emit_conv_input_reshard(args, kwargs, is_transpose)
+
+        if not _lowered_to_matmul:
             # --- 3×3+ kernel: ITS → Halo → [Move] → Conv ---
             # Capture original input BEFORE ITS/Halo so Move guard uses the right tensor.
             original_input = kwargs.get('input_tensor') or (args[0] if args else None)
@@ -1270,23 +1548,15 @@ def _with_halo(op_fn, is_transpose: bool = False, move_before_conv: bool = False
                     else:
                         args = (its_out,) + args[1:]
 
-            # Normalise padding/stride scalars to 2-tuples — same shape robustness
-            # as the kernel_size normalisation above. The Halo LUT key builder
-            # treats these as indexable 2-D geometry, and ``halo_sinf`` reads them
-            # from ``op.attrs``; either would break on a scalar int. Write the
-            # normalised values back into kwargs so downstream preprocessors
-            # (conv2d_pp / conv_transpose2d_pp / max_pool2d_pp) — which do
-            # ``padding[0]`` / ``list(stride)`` — also see 2-tuples.
-            padding = kwargs.get('padding', (0, 0))
-            stride = kwargs.get('stride', (1, 1))
-            if isinstance(padding, int):
-                padding = (padding, padding)
-            if isinstance(stride, int):
-                stride = (stride, stride)
-            padding = tuple(padding)
-            stride = tuple(stride)
-            kwargs['padding'] = padding
-            kwargs['stride'] = stride
+            # ``stride`` / ``padding`` are already 2-tuples in kwargs: ``_norm_pair``
+            # normalises them ahead of the matmul-lowering branch (see the block
+            # above ``_lowered_to_matmul``), precisely so both branches and the
+            # downstream preprocessors see tuples. Re-normalising here was dead —
+            # ``isinstance(padding, int)`` cannot hold at this point and the
+            # write-back re-assigned an identical value. Read them instead; the
+            # locals feed ``halo_attrs`` below.
+            padding = kwargs['padding']
+            stride = kwargs['stride']
 
             # The tensor fed into Halo may be the post-ITS tensor (if input was
             # interleaved); capture it here so ``element_size`` in halo_attrs is
@@ -1308,6 +1578,19 @@ def _with_halo(op_fn, is_transpose: bool = False, move_before_conv: bool = False
                 # downstream conv both see ROW_MAJOR, matching the silicon capture.
                 'layout': Layout.ROW_MAJOR_LAYOUT,
             }
+            # HW HaloDeviceOperation also picks its OUTPUT dtype from a switch
+            # on the input dtype
+            # (tt-metal/ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp:66-70): FLOAT32
+            # and
+            # UINT16 pass through, everything else — BFLOAT8_B included — comes
+            # out BFLOAT16.  Without this the shim inherits BFLOAT8_B and every
+            # downstream conv2d keys on the wrong dtype (capture: all 20 conv2d
+            # rows report INPUT_0_DATATYPE=BFLOAT16).  Gated; see
+            # set_halo_output_dtype_promotion.
+            if halo_output_dtype_promotion_enabled(getattr(halo_input, 'device', None)):
+                halo_attrs['dtype'] = _halo_output_dtype(
+                    getattr(halo_input, '_ttnn_dtype', None)
+                )
             if 'input_tensor' in kwargs:
                 kwargs['input_tensor'] = halo(kwargs['input_tensor'], **halo_attrs)
             elif args:
@@ -1323,19 +1606,84 @@ def _with_halo(op_fn, is_transpose: bool = False, move_before_conv: bool = False
             #   2. Skip when the conv's input came from a fresh-buffer producer
             #      (MaxPool / ConvTranspose) — the kernel doesn't need to
             #      reallocate.
-            #   3. The original deallocate_activation + L1-sharded guard below.
+            #   3. The reallocate_halo_output + L1-sharded guard below.
+            #
+            # On (3): tt-metal gates this Move on ``reallocate_halo_output``, NOT on
+            # ``deallocate_activation``
+            # (``ttnn/cpp/ttnn/operations/conv/conv2d/conv2d.cpp:297-299``)::
+            #
+            #     input_tensor_post_tm = std::move(halo_output);
+            #     if (conv_config.reallocate_halo_output) {
+            #         input_tensor_post_tm = ttnn::move(input_tensor_post_tm);
+            #     }
+            #
+            # `deallocate_activation` drives the deallocate two lines above
+            # (tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d.cpp:291-293), which is a different thing and emits
+            # no op.
+            # Keying the Move off it made polaris emit a Move at every conv with
+            # deallocate_activation=True — 17 of them for ResNet-50 where the
+            # refrun shows 2 — an over-emission that is a shim artefact rather
+            # than a workload divergence.
             emit_move = kwargs.get('emit_move_before_conv', True)
+
+            # ttnn::move is a runtime allocator decision: tt-metal calls it, but
+            # tt-metal/ttnn/cpp/ttnn/operations/data_movement/move/move.cpp:69-76 dispatches nothing when the realloc
+            # lands at the
+            # same address.  Polaris has no allocator and would emit a Move at
+            # every call site, so the positions the capture shows no Move at are
+            # named in _HALO_MOVE_SUPPRESSED_BY_SKU.  See that table for why a
+            # flag rule cannot replace it and why every entry is provisional.
+            if emit_move:
+                # Key off ``halo_input`` -- the PRE-halo tensor captured above,
+                # before ``halo(...)`` rebound kwargs['input_tensor'] to the halo
+                # OUTPUT.  The table stores the halo INPUT's (nhw, channels); see
+                # its "Key: ... AS SEEN AT EMISSION TIME" block.
+                _hw = getattr(halo_input, 'hw_shape', None)
+                if _hw is not None and len(_hw) >= 4:
+                    from ttsim.ops.desc.ttsim_layout import _HALO_MOVE_SUPPRESSED_BY_SKU
+                    # Keyed by the declared SKU, never by arch.  These are
+                    # allocator outcomes measured on one card; an undeclared SKU
+                    # (``capture_sku`` None) must miss rather than inherit
+                    # another card's result -- config/tt_bh.yaml carries p150a
+                    # and p150b beside p100a, and nobody has captured those.
+                    _sku = getattr(getattr(halo_input, 'device', None), 'capture_sku', None)
+                    _empty: frozenset[tuple[int, int]] = frozenset()
+                    _suppressed = _HALO_MOVE_SUPPRESSED_BY_SKU.get(_sku or '', _empty)
+                    if (int(_hw[2]), int(_hw[3])) in _suppressed:
+                        emit_move = False
             if (
                 move_before_conv
                 and emit_move
                 and _producer_optype(original_input) not in _HW_FRESH_BUFFER_PRODUCERS
             ):
                 conv_cfg = kwargs.get('conv_config')
-                deallocate = kwargs.get(
-                    'deallocate_activation',
-                    getattr(conv_cfg, 'deallocate_activation', False),
-                )
-                if deallocate:
+                # Default True when unspecified, matching BOTH tt-metal
+                # (`tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_nanobind.cpp:267`,
+                # `nb::arg("reallocate_halo_output") = true`)
+                # and the shim's own Conv2dConfig
+                # (`ttsim/front/ttnn/config.py:18`).  A conv that
+                # passes no conv_config therefore still emits the Move, as hardware
+                # would; only an explicit False suppresses it — which is what
+                # ResNet-50 sets on its downsample and conv2 (tt-metal
+                # tt-metal/models/demos/vision/classification/resnet50/ttnn_resnet/tt/ttnn_functional_resnet50.py:126
+                # and :232).
+                # Which flag drives the Move is itself gated, because the two
+                # have OPPOSITE defaults -- reallocate_halo_output True,
+                # deallocate_activation False -- so the choice also decides what
+                # an unset conv_config means.  See
+                # set_move_on_reallocate_halo_output.
+                _mv_dev = getattr(original_input, 'device', None)
+                if move_on_reallocate_halo_output_enabled(_mv_dev):
+                    should_move = kwargs.get(
+                        'reallocate_halo_output',
+                        getattr(conv_cfg, 'reallocate_halo_output', True),
+                    )
+                else:
+                    should_move = kwargs.get(
+                        'deallocate_activation',
+                        getattr(conv_cfg, 'deallocate_activation', False),
+                    )
+                if should_move:
                     # Check the POST-ITS+Halo input tensor's memory config (not
                     # original_input). When the original input was L1_INTERLEAVED or
                     # DRAM_INTERLEAVED, auto-ITS converts it to L1-sharded, and
@@ -1430,7 +1778,59 @@ def _matmul_1x1_with_hw_fields(*args, **kwargs):
     weight_t = kwargs.get('weight_tensor')
     bias_t = kwargs.get('bias_tensor')
 
+    # Hardware matmuls consume TILE.  When the activation arrives ROW_MAJOR,
+    # silicon dispatches a Tilize first — the ResNet-50 p100a capture records
+    # exactly that at rows 12 and 19, converting the maxpool's ROW_MAJOR output
+    # ahead of the first two matmuls.  Emit it so the graph carries the op
+    # instead of only the docstring above claiming it happens.
+    #
+    # Opt-in and device-scoped (see set_tilize_before_matmul): it ADDS ops, and
+    # every workload graph is built in one process.
+    _act = kwargs.get('input_tensor') or (args[0] if args else None)
+    if _act is not None and tilize_before_matmul_enabled(getattr(_act, 'device', None)):
+        if _act.get_layout() == Layout.ROW_MAJOR_LAYOUT and getattr(_act, 'device', None) is not None:
+            from .ttnn_shim import tilize_op as _tilize_op
+            _src_mc = getattr(_act, '_memory_config', None)
+            _act = _tilize_op(_act, element_size=_act.element_size())
+            # Tilize is a layout change, not a re-shard: the tensor keeps its
+            # sharding.  tilize_op does not carry `_memory_config` across, which
+            # left the matmul downstream with None and broke the chain that
+            # decides whether a Reshard is needed.
+            if _src_mc is not None and getattr(_act, '_memory_config', None) is None:
+                _act._memory_config = _src_mc
+            if 'input_tensor' in kwargs:
+                kwargs['input_tensor'] = _act
+            else:
+                args = (_act,) + tuple(args[1:])
+
     result = _matmul_1x1_raw(*args, **kwargs)
+
+    # The capture keys `matmul` under the real fidelity and `conv2d` under
+    # 'N/A', so the value conv2d_pp stashed is applied HERE — on the
+    # matmul-lowered path only.  Gated per-device (set_conv_math_fidelity_in_key).
+    # Read and consume: conv2d_pp stashes the fidelity, this is the only
+    # reader, and leaving it set would leak into the next conv.
+    _mf_name, _CONV_PP_MATH_FIDELITY['last'] = _CONV_PP_MATH_FIDELITY.get('last'), None
+    # Two conditions, each doing separate work:
+    #
+    #   _dev is not None  -- Tensor.device is genuinely optional here
+    #       (``_emit_dm_op_4d`` carries a ``# type: ignore[union-attr]`` on
+    #       ``input_tensor.device.add_op(...)`` for the same reason), and there
+    #       is no op registry to annotate without one.  Load-bearing, not
+    #       defensive: the accessor resolves ON for a device-less result
+    #       whenever TTSIM_CONV_MATH_FIDELITY_IN_KEY=1, so omitting it makes
+    #       ``_dev.ops`` below an AttributeError at graph build.
+    #
+    #   the accessor, not a raw getattr -- the two still disagree for a device
+    #       carrying no per-device override, where the accessor falls through to
+    #       the module-level flag the env var controls and a raw getattr would
+    #       yield the literal False default.
+    _dev = getattr(result, 'device', None)
+    if _mf_name is not None and _dev is not None and conv_math_fidelity_in_key_enabled(_dev):
+        for _op_name in (getattr(result, 'op_out', None) or []):
+            _op = _dev.ops.get(_op_name)
+            if _op is not None and isinstance(getattr(_op, 'attrs', None), dict):
+                _op.attrs['math_fidelity'] = _mf_name
 
     if weight_t is not None and weight_t.shape is not None and len(weight_t.shape) == 4:
         C_out = int(weight_t.shape[0])
@@ -1444,9 +1844,562 @@ def _matmul_1x1_with_hw_fields(*args, **kwargs):
             bias_t.hw_shape = [1, 1, 1, C_out]
             bias_t._hw_dtype = DataType.BFLOAT8_B
             bias_t._hw_layout = Layout.TILE_LAYOUT
-    if input_t is not None:
+    # The activation the MATMUL consumes — not the one this function was called
+    # with.  When set_tilize_before_matmul is on, a Tilize was inserted above and
+    # kwargs['input_tensor'] was rebound to its output; tagging the ORIGINAL
+    # tensor here would relabel the Tilize's own input as TILE, and a tilize
+    # whose input_0 is already tilized is not a row the capture has (its two
+    # Tilize rows, 12 and 19, both record INPUT_0_LAYOUT=ROW_MAJOR).  Re-read it.
+    input_t = kwargs.get('input_tensor', input_t)
+    if input_t is not None and input_t.get_layout() != Layout.TILE_LAYOUT:
         input_t._hw_layout = Layout.TILE_LAYOUT
 
+    return result
+
+
+
+
+
+
+def _halo_output_dtype(input_dtype: Optional[DataType]) -> DataType:
+    """FLOAT32/UINT16 pass through, else BFLOAT16.
+
+    ``None`` is a legitimate input, not a guard: the sole caller passes
+    ``getattr(halo_input, '_ttnn_dtype', None)``, and a tensor carrying no
+    ttnn dtype falls through to BFLOAT16 like any other non-FLOAT32/UINT16
+    value.  Annotating it ``DataType`` would reject that call.
+
+    Canonical: ``tt-metal/ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp:66-70``.
+    """
+    if input_dtype in (DataType.FLOAT32, DataType.UINT16):
+        return input_dtype
+    return DataType.BFLOAT16
+
+
+
+
+def _norm_pair(v: Union[int, Sequence[int], None],
+               default: Sequence[int]) -> tuple[int, ...]:
+    """Normalise a scalar / sequence geometry kwarg to a tuple, leaving length alone.
+
+    Several upstream call sites pass ``stride=1`` or ``padding=1`` rather than a
+    2-tuple, and ``avg_pool2d`` passes a 4-element padding. Downstream consumers
+    index these (``conv2d_pp`` does ``padding[0]``, the Halo key builder treats
+    them as 2-D geometry), so they must be normalised *before* any branch reads
+    them — see ``_with_halo``.
+    """
+    if v is None:
+        v = default
+    if isinstance(v, int):
+        return (v, v)
+    return tuple(v)
+
+
+def _padding_n4(padding: Union[int, Sequence[int], None]) -> tuple[int, int, int, int]:
+    """Normalise a conv padding to tt-metal's ``padding_n4`` = (top, bottom, left, right).
+
+    tt-metal spells the padded extents as::
+
+        input_padded_height = input_height + padding_n4[0] + padding_n4[1]
+        input_padded_width  = input_width  + padding_n4[2] + padding_n4[3]
+
+    (``tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp:1405-1406`` and ``:1514-1515``), so the
+    four-element
+    form is TWO-SIDED PER AXIS -- (top, bottom, left, right) -- and emphatically
+    not (h, w, h, w).  Getting that backwards is the whole reason this helper
+    exists rather than the padding being indexed inline.
+
+    Accepted spellings, all of which reach conv kwargs in-tree:
+
+        1              -> (1, 1, 1, 1)
+        (ph, pw)       -> (ph, ph, pw, pw)
+        (t, b, l, r)   -> unchanged
+
+    Raises ``ValueError`` for any other length; :func:`_conv_out_hw` catches it
+    and declines rather than letting a graph build die here.
+    """
+    if padding is None:
+        padding = (0, 0)
+    if isinstance(padding, int):
+        return (padding, padding, padding, padding)
+    p = tuple(int(v) for v in padding)
+    if len(p) == 1:
+        return (p[0], p[0], p[0], p[0])
+    if len(p) == 2:
+        return (p[0], p[0], p[1], p[1])
+    if len(p) == 4:
+        return (p[0], p[1], p[2], p[3])
+    raise ValueError(
+        f"conv padding must have 1, 2 or 4 elements, got {len(p)}: {p}")
+
+
+def _conv_out_hw(kwargs: dict, is_transpose: bool = False) -> tuple[int, int] | None:
+    """Conv output (height, width) from *kwargs*, or ``None`` when not derivable.
+
+    Mirror of tt-metal's ``calculate_output_image_size``
+    (``tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp:277-284``)::
+
+        out_h = ((in_h - k_h - (k_h-1)*(dil_h-1) + (pad[0]+pad[1])) / st_h) + 1
+        out_w = ((in_w - k_w - (k_w-1)*(dil_w-1) + (pad[2]+pad[3])) / st_w) + 1
+
+    ``- k - (k-1)*(dil-1)`` collapses to ``- dil*(k-1) - 1``, which is the form
+    written below; the two are algebraically identical, and the second is what
+    the two former inline copies used.  Those copies spelled the padding term
+    ``2*pd[0]`` / ``2*pd[-1]``, which agrees with cpp for the two-element
+    spelling ``(ph, pw)`` and is WRONG for an asymmetric four-element one:
+    ``2*top`` instead of ``top+bottom``, and ``2*right`` instead of
+    ``left+right``.  Extracting the helper is what makes that fixable in one
+    place -- see ``_padding_n4`` for the layout.
+
+    **Effective kernel extent, not the bare kernel**: a dilated conv covers
+    ``dilation * (k - 1) + 1`` input positions per output position.  Identical
+    to the undilated form at dilation 1, which is all ResNet-50 uses, but the
+    grid and shard spec the callers derive from this are wrong for anything
+    dilated.
+
+    **``is_transpose`` declines rather than computing.**  A transposed conv has
+    a different formula entirely: ``calculate_ct2d_output_image_size``
+    (``cpp:288-299``) MULTIPLIES by stride and SUBTRACTS padding where this one
+    divides and adds, so handing back the forward result would be silently
+    wrong by roughly a factor of stride squared.  Callers early-return on
+    ``None``, which is the conservative outcome -- no shard config rather than a
+    wrong one -- and that is strictly better than what the inline copies did,
+    which was to compute the forward value for a transpose without noticing.
+
+    Nothing reaches here with ``is_transpose=True`` today: the only caller that
+    can see a transposed conv is ``_maybe_emit_conv_input_reshard``, which sits
+    behind ``conv_input_reshard_enabled``; only the ResNet-50 infras enable that
+    gate and ResNet-50 has no transposed convs, while vgg_unet (the one
+    ``conv_transpose2d`` user in-tree) runs with the gate off.  The guard is
+    therefore for the future caller, not a live path -- but it is the path that
+    opens the moment anyone enables the gate for vgg_unet.
+    """
+    if is_transpose:
+        return None
+    in_h = int(kwargs.get('input_height', 0) or 0)
+    in_w = int(kwargs.get('input_width', 0) or 0)
+    if not (in_h and in_w):
+        return None
+    ks = _norm_pair(kwargs.get('kernel_size'), (1, 1))
+    st = _norm_pair(kwargs.get('stride'), (1, 1))
+    dil = _norm_pair(kwargs.get('dilation'), (1, 1))
+    try:
+        pad = _padding_n4(kwargs.get('padding'))
+    except (ValueError, TypeError):
+        return None
+    if int(st[0]) <= 0 or int(st[-1]) <= 0:
+        return None
+    out_h = (in_h + pad[0] + pad[1] - int(dil[0]) * (int(ks[0]) - 1) - 1) // int(st[0]) + 1
+    out_w = (in_w + pad[2] + pad[3] - int(dil[-1]) * (int(ks[-1]) - 1) - 1) // int(st[-1]) + 1
+    if out_h <= 0 or out_w <= 0:
+        return None
+    return out_h, out_w
+
+
+def _lowers_to_matmul(
+    kernel_size: Union[int, Sequence[int], None],
+    stride: Union[int, Sequence[int], None],
+    padding: Union[int, Sequence[int], None],
+    dilation: Union[int, Sequence[int], None],
+    conv_config: Optional[Any] = None,
+) -> bool:
+    """Mirror of tt-metal's ``use_matmul_for_1x1_conv``.
+
+    Source: ``ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp:519``::
+
+        kernel_size == {1,1} && stride[0] == stride[1] && stride[0] == 1
+          && padding[0..3] == 0 && dilation == {1,1} && !is_width_sharded
+
+    When this holds tt-metal runs the conv as a plain matmul and dispatches no
+    HaloDeviceOperation; otherwise it dispatches Halo + Conv2d. Every term
+    matters:
+
+    * **stride** — resnet50's three downsample convs are 1x1 with stride 2 and
+      are Halo + Conv2d on silicon (WH n150 rows 33/34, 56/57, 89/90).
+    * **padding / dilation / width-sharding** — no current workload exercises a
+      padded, dilated or width-sharded 1x1 conv, but testing only the kernel
+      made the predicate broader than tt-metal's and would silently drop the
+      Halo for any of those.
+    """
+    ks = _norm_pair(kernel_size, (3, 3))
+    st = _norm_pair(stride, (1, 1))
+    pad = _norm_pair(padding, (0, 0))
+    dil = _norm_pair(dilation, (1, 1))
+    is_width_sharded = (
+        getattr(conv_config, 'shard_layout', None) == TensorMemoryLayout.WIDTH_SHARDED
+    )
+    return (
+        tuple(ks) == (1, 1)
+        and len(st) >= 2 and st[0] == st[1] and st[0] == 1
+        and all(int(p) == 0 for p in pad)
+        and all(int(d) == 1 for d in dil)
+        and not is_width_sharded
+    )
+
+
+def _maybe_emit_conv_input_reshard(
+    args: tuple, kwargs: dict, is_transpose: bool = False,
+) -> tuple[tuple, dict]:
+    """Emit Reshard (+Move) ahead of a conv whose config sets ``reshard_if_not_optimal``.
+
+    Returns possibly-rebound ``(args, kwargs)``.  A no-op unless the gate is on,
+    the flag is set, and the target input memory config differs from the current
+    one.  See ``set_conv_input_reshard`` for the tt-metal references.
+
+    ``is_transpose`` is threaded in from ``_with_halo`` because this is the one
+    conv path a transposed conv can reach (``conv_transpose2d`` is also wrapped
+    by ``_with_halo``), and the output-geometry formula differs for it -- see
+    ``_conv_out_hw``, which declines rather than returning the forward value.
+    """
+    conv_cfg = kwargs.get('conv_config')
+    if conv_cfg is None or not bool(getattr(conv_cfg, 'reshard_if_not_optimal', False)):
+        return args, kwargs
+    inp = kwargs.get('input_tensor') or (args[0] if args else None)
+    if inp is None:
+        # Guard stated locally.  Without it, `inp` reaching inp.get_layout() /
+        # inp.element_size() below is prevented only indirectly — None input means
+        # None device, which makes the grid tuple (0, 0) and trips `not all(grid)`.
+        # That held, but it made two attribute accesses depend on a two-hop
+        # inference three guards away.
+        return args, kwargs
+    device = getattr(inp, 'device', None)
+    if device is None or not conv_input_reshard_enabled(device):
+        return args, kwargs
+    shard_layout = getattr(conv_cfg, 'shard_layout', None)
+    if not isinstance(shard_layout, TensorMemoryLayout):
+        return args, kwargs
+    grid = (getattr(device, 'grid_x', 0), getattr(device, 'grid_y', 0))
+    if not all(grid):
+        return args, kwargs
+
+    from .conv_sharding import (
+        create_sharded_memory_config_from_parallel_config,
+        determine_parallel_config,
+        get_input_channels_alignment,
+    )
+
+    is_mm_conv = _lowers_to_matmul(
+        kwargs.get('kernel_size'), kwargs.get('stride'),
+        kwargs.get('padding'), kwargs.get('dilation'), conv_cfg)
+    batch = int(kwargs.get('batch_size', 1) or 1)
+    in_c = int(kwargs.get('in_channels', 0) or 0)
+    out_c = int(kwargs.get('out_channels', 0) or 0)
+    in_h = int(kwargs.get('input_height', 0) or 0)
+    in_w = int(kwargs.get('input_width', 0) or 0)
+    if not (in_c and out_c and in_h and in_w):
+        return args, kwargs
+    # cpp:277-284, via the shared helper.  Declines (None) for a transposed
+    # conv, whose formula is different -- see _conv_out_hw.
+    _hw = _conv_out_hw(kwargs, is_transpose=is_transpose)
+    if _hw is None:
+        return args, kwargs
+    out_h, out_w = _hw
+
+    in_mc = getattr(inp, '_memory_config', None)
+    alignment = get_input_channels_alignment(
+        shard_layout, inp.get_layout(), False, is_mm_conv, in_mc)
+    try:
+        # cpp:749 / cpp:1033 derive this from the conv config rather than
+        # assuming ROW_MAJOR:
+        #     conv_config.transpose_shards ? COL_MAJOR : ROW_MAJOR
+        _block_orient = (ShardOrientation.COL_MAJOR
+                         if getattr(conv_cfg, 'transpose_shards', False)
+                         else ShardOrientation.ROW_MAJOR)
+        pcfg = determine_parallel_config(
+            shard_layout, batch, in_c, out_h, out_w, out_c, alignment, grid,
+            _block_orient,
+            enable_channels_padding=not is_mm_conv,
+            act_block_h_override=int(getattr(conv_cfg, 'act_block_h_override', 0) or 0),
+        )
+        target = create_sharded_memory_config_from_parallel_config(
+            batch * in_h * in_w, in_c, pcfg, tile_size=TILE_HEIGHT,
+            input_channels_alignment=alignment)
+    except Exception as e:  # pragma: no cover - never fail the graph build over this
+        logger.debug("conv input reshard: parallel-config build failed ({}); skipping", e)
+        return args, kwargs
+
+    if in_mc is not None and in_mc == target:
+        return args, kwargs  # tt-metal's to_memory_config no-ops here
+
+    from .ttnn_shim import reshard_op as _reshard_op
+    new_t = _reshard_op(inp, memory_config=target, element_size=inp.element_size())
+
+    # cpp:884-887 — the Move rides along only when the activation is being
+    # deallocated and did not live in DRAM.
+    if (bool(getattr(conv_cfg, 'deallocate_activation', False))
+            and in_mc is not None
+            and getattr(in_mc, 'buffer_type', None) == BufferType.L1):
+        new_t = _move(new_t)
+        new_t._memory_config = target
+
+    if 'input_tensor' in kwargs:
+        kwargs['input_tensor'] = new_t
+    else:
+        args = (new_t,) + tuple(args[1:])
+    return args, kwargs
+
+
+
+
+def _rebuild_shard_shape_for_output(in_mc: Any, kwargs: dict,
+                                    result: Tensor) -> Optional[Any]:
+    """Carry ``in_mc``'s grid/scheme/orientation but recompute the shard shape.
+
+    Returns None when the output dims are not derivable, so the caller can fall
+    back to the config as-is.  See the call site for why verbatim inheritance is
+    wrong.
+    """
+    spec = getattr(in_mc, 'shard_spec', None)
+    if spec is None or getattr(spec, 'grid', None) is None:
+        return None
+    from .conv_sharding import (
+        create_sharded_memory_config_from_parallel_config,
+        ParallelConfig,
+    )
+    batch = int(kwargs.get('batch_size', 1) or 1)
+    out_c = int(kwargs.get('out_channels', 0) or 0)
+    in_h = int(kwargs.get('input_height', 0) or 0)
+    in_w = int(kwargs.get('input_width', 0) or 0)
+    if not (out_c and in_h and in_w):
+        return None
+    # cpp:277-284, via the shared helper.  ``is_transpose`` is left at its
+    # default False on purpose: this function is reached only from
+    # ``_apply_conv_output_memory_config``, which only the conv2d dispatch
+    # calls -- ``_conv_transpose2d_raw`` applies the output LAYOUT but not the
+    # output memory config, so a transposed conv never arrives here.
+    _hw = _conv_out_hw(kwargs)
+    if _hw is None:
+        return None
+    out_h, out_w = _hw
+    pcfg = ParallelConfig(spec.grid, in_mc.memory_layout, spec.orientation)
+    try:
+        # cpp:846-848 runs determine_output_parallel_config on the (inherited)
+        # input config before building the output's memory config; it rewrites
+        # only .grid, to suit the output channel count.
+        from .conv_sharding import determine_output_parallel_config
+        ks_mm = _lowers_to_matmul(
+            kwargs.get('kernel_size'), kwargs.get('stride'),
+            kwargs.get('padding'), kwargs.get('dilation'),
+            kwargs.get('conv_config'))
+        _grid = (int(getattr(result.device, 'grid_x', 0) or 0),
+                 int(getattr(result.device, 'grid_y', 0) or 0))
+        if all(_grid):
+            # cpp:833 passes parallel_config.shard_orientation — the input
+            # config's own orientation — so the grid axes are laid out the
+            # way the output's inherited orientation says they are.
+            pcfg = determine_output_parallel_config(
+                pcfg, _grid, out_c, pcfg.shard_orientation, is_mm_conv=ks_mm)
+        # An OUTPUT config pads channels by TILE_WIDTH, not by the input-channel
+        # alignment.  cpp keeps the two granularities separate:
+        #
+        #   input  (conv2d_utils.cpp:641-642)
+        #       round_up(in_channels,  num_cores_c        * input_channels_alignment)
+        #   output (conv2d_utils.cpp:1286-1287)
+        #       round_up(out_channels, num_cores_channels * TILE_WIDTH)
+        #
+        # Both then divide plainly inside
+        # create_sharded_memory_config_from_parallel_config (cpp:357), whose
+        # ``channels % num_cores_channels`` assertion holds precisely because the
+        # caller pre-padded.  This port folds the padding into that function, so
+        # the granularity arrives as a parameter and each caller must supply the
+        # one its direction uses.
+        #
+        # Passing TILE_WIDTH is exactly equivalent to cpp's formula, not merely
+        # close: ceil(ceil(c/32)/n)*32 == ceil(c/(32n))*32 for positive integers.
+        #
+        # ResNet-50 could not see this.  Its conv inputs are TILE layout and its
+        # 1x1s are mm convs, and both routes return TILE_WIDTH from
+        # get_input_channels_alignment, so alignment == 32 == TILE_WIDTH there.
+        # A ROW_MAJOR, non-mm, non-width-sharded input can yield 16 or 8, and
+        # then the two disagree: out_c=512 on 7 channel cores is 96 per cpp but
+        # ceil(32/7)*16 = 80 at alignment 16.  MemoryConfig.__eq__ compares the
+        # shard shape, so that gap is the exact condition
+        # ``ds_out.memory_config() != out.memory_config()`` tests.
+        return create_sharded_memory_config_from_parallel_config(
+            batch * out_h * out_w, out_c, pcfg, tile_size=TILE_HEIGHT,
+            input_channels_alignment=TILE_WIDTH)
+    except Exception:  # pragma: no cover - fall back to verbatim inheritance
+        return None
+
+
+def _apply_conv_output_memory_config(result: Tensor, kwargs: dict) -> Tensor:
+    """Give a conv/matmul output the memory config its Conv2dConfig implies.
+
+    No-op unless propagation is enabled.  Only sets a config when the conv
+    declares a ``shard_layout``; an unset shard_layout leaves the output as it
+    was, rather than inventing one.
+    """
+    # Resolve the device the way every other gate in this file does -- off the
+    # tensor, with the kwarg only as a fallback.  ``device=`` is optional on
+    # ttnn.conv2d: ResNet-50 supplies it (inside ``conv_kwargs``, forwarded as
+    # ``**conv_kwargs`` -- ttnn_functional_resnet50.py:586), but vgg_unet omits
+    # it at both of its call sites (workloads/ttnn/vgg_unet/ttnn_vgg_unet.py:74 and
+    # workloads/ttnn/vgg_unet/common/ttnn_vgg_unet.py:136).  Keying on the kwarg alone therefore
+    # resolved the gate per call site rather than per graph: on for the convs
+    # that pass it, off for the ones that do not, within one workload.
+    #
+    # ``result`` is in the chain because this helper receives only kwargs, not
+    # args: a positional ``ttnn.conv2d(x, w, b, ...)`` puts no input_tensor in
+    # kwargs, and the conv output carries the same device either way.
+    #
+    # Verified neutral for ResNet-50 (which already resolved a real device):
+    # 115/115 p100a and 108/108 n150, zero op records differing.  Note the gate
+    # itself is NOT redundant there -- dropping the opt-in costs p100a three ops
+    # and a hit (118 ops, 114/118).
+    device = (
+        getattr(kwargs.get('input_tensor'), 'device', None)
+        or getattr(result, 'device', None)
+        or kwargs.get('device')
+    )
+    enabled = memory_config_propagation_enabled(device)
+    if not enabled:
+        return result
+    if not hasattr(result, '_memory_config'):
+        return result
+
+    conv_cfg = kwargs.get('conv_config')
+    shard_layout = getattr(conv_cfg, 'shard_layout', None) if conv_cfg is not None else None
+
+    # Precedence follows tt-metal (tt-metal/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp:676-750), which is the
+    # OPPOSITE of what this function used to do.  There:
+    #
+    #     ParallelConfig parallel_config = input_tensor_parallel_config;   // inherit
+    #     if (conv_config.reshard_if_not_optimal || needs_shard_or_reshard) {
+    #         ... = determine_parallel_config(shard_layout, ...);          // request
+    #     }
+    #
+    # i.e. the conv INHERITS the input tensor's existing sharding, and
+    # `Conv2dConfig.shard_layout` is only consulted when a reshard actually
+    # fires.  Note determine_parallel_config does not *choose* a layout — it
+    # takes shard_layout as an argument and returns it as `.shard_scheme`,
+    # computing only the core grid.
+    #
+    # Applying the request unconditionally, as this did, is what made ResNet-50
+    # report BLOCK_SHARDED on ~40 ops the capture records as HEIGHT_SHARDED:
+    # canonical passes `height_sharding` only to each layer's *_module1
+    # (tt-metal/models/demos/vision/classification/resnet50/ttnn_resnet/tt/ttnn_functional_resnet50.py:691, 726,
+    # 775, 859),
+    # so modules 2 and 3 fall to the `height_sharding=None`
+    # default and request BLOCK — but they also leave `reshard_if_not_optimal`
+    # False, so hardware never looks at that request and keeps the incoming
+    # HEIGHT sharding.
+    #
+    # `needs_shard_or_reshard` (cpp:686-745) is evaluated by conv_sharding,
+    # which models the per-core shard spec the clauses there read.
+    from .conv_sharding import (
+        create_sharded_memory_config_from_parallel_config,
+        determine_output_parallel_config,
+        determine_parallel_config,
+        get_input_channels_alignment,
+        needs_shard_or_reshard,
+    )
+
+    inp = kwargs.get('input_tensor')
+    in_mc = getattr(inp, '_memory_config', None) if inp is not None else None
+    reshard_if_not_optimal = bool(getattr(conv_cfg, 'reshard_if_not_optimal', False))
+    is_mm_conv = _lowers_to_matmul(
+        kwargs.get('kernel_size'), kwargs.get('stride'),
+        kwargs.get('padding'), kwargs.get('dilation'), conv_cfg)
+
+    _in_layout = inp.get_layout() if inp is not None else None
+    must_reshard = reshard_if_not_optimal or needs_shard_or_reshard(
+        in_mc, int(kwargs.get('in_channels', 0) or 0), is_mm_conv,
+        input_tensor_layout=_in_layout)
+
+    if not must_reshard and in_mc is not None:
+        # Inherit the incoming split, exactly as cpp:744 does — but that line
+        # inherits the *ParallelConfig* (grid, scheme, orientation), not the
+        # shard SHAPE.  The output tensor's config is still built by
+        # create_sharded_memory_config_from_parallel_config from the OUTPUT
+        # dims, so the per-core shape tracks the output while the grid is
+        # carried over.
+        #
+        # Copying in_mc verbatim propagated a stale shape down whole stages:
+        # every conv in layer 2 inherits, so layer3_module1's conv1 saw
+        # HEIGHT_SHARDED (448, 256) — layer 1's 56x56x256 shard — against a real
+        # input of 12544x512, and MaxPool reported (1696, 64) where the capture
+        # has (448, 64).  Anything comparing configs (the bottleneck's
+        # ``ds_out.memory_config() != out.memory_config()``, needs_shard_or_reshard,
+        # the conv input reshard) was then reading fiction.
+        _inherited = _rebuild_shard_shape_for_output(in_mc, kwargs, result)
+        result._memory_config = _inherited if _inherited is not None else in_mc
+        return result
+
+    if not isinstance(shard_layout, TensorMemoryLayout):
+        return result
+
+    # Reshard: derive the grid for the requested layout, adjust it for the
+    # output channel count, and build a config that carries the per-core shard
+    # shape — without which two genuinely different configs compare equal and
+    # the bottleneck's `ds_out.memory_config() != out.memory_config()` never
+    # fires.
+    grid = getattr(device, 'grid_x', 0), getattr(device, 'grid_y', 0)
+    if not all(grid):
+        result._memory_config = MemoryConfig(shard_layout, BufferType.L1)
+        return result
+
+    batch = int(kwargs.get('batch_size', 1) or 1)
+    in_c = int(kwargs.get('in_channels', 0) or 0)
+    out_c = int(kwargs.get('out_channels', 0) or 0)
+    # Output spatial extent, per cpp:277-284.  It sizes the output shard spec
+    # built below -- create_sharded_memory_config_from_parallel_config is handed
+    # ``batch * out_h * out_w`` as the NHWC-flat row count -- so getting it wrong
+    # moves the shard shape and therefore the LUT key.
+    #
+    # ``_conv_out_hw`` returns None for every case where that extent is not
+    # derivable: unknown geometry (zero input_height/width), a non-positive
+    # result, a stride of zero, a padding that is not 1, 2 or 4 elements, or a
+    # transposed conv, whose formula differs (cpp:288-299).  ``is_transpose`` is
+    # left at its default here because this function is reached only from the
+    # conv2d dispatch; conv_transpose2d applies the output LAYOUT but not the
+    # output memory config, so it never arrives.
+    #
+    # On None -- or with no out_channels to shard across -- fall back to a
+    # layout-only MemoryConfig carrying no shard spec.  That is the honest
+    # answer: consumers that read a spec (needs_shard_or_reshard,
+    # get_num_cores_channels, MemoryConfig.__eq__) then take their "unknown"
+    # branch rather than trusting a shape derived from geometry we do not have.
+    _hw = _conv_out_hw(kwargs)
+    if _hw is None or not out_c:
+        result._memory_config = MemoryConfig(shard_layout, BufferType.L1)
+        return result
+    out_h, out_w = _hw
+
+    alignment = get_input_channels_alignment(
+        shard_layout, _in_layout, False, is_mm_conv, in_mc)
+    # cpp:749 / cpp:1033 derive this from the conv config rather than
+    # assuming ROW_MAJOR:
+    #     conv_config.transpose_shards ? COL_MAJOR : ROW_MAJOR
+    _block_orient = (ShardOrientation.COL_MAJOR
+                     if getattr(conv_cfg, 'transpose_shards', False)
+                     else ShardOrientation.ROW_MAJOR)
+    # cpp:1057 is the call this mirrors, and it passes BOTH ``!is_mm_conv`` and
+    # ``conv_config.act_block_h_override`` -- as do the other two call sites
+    # (cpp:616, cpp:752).  The override is not cosmetic: determine_parallel_config
+    # turns it into ``act_block_h_ntiles`` and feeds that as the ``mult`` of
+    # find_closest_largest_divisor_with_num_padding_and_mult, so leaving it at 0
+    # searches with mult=1 and returns a different num_cores_nhw.  That count
+    # reaches ocfg below (cpp:258 reads it off the input config) and therefore
+    # the output shard shape.  ResNet-50 sets the override on conv1 (1568 on WH,
+    # 1024 or 1568 on BH batch 32) and on the layer1/layer2 convs (512, 32, 448),
+    # so this is a live path, not a defensive argument.
+    pcfg = determine_parallel_config(
+        shard_layout, batch, in_c, out_h, out_w, out_c, alignment, grid, _block_orient,
+        enable_channels_padding=not is_mm_conv,
+        act_block_h_override=int(getattr(conv_cfg, 'act_block_h_override', 0) or 0),
+    )
+    # cpp:1077 passes the same orientation used to build pcfg (cpp:1066).
+    ocfg = determine_output_parallel_config(
+        pcfg, grid, out_c, pcfg.shard_orientation, is_mm_conv=is_mm_conv)
+    # TILE_WIDTH, not ``alignment``: this builds the OUTPUT config, and cpp pads
+    # output channels by ``num_cores_channels * TILE_WIDTH`` (cpp:1286-1287).
+    # ``alignment`` above is still correct where it is used -- determine_parallel_config
+    # takes input_channels_alignment and divides the INPUT channel count with it
+    # (cpp:641-642) -- so the two are deliberately different here.  See
+    # _rebuild_shard_shape_for_output for the full note.
+    result._memory_config = create_sharded_memory_config_from_parallel_config(
+        batch * out_h * out_w, out_c, ocfg, tile_size=TILE_HEIGHT,
+        input_channels_alignment=TILE_WIDTH)
     return result
 
 
@@ -1468,12 +2421,20 @@ def _apply_conv_output_layout(result, kwargs):
 
 
 def _conv2d_dispatch(*args, **kwargs):
-    ks = kwargs.get('kernel_size', (3, 3))
-    if tuple(ks) == (1, 1):
+    # MUST use the same predicate as _with_halo, which wraps this function and
+    # has already decided Halo-vs-no-Halo from it.  Testing the kernel alone
+    # here made the two disagree for a 1x1 STRIDE-2 conv: _with_halo emitted a
+    # Halo (correct — tt-metal dispatches Halo + Conv2d) while this lowered to a
+    # matmul, producing a Halo + MatMul pair that cannot occur on hardware.
+    # ResNet-50's three downsample convs are exactly that shape.
+    if _lowers_to_matmul(kwargs.get('kernel_size'), kwargs.get('stride'),
+                         kwargs.get('padding'), kwargs.get('dilation'),
+                         kwargs.get('conv_config')):
         result = _matmul_1x1_with_hw_fields(*args, **kwargs)
     else:
         result = _conv2d_raw(*args, **kwargs)
-    return _apply_conv_output_layout(result, kwargs)
+    result = _apply_conv_output_layout(result, kwargs)
+    return _apply_conv_output_memory_config(result, kwargs)
 
 
 conv2d = _with_halo(_conv2d_dispatch, is_transpose=False, move_before_conv=True)
@@ -1535,7 +2496,40 @@ Tensor.__mul__ = multiply  # type: ignore
 Tensor.__div__ = div  # type: ignore
 Tensor.__pow__ = pow  # type: ignore
 Tensor.__matmul__ = matmul  # type: ignore
-Tensor.reshape = reshape  # type: ignore
+def _tensor_reshape(self, *shape: Any) -> Tensor:
+    """``Tensor.reshape`` accepting a sequence OR varargs dims, as real ttnn does.
+
+    Bound directly to the ``reshape`` op, this only accepted
+    ``t.reshape([a, b, c])``; ``t.reshape(a, b, c)`` arrived as N positional args
+    and tripped ``reshape_pp``'s ``len(args_list) <= 3`` guard with the
+    misleading "ttnn.reshape has 3 inputs".  That is what broke ``ttnn.fold``'s
+    ``use_transpose_as_fold=True`` path, which does
+    ``t.reshape(N, Hs, stride_h, Ws, stride_w, C)`` — six dims.
+    """
+    if len(shape) == 1 and isinstance(shape[0], (list, tuple, Shape)):
+        new_shape = shape[0]
+    else:
+        new_shape = list(shape)
+    return reshape(self, new_shape)
+
+
+def _tensor_permute(self, *perm: Any) -> Tensor:
+    """``Tensor.permute`` on the ttnn path, sequence or varargs.
+
+    Without this, ``Tensor`` inherited ``SimTensor.permute`` from the functional
+    front-end (``ttsim/front/functional/tensor_op.py:212``), which needs a
+    ``link_module`` the ttnn path never sets — so a ttnn tensor's ``.permute``
+    asserted instead of emitting a Transpose SimOp.
+    """
+    if len(perm) == 1 and isinstance(perm[0], (list, tuple)):
+        order = list(perm[0])
+    else:
+        order = list(perm)
+    return permute(self, order)
+
+
+Tensor.reshape = _tensor_reshape  # type: ignore[attr-defined]
+Tensor.permute = _tensor_permute  # type: ignore[attr-defined]
 
 
 def silu(x):
@@ -1700,7 +2694,8 @@ def fold(
         # parameter.  This mirrors the tt-metal C++ implementation where
         # prim::fold always produces [1,1,N*Hs*Ws,Cs] but the higher-level
         # ttnn::fold conditionally reshapes back to [N,Hs,Ws,Cs] for tiled
-        # or DRAM-interleaved inputs (see fold.cpp / fold_device_op.cpp).
+        # or DRAM-interleaved inputs (see tt-metal/ttnn/cpp/ttnn/operations/data_movement/fold/fold.cpp /
+        # tt-metal/ttnn/cpp/ttnn/operations/data_movement/fold/device/fold_device_op.cpp).
         #
         # The choice of `(device is not None) and not (is_tiled or is_dram)` means:
         #   - Device ROW_MAJOR (any memcfg, including None) → flatten_nd=True  (ViT, typical models)

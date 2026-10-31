@@ -4,6 +4,7 @@
 
 from .device import open_device, close_device, ARCH, num_cores_to_corerangeset, create_sharded_memory_config, ReadDeviceProfiler
 from .device import USE_DEFAULT_DEVICE, resolve_device, set_default_device, get_default_device
+from .device import try_get_default_device, coerce_arch
 from .ttnn_shim import interleaved_to_sharded, sharded_to_interleaved, reshard, to_memory_config
 from .tensor import (
     Tensor,
@@ -66,7 +67,16 @@ TILE_SIZE        = 32
 DRAM_MEMORY_CONFIG = MemoryConfig.DRAM  # MemoryConfig(INTERLEAVED, BufferType.DRAM)
 L1_MEMORY_CONFIG   = MemoryConfig.L1   # MemoryConfig(INTERLEAVED, BufferType.L1)
 
-L1_WIDTH_SHARDED_MEMORY_CONFIG = 0
+# Was a bare ``0`` placeholder.  Anything that passed it as ``memory_config=``
+# set the output tensor's ``_memory_config`` to the int 0, which
+# ``tensor_memory_str`` cannot read, so the LUT key silently fell back to
+# DEV_1_DRAM_INTERLEAVED — ResNet-50's fc matmul and the
+# UntilizeWithUnpadding after it both keyed that way against the capture's
+# DEV_1_L1_WIDTH_SHARDED.  Real ttnn defines it as an interleaved-free width
+# shard in L1 with no explicit shard spec, same shape as the two above.
+L1_WIDTH_SHARDED_MEMORY_CONFIG = MemoryConfig(
+    TensorMemoryLayout.WIDTH_SHARDED, BufferType.L1,
+)
 
 #placeholders
 
@@ -80,7 +90,22 @@ def name_to_datatype(dtype_name: str) -> DataType:
         )
 
 def get_arch_name():
-    return ARCH.WORMHOLE_B0.cname
+    """Target architecture name, e.g. 'wormhole_b0' or 'blackhole'.
+
+    Reports the DEFAULT DEVICE's architecture, so arch-conditional model code
+    (``is_blackhole()`` / ``is_wormhole_b0()`` in the tt-metal models) takes the
+    branch hardware would take.  This used to return the WORMHOLE_B0 constant
+    unconditionally, which made ``is_blackhole()`` permanently False and left
+    every Blackhole branch in every workload unreachable.
+
+    Falls back to WORMHOLE_B0 when no default device has been set — model code
+    may call this at import time — so callers that never set an arch keep their
+    previous behaviour.  A workload that wants Blackhole sets it explicitly on
+    its device (``open_device(arch='blackhole')`` or ``device.set_arch(...)``)
+    from its per-arch entry point.
+    """
+    device = try_get_default_device()
+    return (device.architecture if device is not None else ARCH.WORMHOLE_B0).cname
 
 def is_tensor_storage_on_device(ttnn_tensor_like):
     return True

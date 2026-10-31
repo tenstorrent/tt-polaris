@@ -50,11 +50,71 @@ packages:
         instances:
         -   name: n150
             # operator_lookup_file can be a local path or LFC path starting with lfc://
-            operator_lookup_file: lfc://hlm-lut/whb0_n150_lut_v5.yaml
-            # Logical tensix grid (x, y) — see doc/TTNN_SHIM_ARCHITECTURE.md §17.
-            # Source: tt-metal/tt_metal/core_descriptors/wormhole_b0_80_arch_eth_dispatch.yaml
-            # (end=[7, 9] → 8×10 physical). n150 has one row harvested → 8×9 = 72 cores
-            # (matches num_units below).
+            operator_lookup_file: lfc://hlm-lut/whb0_n150_lut_v6.yaml
+            # Logical tensix grid (x, y).  This field stands in for tt-metal's
+            # device.compute_with_storage_grid_size().
+            #
+            # Source: tt-metal/tt_metal/core_descriptors/wormhole_b0_80_arch_eth_dispatch.yaml,
+            # field compute_with_storage_grid_range.  That descriptor keys the
+            # grid PER PRODUCT, and the value below matches none of its keys:
+            #
+            #   galaxy      end=[7, 9]  ->  8x10  =  80
+            #   nebula_x1   end=[7, 7]  ->  8x8   =  64   <- n150 (single ASIC)
+            #   nebula_x2   end=[7, 7]  ->  8x8   =  64   <- n300, per ASIC
+            #
+            # n150 is nebula_x1, so the descriptor's answer for this field is
+            # 8x8 = 64.  The 8x9 = 72 below is the card's Tensix count from the
+            # spec table at the foot of this file -- a different quantity,
+            # reached by subtracting one harvested row from the 8x10 die rather
+            # than by reading the product key.
+            #
+            # UNRESOLVED, and currently harmless: the hlm-refrun/merged_ops*.csv for wh n150 disagree with this
+            # value.  Example : Every row of
+            # __refrun_cache/resnet50/wh/n150/merged_ops_resnet50-02b76a9-wormhole_b0-n150_L-260916.csv
+            # reports AVAILABLE WORKER CORE COUNT = 64, and no op dispatches
+            # on more than 64 (64 = 8x8).  This says 8x9 = 72.  Not a resnet50
+            # quirk: vit (206 ops) and vgg_unet (105 ops) on this SKU report 64
+            # too, and across all 419 ops the value is constant and nothing
+            # exceeds it.  So the capture, the descriptor's nebula_x1 key and
+            # AVAILABLE WORKER CORE COUNT all agree on 64; only this field
+            # disagrees.
+            #
+            # Left as-is deliberately.  Measured at both values across resnet50,
+            # vgg_unet and vit: identical op counts, identical per-optype
+            # census, identical LUT hits.  Three things mask it:
+            #   1. _HALO_EXT_Y_OVERRIDES_BY_DEVICE is TRANSCRIBED from the
+            #      capture, so the largest grid consumer never reads this;
+            #   2. everywhere else the grid only feeds values that are compared
+            #      against each other, so a uniformly-wrong grid cancels;
+            #   3. find_closest_largest_divisor_with_num_padding walks down to
+            #      the same divisor from either start.
+            #
+            # Mask (1) LIFTS if anyone ports the halo derivation
+            # (tt-metal/ttnn/cpp/ttnn/operations/sliding_window/sliding_window.cpp:
+            # generate_shard_boundaries -> generate_max_out_nsticks_per_core),
+            # which reads config.num_cores_nhw directly.  VERIFY THIS GRID
+            # AGAINST THE CAPTURE BEFORE DOING THAT, or the derived table will
+            # be wrong in a way the transcribed one currently hides.
+            #
+            # num_units below carries the same discrepancy (72 where the
+            # captures report 64) and cannot change a LUT-backed run.  It is the
+            # fallback source for the lookup's core_count
+            # (tools/perf_lookup/lookup_operator_perf.py:1333-1355 -- no config
+            # sets operator_lookup_core_count, so num_units is what is used), and
+            # core_count reaches only two places: _eval_curve_value (:304), which
+            # evaluates a regression AT core_count and is unreachable here
+            # because both v6 LUTs are entirely single-entry and
+            # operator_lookup_hybrid_curve is unset; and
+            # _maybe_warn_single_core_mismatch (:346), which logs at debug level
+            # and returns, "using table scalars as-is".  A single-entry hit
+            # therefore yields the table's own msecs whatever num_units says.  That is structural and
+            # arch-independent, so the Blackhole sweep in tt_bh.yaml (total LUT
+            # msecs identical at 110 and 120) corroborates it rather than needing
+            # a repeat on n150.
+            #
+            # It DOES feed the analytical model (ttsim/config/simconfig.py:521,
+            # :561), so LUT_OFF projections depend on it and correcting it to
+            # 64 would move them.
             compute_grid_size: [8, 9]
             ipgroups:
             -   ipname: tensix

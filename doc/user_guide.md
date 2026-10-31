@@ -430,16 +430,20 @@ YAML Config → TT-Polaris → TTNN Workload Function → Device Execution → P
    - Defines workload API type, name, and instances
    - Specifies module path and hyperparameters
 
-2. **Dispatch** (`polaris.py:111-122`):
+2. **Dispatch** (`polaris.py:165-180`):
    - Loads TTNN function from module
    - Opens device for execution
    - Calls workload with standard signature
    - Captures operation graph for analysis
 
-3. **Execution** (e.g., `workloads/ttnn/resnet50/ttnn_functional_resnet50.py`):
+3. **Execution** (e.g., `workloads/ttnn/resnet50/bh/test_resnet50_device_perf_bh.py`):
    - Implements model using TTNN operations
    - Returns output tensor
    - Device tracks all operations for performance analysis
+
+   The entry point is thin; the ResNet-50 model itself is shared across both arches in
+   `workloads/ttnn/resnet50/common/ttnn_functional_resnet50.py`, and the per-arch
+   `resnet50_test_infra_polaris_{bh,wh}.py` supplies the arch, capture SKU and compute grid.
 
 ### Creating TTNN Workloads
 
@@ -469,7 +473,9 @@ def run_<model_name>(wlname: str, device: TTNNDevice, cfg: dict):
 #### Key Conventions
 
 1. **Function Naming**: `run_<model_name>` where model_name matches the module context
-   - Example: `run_resnet50`, `run_vit`, `run_bert`
+   - Example: `run_vit`, `run_llama3`, `run_resnet50_e2e_entry`
+   - A workload with several YAML entries names one function per entry rather than branching
+     inside one: ResNet-50 exposes `run_resnet50_e2e_entry` and `run_resnet50_perf_device`
 
 2. **Parameter Contract**:
    - `wlname` (str): Workload identifier from YAML config (used for logging/identification)
@@ -602,12 +608,12 @@ python polaris.py --wlspec config/my_workloads.yaml --batchsize 1 32 1
 ┌─────────────────────────────────────────────────────────────────┐
 │ TTNN Workload Function (workloads/ttnn/.../run_*.py)            │
 │                                                                  │
-│ def run_resnet50(wlname: str, device: TTNNDevice, cfg: dict):   │
-│     # wlname = "Resnet50" (for logging/identification)          │
+│ def run_resnet50_e2e_entry(wlname, device, cfg: dict):          │
+│     # wlname = "resnet50_bh_device_perf" (logging/identity)     │
 │     # device = TTNN device instance (managed by TT-Polaris)     │
-│     # cfg = {batch_size: 8, ...} (merged configuration)         │
+│     # cfg = {bs: 16, ...} (merged configuration)                │
 │                                                                  │
-│     batch_size = cfg.get('batch_size', 8)                       │
+│     batch_size = cfg.get('bs', DEFAULT_BATCH_SIZE)              │
 │     # ... implement model ...                                   │
 │     return output_tensor                                        │
 └─────────────────────────────────────────────────────────────────┘
@@ -675,10 +681,12 @@ After execution, TT-Polaris captures the operation graph:
 4. **Shape mismatch"**: Verify tensor shapes match TTNN requirements
 
 ### See Also
-- `workloads/ttnn/resnet50/ttnn_functional_resnet50.py` - Reference implementation
-- `polaris.py:111-122` - TTNN dispatch mechanism
+- `workloads/ttnn/resnet50/` - Reference implementation (entry points in `bh/` and `wh/`,
+  shared model in `workloads/ttnn/resnet50/common/ttnn_functional_resnet50.py`)
+- `polaris.py:165-180` - TTNN dispatch mechanism
 - `config/all_workloads.yaml` - Configuration examples
 - `ttsim/front/ttnn/` - TTNN API implementation
+- `doc/shim_gates.md` - Opt-in shim behaviours and their `TTSIM_*` environment variables
 
 ## Troubleshooting
 

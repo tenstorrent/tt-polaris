@@ -2,8 +2,7 @@
 #SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
 #SPDX-License-Identifier: Apache-2.0
 
-from typing import Tuple, Iterator, Optional, Iterable
-from dataclasses import dataclass
+from typing import Iterator, Optional, Iterable
 from enum import Enum, auto
 
 
@@ -113,6 +112,21 @@ class CoreRange:
     def __str__(self):
         return f"CoreRange({self.start_coord} -> {self.end_coord})"
 
+    # Value equality, like tt-metal's CoreRange.  Without it two structurally
+    # identical ranges compared by identity, which propagated up through
+    # ShardSpec.__eq__ and MemoryConfig.__eq__ and made every
+    # ``a.memory_config() != b.memory_config()`` test true — see CoreRangeSet
+    # below for what that cost.
+    def __eq__(self, other):
+        if not isinstance(other, CoreRange):
+            return NotImplemented
+        return (self.start_coord == other.start_coord
+                and self.end_coord == other.end_coord)
+
+    def __hash__(self):
+        return hash((self.start_coord.x, self.start_coord.y,
+                     self.end_coord.x, self.end_coord.y))
+
 class CoreRangeSet:
     """A collection of non-overlapping core ranges."""
     def __init__(self, ranges: Iterable[CoreRange]):
@@ -147,6 +161,41 @@ class CoreRangeSet:
         for range_obj in self.ranges:
             yield from range_obj
 
+    # Value equality, like tt-metal's CoreRangeSet.  ShardSpec.__eq__ compares
+    # ``self.grid == other.grid``, and MemoryConfig.__eq__ compares shard_spec,
+    # so without this two byte-identical sharded configs compared UNEQUAL.
+    # ResNet-50's bottleneck does
+    # ``if ds_out.memory_config() != out.memory_config(): to_memory_config(...)``
+    # (tt-metal/models/demos/vision/classification/resnet50/ttnn_resnet/tt/ttnn_functional_resnet50.py:325-326), which
+    # therefore fired unconditionally: polaris emitted a
+    # Reshard at three positions where both configs were identical
+    # (HEIGHT_SHARDED/L1 (448, 256) on 112 cores, and BLOCK_SHARDED/L1 (96, 256)
+    # on 72 cores twice) and the p100a capture has no Reshard at all.
+    #
+    # Compare the range *decomposition*, not the covered coordinate set, because
+    # that is what tt-metal does: ``operator==(const CoreRangeSet&, const
+    # CoreRangeSet&)`` (tt_metal/common/core_coord.cpp:484-496) checks
+    # ``ranges().size()`` and then walks both vectors pairwise, and
+    # ``std::hash<CoreRangeSet>`` (ibid.:699-706) combines the range count and
+    # each range in turn. A coordinate-set comparison would be *looser* than
+    # hardware: ``_num_cores_to_corerangeset(3, (2, 2), row_wise=True)`` and the
+    # column-wise call cover the same three cores but place shard 1 on (1, 0)
+    # versus (0, 1), so silicon reshards between them and the model must too.
+    # Only the vector order is relaxed here (sorted, not pairwise) — every
+    # construction site emits full block first, remainder second, so the order is
+    # already canonical and the sort is defensive rather than a semantic change.
+    def __eq__(self, other):
+        if not isinstance(other, CoreRangeSet):
+            return NotImplemented
+        if len(self.ranges) != len(other.ranges):
+            return False
+        key = lambda r: (r.start_coord.x, r.start_coord.y, r.end_coord.x, r.end_coord.y)
+        return sorted(self.ranges, key=key) == sorted(other.ranges, key=key)
+
+    def __hash__(self) -> int:
+        key = lambda r: (r.start_coord.x, r.start_coord.y, r.end_coord.x, r.end_coord.y)
+        return hash(tuple(sorted((key(r) for r in self.ranges))))
+
 class CoreGrid(CoreRangeSet):
     """Mimic real ttnn's ``CoreGrid(x=.., y=..)`` grid descriptor while remaining a
     ``CoreRangeSet`` (TT-Polaris represents grids as range sets). Dual-mode workloads must use the
@@ -155,7 +204,13 @@ class CoreGrid(CoreRangeSet):
     """
     def __init__(self, ranges=None, *, x=None, y=None):
         if x is not None or y is not None:
-            assert x is not None and y is not None, "CoreGrid(x=, y=) requires both x and y"
+            # ValueError, not assert: this validates a CALLER's arguments, and
+            # ``python -O`` strips asserts.  Stripped, ``CoreGrid(x=8)`` would
+            # reach ``int(None)`` and die with a TypeError three lines down
+            # instead of saying what is wrong.  Same reasoning as
+            # conv_sharding._num_cores_to_corerangeset.
+            if x is None or y is None:
+                raise ValueError("CoreGrid(x=, y=) requires both x and y")
             self.x = int(x)
             self.y = int(y)
             super().__init__([CoreRange(CoreCoord(0, 0), CoreCoord(self.x - 1, self.y - 1))])
