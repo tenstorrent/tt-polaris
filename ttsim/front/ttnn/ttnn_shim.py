@@ -2447,6 +2447,42 @@ def sharded_to_interleaved_op(input_tensor, memory_config=None, element_size=2):
     return out_tensor
 
 
+def copy_op(input_tensor, memory_config, element_size=2):
+    """Create a Copy SimOp (tracking-only; no execution): ``input_tensor`` copied to ``memory_config``."""
+    assert input_tensor.device is not None, "copy_op requires input_tensor on device"
+    op_name = generate_new_op_name()
+    out_tensor = Tensor(
+        name=op_name + '.out',
+        shape=input_tensor.logical_shape()._shape,
+        dtype=input_tensor.dtype,
+        layout=input_tensor.get_layout(),
+        padded_shape=input_tensor.padded_shape()._shape,
+        op_out=[op_name],
+        device=input_tensor.device,
+    )
+    input_tensor.op_in.append(op_name)
+    opinfo = {
+        'name': op_name,
+        'optype': 'Copy',
+        'inList': [input_tensor.name],
+        'outList': [out_tensor.name],
+        'attrs': {
+            'element_size': element_size,
+            'memory_config': {
+                'memory_layout': memory_config.memory_layout,
+                'buffer_type': memory_config.buffer_type,
+            },
+        },
+    }
+    opobj = SimOp(opinfo)
+    opobj.get_perf_counts([input_tensor], [out_tensor])
+    opobj.update_tensor_counts([input_tensor], [out_tensor])
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
+    out_tensor._memory_config = memory_config
+    input_tensor.device.add_op(opobj)
+    return out_tensor
+
+
 def sharded_to_interleaved(input_tensor, memory_config=None, output_dtype=None):
     """Convert tensor from sharded to interleaved memory layout."""
     mode = get_execution_mode()
@@ -2547,11 +2583,14 @@ def reshard_op(input_tensor, memory_config=None, element_size=2):
 
 
 def to_memory_config(input_tensor, memory_config=None):
-    """Emit STI+ITS SimOps when resharding from one sharded config to another.
+    """Emit the SimOps tt-metal's ``to_memory_config`` runs, for the transitions modelled here.
 
-    On hardware, transitioning between two sharded layouts goes through an
-    interleaved staging step: ShardedToInterleaved → InterleavedToSharded.
-    This is emitted when both source and target are sharded but differ.
+    * Same memory config: no op (tt-metal returns the input tensor).
+    * Interleaved → a different interleaved config (e.g. L1 → DRAM): one ``Copy``. tt-metal
+      falls through to its general ``prim::copy`` fallback (``to_memory_config_op.cpp``).
+    * Sharded → a different sharded config: ShardedToInterleaved → InterleavedToSharded.
+      tt-metal prefers ``Reshard`` here and uses this pair only as a fallback; the remaining
+      transitions (interleaved ↔ sharded, dtype) are not modelled yet (#549).
     """
     if memory_config is None:
         return input_tensor
@@ -2565,6 +2604,12 @@ def to_memory_config(input_tensor, memory_config=None):
             input_tensor = sharded_to_interleaved_op(input_tensor, element_size=elem_sz)
             input_tensor = interleaved_to_sharded_op(input_tensor, memory_config=memory_config, element_size=elem_sz)
             return input_tensor
+    if (should_track and not memory_config.is_sharded()
+            and isinstance(input_tensor, Tensor) and input_tensor.device is not None):
+        input_mc = getattr(input_tensor, '_memory_config', None)
+        if input_mc is not None and not input_mc.is_sharded() and input_mc != memory_config:
+            elem_sz = input_tensor.element_size() if hasattr(input_tensor, 'element_size') else 2
+            return copy_op(input_tensor, memory_config, element_size=elem_sz)
     if hasattr(input_tensor, '_memory_config'):
         input_tensor._memory_config = memory_config
     return input_tensor

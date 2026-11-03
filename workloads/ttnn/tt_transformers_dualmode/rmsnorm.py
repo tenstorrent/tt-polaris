@@ -44,6 +44,15 @@ class RMSNorm:
         self.sharded_output_config = sharded_output_config
         self.ccl_topology = ccl_topology
         self.compute_kernel_config_hifi2 = ttnn.MathFidelity.HiFi2
+        if not IS_POLARIS:
+            # tt-metal models/common/rmsnorm.py (f8c634a) compute_kernel_config_hifi2: HiFi2,
+            # math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True. BH p100a 261018 and WH n150
+            # 261015 captures: every prefill norm runs with exactly this; without it ttnn defaults to HiFi4
+            # and the LUT key misses.
+            self._hw_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi2, math_approx_mode=False,
+                fp32_dest_acc_en=True, packer_l1_acc=True,
+            )
 
         # gamma weight: (1, 1, dim//TILE, TILE), ROW_MAJOR — matches HW LayerNorm in1
         wshape = (1, 1, dim // TILE, TILE)
@@ -76,4 +85,7 @@ class RMSNorm:
         # (adding a `weight=` alias to the shim's rms_norm just to satisfy the type checker) would
         # diverge the shim API from a real tt-metal op for no runtime benefit. Keep the pragma
         # localized to this real-ttnn-only call.
-        return ttnn.rms_norm(x, epsilon=self.eps, weight=self.weight, memory_config=None)  # type: ignore[call-arg]
+        # Prefill only: tt-metal passes the same config in decode too, but the decode HW path is pinned
+        # to its own capture and left unchanged here.
+        hw_kw = {'compute_kernel_config': self._hw_compute_kernel_config} if mode == 'prefill' else {}
+        return ttnn.rms_norm(x, epsilon=self.eps, weight=self.weight, memory_config=None, **hw_kw)  # type: ignore[call-arg]
