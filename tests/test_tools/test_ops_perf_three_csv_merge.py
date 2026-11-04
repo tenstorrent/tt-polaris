@@ -9,6 +9,7 @@ import pytest
 from tools.si_profiling_helpers.ops_perf_three_csv_merge import (
     COL_FPU_UTIL_RAW,
     COL_MEM_UTIL_RAW,
+    NOCTRACE_ONLY_OUTPUT_COLUMNS,
     MergeError,
     classify_file,
     detect_by_op_code_period,
@@ -511,3 +512,76 @@ def test_merge_fpu_extras_spliced_before_shared_trailing(tmp_path):
     # The shared trailing op-type column is carried once (from vanilla), not duplicated.
     assert hdr.count(_OP_HOST_FUNC) == 1
     assert hdr.count(COL_FPU_UTIL_RAW) == 1
+
+
+# ---------------------------------------------------------------------------
+# --allow-missing-noctrace: merge a vanilla CSV and an fpu CSV
+# ---------------------------------------------------------------------------
+
+_FPU_UTIL_COLS = ['FPU Util Median (%)', 'SFPU Util Median (%)']
+# tt-metal layout: noctrace and vanilla carry no FPU/SFPU util columns; only fpu does.
+_BASE_NO_FPU_UTIL = [c for c in _E2E_COLS if c not in _FPU_UTIL_COLS]
+
+
+def _write_passes(d, base, with_noctrace=True):
+    """Write vanilla + fpu (+ noctrace) passes of two ops into ``d`` with ``base`` columns."""
+    shared = [*base, _OP_HOST_FUNC]
+    fpu_cols = [*base, *(c for c in _FPU_UTIL_COLS if c not in base), *_FPU_EXTRAS, _OP_HOST_FUNC]
+
+    def rows(ns, **kw):
+        out = []
+        for gcc, op in [(1024, 'Matmul'), (2048, 'Add')]:
+            r = _e2e_row(gcc, op, ns, **kw)
+            r[_OP_HOST_FUNC] = '5'
+            for c in _FPU_EXTRAS:
+                r[c] = '7.5'
+            out.append(r)
+        return out
+
+    d.mkdir()
+    if with_noctrace:
+        _write_csv(d / 'noctrace.csv', rows(1200, dram='45.2'), cols=shared)
+    _write_csv(d / 'fpuutil.csv', rows(1100, fpu='62.1'), cols=fpu_cols)
+    _write_csv(d / 'vanilla.csv', rows(1000), cols=shared)
+
+
+def _merge(d, out, **kw):
+    run_merge(d, out, dram_peak_bw_gbps=288.0, duration_rel_tol=1e9, encoding='utf-8', **kw)
+    with out.open(newline='') as fh:
+        return list(csv.reader(fh))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('base', [_BASE_NO_FPU_UTIL, _E2E_COLS], ids=['tt-metal-layout', 'fpu-util-everywhere'])
+def test_merge_without_noctrace_is_three_csv_merge_minus_noctrace_columns(tmp_path, base):
+    _write_passes(tmp_path / 'three', base)
+    _write_passes(tmp_path / 'two', base, with_noctrace=False)
+    full = _merge(tmp_path / 'three', tmp_path / 'three.csv')
+    two = _merge(tmp_path / 'two', tmp_path / 'two.csv', allow_missing_noctrace=True)
+
+    keep = [i for i, c in enumerate(full[0]) if c not in NOCTRACE_ONLY_OUTPUT_COLUMNS]
+    assert len(full[0]) - len(keep) == len(NOCTRACE_ONLY_OUTPUT_COLUMNS)
+    assert two == [[r[i] for i in keep] for r in full]
+
+
+@pytest.mark.unit
+def test_allow_missing_noctrace_with_three_csvs_is_byte_identical(tmp_path):
+    _write_passes(tmp_path / 'in', _BASE_NO_FPU_UTIL)
+    _merge(tmp_path / 'in', tmp_path / 'plain.csv')
+    _merge(tmp_path / 'in', tmp_path / 'flag.csv', allow_missing_noctrace=True)
+    assert (tmp_path / 'plain.csv').read_bytes() == (tmp_path / 'flag.csv').read_bytes()
+
+
+@pytest.mark.unit
+def test_missing_noctrace_without_flag_names_the_flag(tmp_path):
+    _write_passes(tmp_path / 'in', _BASE_NO_FPU_UTIL, with_noctrace=False)
+    with pytest.raises(MergeError, match='--allow-missing-noctrace'):
+        _merge(tmp_path / 'in', tmp_path / 'out.csv')
+
+
+@pytest.mark.unit
+def test_allow_missing_noctrace_still_requires_fpu_and_vanilla(tmp_path):
+    _write_passes(tmp_path / 'in', _BASE_NO_FPU_UTIL)
+    (tmp_path / 'in' / 'fpuutil.csv').unlink()
+    with pytest.raises(MergeError, match='Expected exactly one fpu CSV, found 0'):
+        _merge(tmp_path / 'in', tmp_path / 'out.csv', allow_missing_noctrace=True)
