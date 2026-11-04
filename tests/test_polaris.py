@@ -128,6 +128,99 @@ def test_polaris_reports_empty_spec_rather_than_blaming_filters(reset_typespec, 
     assert polaris.main(args) != 0, "an empty spec should still fail the run"
 
 
+# --- --ignore-lut propagation: polaris() must set ignore_lut on every device in devspec ---
+
+def _polaris_args(source, tmp_path, ignore_lut, hybrid_curve=False):
+    """Build the argument object polaris() receives: argparse.Namespace (CLI) or PolarisRunConfig (polproj)."""
+    if source == 'namespace':
+        argv = [
+            '--odir', str(tmp_path), '--study', 'dummy',
+            '--wlspec', 'config/mlperf_inference.yaml',
+            '--archspec', 'config/all_archs.yaml',
+            '--wlmapspec', 'config/wl2archmapping.yaml',
+            '--filterarch', 'Q1_A1', '--filterwli', 'rn50_b1',
+        ]
+        if ignore_lut:
+            argv.append('--ignore-lut')
+        if hybrid_curve:
+            argv.append('--operator-lookup-hybrid-curve')
+        return polaris.setup_cmdline_args(argv)
+    return polaris.runcfgmodel.PolarisRunConfig(
+        title='ignore_lut test', odir=str(tmp_path), study='dummy',
+        wlspec='config/mlperf_inference.yaml', archspec='config/all_archs.yaml',
+        wlmapspec='config/wl2archmapping.yaml', filterarch='Q1_A1', filterwli='rn50_b1',
+        ignore_lut=ignore_lut, operator_lookup_hybrid_curve=hybrid_curve,
+    )
+
+
+def _capture_devspec(monkeypatch):
+    """Stub the execution stage and return a dict that receives the devspec polaris() passes to it."""
+    seen = {}
+
+    def fake_execute_wl_on_dev(workload_list, device_list, wlspec, devspec, *a, **kw):
+        seen['devspec'] = devspec
+        return 0, []
+
+    monkeypatch.setattr(polaris, 'create_uniq_workloads_tbl', lambda wl_list: {})
+    monkeypatch.setattr(polaris, 'execute_wl_on_dev', fake_execute_wl_on_dev)
+    return seen
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('source', ['namespace', 'runconfig'])
+def test_polaris_ignore_lut_sets_every_device(reset_typespec, monkeypatch, tmp_path, source):
+    seen = _capture_devspec(monkeypatch)
+    assert polaris.polaris(_polaris_args(source, tmp_path, ignore_lut=True)) == 0
+    devspec = seen['devspec']
+    assert len(devspec) > 1, "test needs several devices to show every entry is set, not just one"
+    assert all(d.ignore_lut is True for d in devspec.values()), \
+        {name: d.ignore_lut for name, d in devspec.items()}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('source', ['namespace', 'runconfig'])
+def test_polaris_without_ignore_lut_leaves_devices_unchanged(reset_typespec, monkeypatch, tmp_path, source):
+    seen = _capture_devspec(monkeypatch)
+    assert polaris.polaris(_polaris_args(source, tmp_path, ignore_lut=False)) == 0
+    assert all(d.ignore_lut is False for d in seen['devspec'].values())
+
+
+@pytest.mark.unit
+def test_polaris_main_ignore_lut_flag_reaches_devices(reset_typespec, monkeypatch, tmp_path):
+    """Same check through main(), i.e. the real command-line entry point."""
+    seen = _capture_devspec(monkeypatch)
+    rc = polaris.main([
+        '--odir', str(tmp_path), '--study', 'dummy',
+        '--wlspec', 'config/mlperf_inference.yaml',
+        '--archspec', 'config/all_archs.yaml',
+        '--wlmapspec', 'config/wl2archmapping.yaml',
+        '--filterarch', 'Q1_A1', '--filterwli', 'rn50_b1',
+        '--ignore-lut',
+    ])
+    assert rc == 0
+    assert all(d.ignore_lut is True for d in seen['devspec'].values())
+
+
+@pytest.mark.unit
+def test_polaris_warns_when_hybrid_curve_given_with_ignore_lut(reset_typespec, monkeypatch, tmp_path):
+    _capture_devspec(monkeypatch)
+    # polaris() calls setup_logger(), which removes every loguru sink, so patch the WARNING hook instead.
+    messages = []
+    monkeypatch.setattr(polaris, 'WARNING', lambda msg, *a, **kw: messages.append(str(msg)))
+    polaris.polaris(_polaris_args('namespace', tmp_path, ignore_lut=True, hybrid_curve=True))
+    assert any('--operator-lookup-hybrid-curve has no effect' in m for m in messages), messages
+
+
+@pytest.mark.unit
+def test_polaris_no_hybrid_curve_warning_without_ignore_lut(reset_typespec, monkeypatch, tmp_path):
+    # Separate test: polaris() sets the WL2ArchTypeSpec singleton, so it can run once per test.
+    _capture_devspec(monkeypatch)
+    messages = []
+    monkeypatch.setattr(polaris, 'WARNING', lambda msg, *a, **kw: messages.append(str(msg)))
+    polaris.polaris(_polaris_args('namespace', tmp_path, ignore_lut=False, hybrid_curve=True))
+    assert not any('has no effect' in m for m in messages), messages
+
+
 def _run_polaris_cli(extra_args, tmp_path):
     """Invoke polaris.py as a subprocess and return the CompletedProcess."""
     repo_root = Path(polaris.__file__).parent

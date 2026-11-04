@@ -311,6 +311,16 @@ def setup_cmdline_args(argv: list[str] | None = None) -> argparse.Namespace:
             'benefit from analytical fusion. Use --disable-fusion only to debug fusion itself.'
         ),
     )
+    parser.add_argument(
+        '--ignore-lut',
+        dest='ignore_lut',
+        action='store_true',
+        default=False,
+        help=(
+            'Do not load the operator perf LUT named in the arch config; every op uses the analytical model. '
+            'Overrides --operator-lookup-hybrid-curve, which has no effect when no LUT is loaded.'
+        ),
+    )
 
     #cmdline args processing
     args = parser.parse_args(argv)
@@ -526,6 +536,14 @@ def polaris(args: argparse.Namespace | runcfgmodel.PolarisRunConfig) -> int:
             profiler.dump_stats("polaris_cprofile_stats.prof")
         return 1
     wlmapspec = get_wlmapspec_from_yaml(args.wlmapspec)
+
+    # --ignore-lut rides on the device config (read by Device as simcfg_obj.ignore_lut), the same
+    # way operator_lookup_file is; it is not a separate argument to execute_wl_on_dev / Device().
+    if bool(getattr(args, 'ignore_lut', False)):
+        for _dev in devspec.values():
+            _dev.ignore_lut = True
+        if args.operator_lookup_hybrid_curve:
+            WARNING('--operator-lookup-hybrid-curve has no effect with --ignore-lut: no operator LUT is loaded')
 
     if args.datatype is not None:
         # set the data type for the simulation

@@ -217,3 +217,72 @@ def test_get_exec_stats_lut_validation_error_propagates():
 
     with pytest.raises(OperatorPerfLUTValidationError, match="bad row"):
         device.get_exec_stats(graph, bs=1)
+
+
+# --- ignore_lut gate in Device.__init__ -------------------------------------------------
+# A run with ignore_lut set must never load the LUT: if the gate is reordered, measured times
+# would silently be reported as analytical estimates, with no error.
+
+_IGNORE_LUT_UNSET = object()
+
+
+def _lookup_cfg(lookup_file, ignore_lut=_IGNORE_LUT_UNSET):
+    cfg = MockSimConfigWithPeakIpc()
+    cfg.operator_lookup_file = lookup_file
+    if ignore_lut is not _IGNORE_LUT_UNSET:
+        cfg.ignore_lut = ignore_lut
+    return cfg
+
+
+@pytest.mark.unit
+def test_ignore_lut_true_does_not_resolve_lfc_path(monkeypatch):
+    resolve = Mock(return_value=None)
+    monkeypatch.setattr("ttsim.back.device.resolve_lfc_path", resolve)
+    device = Device(_lookup_cfg("lfc://hlm-lut/some_lut.yaml", ignore_lut=True))
+    assert resolve.call_count == 0
+    assert device.operator_perf_map is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("ignore_lut", [False, _IGNORE_LUT_UNSET], ids=["false", "attribute_missing"])
+def test_ignore_lut_false_or_missing_still_resolves_lfc_path(monkeypatch, ignore_lut):
+    resolve = Mock(return_value=None)
+    monkeypatch.setattr("ttsim.back.device.resolve_lfc_path", resolve)
+    Device(_lookup_cfg("lfc://hlm-lut/some_lut.yaml", ignore_lut=ignore_lut))
+    assert resolve.call_count == 1
+    resolve.assert_called_once_with("lfc://hlm-lut/some_lut.yaml")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "ignore_lut, expect_loaded",
+    [(True, False), (False, True), (_IGNORE_LUT_UNSET, True)],
+    ids=["true", "false", "attribute_missing"],
+)
+def test_ignore_lut_gates_local_lookup_file(monkeypatch, tmp_path, ignore_lut, expect_loaded):
+    """Same gate for a plain (non-lfc) path: the LUT file is opened only when ignore_lut is not set."""
+    (tmp_path / "lut.yaml").write_text("{}\n")
+    monkeypatch.chdir(tmp_path)
+    sentinel = object()
+    perf_map_cls = Mock(return_value=sentinel)
+    monkeypatch.setattr("tools.perf_lookup.lookup_operator_perf.OperatorPerfMap", perf_map_cls)
+
+    device = Device(_lookup_cfg("lut.yaml", ignore_lut=ignore_lut))
+
+    if expect_loaded:
+        assert perf_map_cls.call_count == 1
+        assert device.operator_perf_map is sentinel
+    else:
+        assert perf_map_cls.call_count == 0
+        assert device.operator_perf_map is None
+
+
+@pytest.mark.unit
+def test_ignore_lut_true_logs_lookup_disabled(monkeypatch):
+    # Patch the module's logger rather than adding a loguru sink: other tests call
+    # logger.disable("ttsim") (e.g. test_sigmoid.py), which silences ttsim.* sinks process-wide.
+    fake_logger = Mock()
+    monkeypatch.setattr("ttsim.back.device.logger", fake_logger)
+    Device(_lookup_cfg(None, ignore_lut=True))
+    logged = [str(c.args[0]) for c in fake_logger.info.call_args_list if c.args]
+    assert any("lookup disabled" in m for m in logged), logged
