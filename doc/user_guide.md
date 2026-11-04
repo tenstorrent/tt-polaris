@@ -67,6 +67,19 @@ python polaris.py [options] --archspec <arch_config> --wlspec <workload_spec> --
   TT-Polaris automatically clears the `fused_in_optimization` flag on any fused op that receives a
   LUT hit, so it keeps its real hardware timing. Ops without LUT entries continue to benefit from
   analytical fusion. Use `--disable-fusion` only to debug fusion behaviour itself.
+- `--ignore-lut`: Do not load the operator perf LUT named in the arch config (`operator_lookup_file`);
+  every op uses the analytical model. Useful for evaluating changes to the analytical model, since LUT
+  hits otherwise replace the analytical time with the hardware-measured one. `--operator-lookup-hybrid-curve`
+  has no effect when this flag is set (polaris logs a warning if both are given). There are two other ways
+  to set it:
+  - `ignore_lut: true` on a package instance in the arch YAML (applies to that device only).
+  - `ignore_lut: true` in a `polproj` run config (equivalent to passing `--ignore-lut`).
+
+  With the flag set, every row of the opstats CSV has `uses_perf_lookup = False` and an empty
+  `lut_hit_source`. That is the same result as a device with no `operator_lookup_file`. It differs from
+  `lut_hit_source = analytical`, which means the LUT *was* loaded but had no matching entry for that op.
+  `CONFIG/<dev>.json` in the study output directory shows which case applied (`ignore_lut` and
+  `operator_lookup_file` of the device).
 
 **LUT timing and the analytical guardband:** LUT-sourced timing is **not** subject to the 25%
 analytical guardband (`G_GUARDBAND`) that TT-Polaris applies to estimated op durations. When a LUT

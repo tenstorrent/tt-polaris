@@ -17,6 +17,9 @@ Usage::
 
     python tools/profiling/run_projections_and_compare.py --run-tag my_run
 
+    # Evaluate the analytical model: skip the operator perf LUT (TT-Polaris --ignore-lut)
+    python tools/profiling/run_projections_and_compare.py --run-tag my_run_nolut --ignore-lut
+
 Outputs (under ``__output/<run-tag>/``):
   - ``<combo>/STATS/...-opstats.csv``       (TT-Polaris)
   - ``<combo>/STATS/...-opstats.complete``  (written by this tool once TT-Polaris has finished)
@@ -230,8 +233,13 @@ def reusable_opstats(artifacts: tuple[bool, bool]) -> bool:
     return csv_there and marker_there
 
 
-def run_polaris(combo: Combo, run_tag: str, timeout_s: int = _DEFAULT_TIMEOUT_S) -> Path:
-    """Run polaris.py for this combo. Returns the opstats CSV path."""
+def run_polaris(combo: Combo, run_tag: str, timeout_s: int = _DEFAULT_TIMEOUT_S,
+                *, ignore_lut: bool = False) -> Path:
+    """Run polaris.py for this combo. Returns the opstats CSV path.
+
+    ``ignore_lut`` forwards ``--ignore-lut``: the arch config's operator perf LUT is not loaded and
+    every op is timed by the analytical model.
+    """
     study = f'{run_tag}/{combo.label}'
     cmd = [
         sys.executable, 'polaris.py',
@@ -244,6 +252,8 @@ def run_polaris(combo: Combo, run_tag: str, timeout_s: int = _DEFAULT_TIMEOUT_S)
         '-o', '__output/',
         '--dump_stats_csv',
     ]
+    if ignore_lut:
+        cmd.append('--ignore-lut')
     # No --datatype on purpose. It sets op_data_type_spec.global_type, which set_precision writes
     # onto every op as op.precision -- but the LUT keys these comparisons depend on are read from
     # tensor state: shape_canonical.tensor_datatype() checks _hw_dtype, then _ttnn_dtype, then
@@ -677,6 +687,11 @@ def main() -> int:
                         help=f'Ceiling for each TT-Polaris and compare_layers subprocess '
                              f'(default {_DEFAULT_TIMEOUT_S}). A cell that exceeds it is '
                              f'recorded like any other failed combo and the matrix continues.')
+    parser.add_argument('--ignore-lut', action='store_true',
+                        help='Pass --ignore-lut to TT-Polaris: do not load the operator perf LUT, so '
+                             'every op uses the analytical model. Only affects combos that are '
+                             'simulated; an opstats CSV reused via --skip-polaris is left as it was '
+                             'produced.')
     parser.add_argument('--only', metavar='COMBO_LABEL', action='append',
                         help='Run only the named combo(s) (default: all of them). Repeatable.')
     parser.add_argument('--list', action='store_true', help='List available combo labels and exit')
@@ -691,6 +706,12 @@ def main() -> int:
 
     if not args.run_tag:
         parser.error('--run-tag is required (unless using --list)')
+
+    if args.ignore_lut and args.skip_polaris:
+        # A reused CSV is not re-simulated, so it keeps whatever LUT setting its own run used.
+        print('NOTE: --ignore-lut only applies to combos that are simulated; opstats CSVs reused '
+              'via --skip-polaris keep the LUT setting of the run that produced them.',
+              file=sys.stderr)
 
     # Reject unknown labels rather than filtering them away: a silently-dropped typo would not be
     # counted in n_requested, so it could not turn the exit status nonzero and would leave a
@@ -817,7 +838,8 @@ def main() -> int:
                     print(f'  NOTE: --skip-polaris given but no completed opstats to reuse '
                           f'({reason}); simulating anyway', file=sys.stderr)
                 print(f'  running TT-Polaris (study={args.run_tag}/{combo.label})...', flush=True)
-                opstats = run_polaris(combo, args.run_tag, args.timeout_per_combo)
+                opstats = run_polaris(combo, args.run_tag, args.timeout_per_combo,
+                                      ignore_lut=args.ignore_lut)
                 print(f'  opstats: {opstats.relative_to(REPO_ROOT)}')
             print('  running compare_layers...', flush=True)
             xlsx, compare_log = run_compare(combo, args.run_tag, opstats, refrun,

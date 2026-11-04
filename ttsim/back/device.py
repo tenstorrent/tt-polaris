@@ -134,7 +134,11 @@ class Device:
             _hybrid_curve = bool(getattr(simcfg_obj, "operator_lookup_hybrid_curve", False))
         else:
             _hybrid_curve = bool(operator_lookup_hybrid_curve)
-        if hasattr(simcfg_obj, 'operator_lookup_file') and simcfg_obj.operator_lookup_file:
+        # ignore_lut travels on the device config (set by polaris --ignore-lut or in the arch YAML)
+        ignore_lut = bool(getattr(simcfg_obj, 'ignore_lut', False))
+        if ignore_lut:
+            logger.info("Operator performance lookup disabled (--ignore-lut=True); using the analytical model for all ops")
+        elif hasattr(simcfg_obj, 'operator_lookup_file') and simcfg_obj.operator_lookup_file:
             lookup_file = simcfg_obj.operator_lookup_file
             if lookup_file.startswith('lfc://'):
                 try:
