@@ -68,7 +68,7 @@ If a future capture is trace+replay **and** iterative (a step that itself contai
 
 | Flag | Required | Default | Meaning |
 |------|----------|---------|---------|
-| `--input-dir` | yes | — | Root directory; recursively discovers exactly three `ops_perf_results_*.csv` files (falls back to `*.csv`). |
+| `--input-dir` | yes | — | Root directory; recursively discovers exactly three `ops_perf_results_*.csv` files, or two with `--allow-missing-noctrace` (falls back to `*.csv`). |
 | `--dram-peak-bw-gbps` | yes | — | Peak DRAM bandwidth in **GB/s** (MemTraffic). |
 | `--output` | no | `<input-dir>/merged_ops.csv` | Output CSV path. |
 | `--duration-rel-tol` | no | `0.05` | Relative tolerance for fpu vs vanilla `DEVICE KERNEL DURATION [ns]`. |
@@ -78,9 +78,10 @@ If a future capture is trace+replay **and** iterative (a step that itself contai
 | `--ops-per-iteration` | no | — | Forwarded to the composed iteration reducer (trace+replay+iterative only). |
 | `--measured-iteration-indices` | no | — | Forwarded to the composed iteration reducer (trace+replay+iterative only). |
 | `--select-iteration` | no | `median` | Forwarded to the composed iteration reducer (trace+replay+iterative only). |
+| `--allow-missing-noctrace` | no | off | Accept a vanilla CSV and an fpu CSV without the noctrace CSV. The output omits the noctrace-only columns (see the iterative spec's *Missing noctrace CSV* section). The step is selected on the vanilla CSV as usual. |
 
 ## Shared behavior (unchanged from the iterative tool)
 
-Classification (noctrace / fpu / vanilla), header subsequence/omission rules, join keys and sorting, per-row and aggregate duration checks, MemTraffic derivation, and the full output column order are exactly as specified in [`SPEC_ops_perf_three_csv_merge.md`](SPEC_ops_perf_three_csv_merge.md). The reduction runs **after** classification/header validation and **before** the join, so the join always receives one unique-keyed row set per variant.
+Classification (noctrace / fpu / vanilla), header subsequence/omission rules, join keys and sorting, per-row and aggregate duration checks, MemTraffic derivation, the full output column order, and the missing-noctrace behavior are exactly as specified in [`SPEC_ops_perf_three_csv_merge.md`](SPEC_ops_perf_three_csv_merge.md). The reduction runs **after** classification/header validation and **before** the join, so the join always receives one unique-keyed row set per variant.
 
 **Signpost-row filtering** (see the iterative spec's *Input row filtering* section) is likewise inherited: `signpost` marker rows are dropped in the shared `run_merge` immediately after each CSV is read — **before** classification and the step reduction — so a trace+replay capture whose passes are wrapped in Tracy `start`/`stop` signposts is handled identically to an iterative one.

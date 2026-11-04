@@ -279,11 +279,11 @@ class TTSimHLWlDevRunOpCSVPerfStats(BaseModel, extra='forbid'):
     mem_wr_util: float = Field(
         description = 'Memory write utilization fraction; 0 when uses_perf_lookup (not derived with LUT timing); else analytical'
     )
-    memory_traffic: float = Field(
-        description = 'Bytes of memory traffic from tt-perf master lookup when uses_perf_lookup; else 0'
+    memory_traffic: Optional[float] = Field(
+        description = 'Bytes of memory traffic from tt-perf master lookup when uses_perf_lookup; None (not measured) on a LUT miss or a hit on a time-only LUT entry; 0 for a removed or fused op'
     )
-    mem_util: float = Field(
-        description = 'DRAM utilization as fraction 0–1 from tt-perf master (LUT percent/100) when present and uses_perf_lookup; else 0'
+    mem_util: Optional[float] = Field(
+        description = 'DRAM utilization as fraction 0–1 from tt-perf master (LUT percent/100) when uses_perf_lookup; None (not measured) on a LUT miss or a hit on a time-only LUT entry; 0 for a removed or fused op'
     )
     uses_perf_lookup: bool = Field(
         description = 'True when timing and pipe util were obtained from operator performance master lookup (matrix/vector util required in LUT row)'
@@ -299,6 +299,10 @@ class TTSimHLWlDevRunOpCSVPerfStats(BaseModel, extra='forbid'):
     lut_hit_source: Optional[str] = Field(
         default = None,
         description = 'Which lookup path produced the hit: "direct", one of the fallback names (e.g. "halo_height_to_block", "its_l1_to_dram", "move_arity_dup"), or "analytical" when a LUT is configured but no entry matched (LUT miss). None only when no LUT is configured for this device. See MasterPerfStats.hit_source for full enum.'
+    )
+    lut_stats_coverage: Optional[str] = Field(
+        default = None,
+        description = 'Coverage of the LUT entry behind a hit: "full", or "time_only" when the entry has no NOC-trace stats (memory_traffic and mem_util are then None). None when the op is not a LUT hit.'
     )
 
 # Option 2 - Structured Stats
@@ -348,8 +352,8 @@ class TTSimHLWlDevRunOperatorPerfStats(BaseModel, extra='forbid'):
     vector_pipe_util: float
     mem_rd_util: float
     mem_wr_util: float
-    memory_traffic: float
-    mem_util: float
+    memory_traffic: Optional[float]
+    mem_util: Optional[float]
     uses_perf_lookup: bool
     # Literal / resolved LUT key.  See TTSimHLWlDevRunOpCSVPerfStats for full semantics.
     # ``lut_key`` is the tuple built from this op + tensor state (pre-fallback) —
@@ -361,6 +365,8 @@ class TTSimHLWlDevRunOperatorPerfStats(BaseModel, extra='forbid'):
     lut_key: Optional[str] = None
     lut_key_resolved: Optional[str] = None
     lut_hit_source: Optional[str] = None
+    # "full" / "time_only" on a LUT hit, else None. See TTSimHLWlDevRunOpCSVPerfStats.
+    lut_stats_coverage: Optional[str] = None
 
 class TTSimHLWlDevRunPerfStats(BaseModel, extra='forbid'):
     """

@@ -6,13 +6,16 @@
 from __future__ import annotations
 
 import math
+import sys
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pytest
 import yaml
+from loguru import logger
 
+from tools.perf_lookup import tt_perf_mapper
 from tools.perf_lookup.tt_perf_master_loader import load_existing_yaml
 from tools.perf_lookup.tt_perf_master_schema import (
     KEY_TUPLE_YAML_KEYS,
@@ -28,6 +31,12 @@ from tools.perf_lookup.tt_perf_master_schema import (
     MASTER_HYBRID_SINGLE_KEY,
     MASTER_SINGLE_NUM_CORES_KEY,
     MASTER_SINGLE_STAT_KEYS,
+    MASTER_NOCTRACE_STAT_KEYS,
+    MASTER_STATS_COVERAGE_FULL,
+    MASTER_STATS_COVERAGE_KEY,
+    MASTER_STATS_COVERAGE_TIME_ONLY,
+    MASTER_TIME_ONLY_STAT_KEYS,
+    MASTER_YAML_COVERAGE_KEY,
     MASTER_YAML_ENTRIES_KEY,
     MASTER_YAML_ENTRY_VALUE_FIELD,
     MASTER_YAML_RECORD_KEY_FIELD,
@@ -39,6 +48,9 @@ from tools.perf_lookup.tt_perf_master_schema import (
     labeled_key_map_to_tuple,
     normalize_flat_single_payload,
     tuple_to_labeled_key_map,
+    entry_stats_coverage,
+    master_coverage_counts,
+    payload_stats_coverage,
     yaml_labeled_key_to_tuple,
 )
 from tools.profiling.op_canonical import normalize_profiler_opcode
@@ -51,10 +63,12 @@ from tools.perf_lookup.tt_perf_mapper import (
     EXCEL_COL_SFPU,
     EXCEL_DURATION_COLUMN,
     KEY_TUPLE_COLUMN_NAMES,
+    InputTable,
     POLARIS_LAYER_MATMUL,
     STATS_COLUMN_OPTIONAL,
     STATS_COLUMNS_REQUIRED,
     build_key_tuple,
+    build_master_dict,
     build_stats_row,
     canonicalize_master_for_write,
     format_dry_run_report,
@@ -64,6 +78,7 @@ from tools.perf_lookup.tt_perf_mapper import (
     merge_entry_for_key,
     merge_master,
     serialize_master_for_yaml,
+    validate_columns,
 )
 
 _STAT_COLS_WITH_OPTIONAL = [*STATS_COLUMNS_REQUIRED, STATS_COLUMN_OPTIONAL]
@@ -735,3 +750,267 @@ def test_unary_device_operation_gelu_from_op_chain_attributes():
         "'output_dtype': 'DataType::BFLOAT16'}"
     )
     assert normalize_profiler_opcode("UnaryDeviceOperation", attr) == "gelu"
+
+
+# ---------------------------------------------------------------------------
+# Time-only entries (stats_coverage: time_only): no NOC-trace stats
+# ---------------------------------------------------------------------------
+
+
+def _time_only_single(num_cores=1, msecs=1.0):
+    return {
+        MASTER_ENTRY_TYPE_KEY: MASTER_ENTRY_TYPE_SINGLE,
+        MASTER_SINGLE_NUM_CORES_KEY: num_cores,
+        **{k: msecs if k == MASTER_DURATION_MS_KEY else 5.0 for k in MASTER_TIME_ONLY_STAT_KEYS},
+        MASTER_STATS_COVERAGE_KEY: MASTER_STATS_COVERAGE_TIME_ONLY,
+    }
+
+
+def _full_single(num_cores=1, msecs=2.0):
+    return {
+        MASTER_ENTRY_TYPE_KEY: MASTER_ENTRY_TYPE_SINGLE,
+        MASTER_SINGLE_NUM_CORES_KEY: num_cores,
+        **_single_stats_payload(),
+        MASTER_DURATION_MS_KEY: msecs,
+    }
+
+
+def _key9(op="add"):
+    return (op,) + tuple(f"t{i}" for i in range(8))
+
+
+def _write_master(tmp_path: Path, master: dict) -> Path:
+    p = tmp_path / "m.yaml"
+    p.write_text(yaml.safe_dump(serialize_master_for_yaml(master), sort_keys=False))
+    return p
+
+
+def _time_only_table(extra_cols=()):
+    cols = [*KEY_TUPLE_COLUMN_NAMES, "CORE COUNT", EXCEL_DURATION_COLUMN, EXCEL_COL_FPU, EXCEL_COL_SFPU, *extra_cols]
+    return InputTable(columns=cols, rows=[])
+
+
+def test_noctrace_and_time_only_stat_keys_partition_the_stat_keys():
+    assert set(MASTER_NOCTRACE_STAT_KEYS) | set(MASTER_TIME_ONLY_STAT_KEYS) == set(MASTER_SINGLE_STAT_KEYS)
+    assert not set(MASTER_NOCTRACE_STAT_KEYS) & set(MASTER_TIME_ONLY_STAT_KEYS)
+
+
+def test_validate_columns_without_noctrace_columns_is_time_only():
+    _, _, _, required, stat_cols = validate_columns(_time_only_table(), allow_missing_noctrace=True)
+    assert required == [EXCEL_DURATION_COLUMN]
+    assert stat_cols == [EXCEL_DURATION_COLUMN]
+
+
+def test_validate_columns_without_noctrace_columns_requires_the_flag():
+    # Time-only mode is opt-in: without the flag a NOC-less input is an error, as before v6.
+    with pytest.raises(KeyError, match="Stats columns missing.*--allow-missing-noctrace"):
+        validate_columns(_time_only_table())
+
+
+@pytest.mark.parametrize(
+    "present, missing",
+    [((EXCEL_COL_FPU,), [EXCEL_COL_SFPU]), ((EXCEL_COL_SFPU,), [EXCEL_COL_FPU]), ((), [EXCEL_COL_SFPU, EXCEL_COL_FPU])],
+    ids=["no-sfpu", "no-fpu", "neither"],
+)
+def test_validate_columns_time_only_requires_fpu_and_sfpu_columns(present, missing):
+    # A time-only entry records the pipe utilizations as measured, so they must not default to 0.
+    cols = [*KEY_TUPLE_COLUMN_NAMES, "CORE COUNT", EXCEL_DURATION_COLUMN, *present]
+    with pytest.raises(KeyError, match="Stats columns missing") as exc:
+        validate_columns(InputTable(columns=cols, rows=[]), allow_missing_noctrace=True)
+    assert all(c in str(exc.value) for c in missing)
+
+
+def test_validate_columns_with_partial_noctrace_columns_still_raises():
+    with pytest.raises(KeyError, match="Stats columns missing"):
+        validate_columns(_time_only_table(extra_cols=(EXCEL_COL_DRAM_BW_UTIL,)))
+
+
+@pytest.mark.parametrize("allow", [False, True], ids=["no-flag", "flag"])
+def test_process_excel_to_master_time_only_gate(tmp_path: Path, allow: bool):
+    # The CLI flag must reach validate_columns: without it a NOC-less CSV fails at column
+    # validation (exit 2); with it, validation passes and the empty table exits 1.
+    p = tmp_path / "merged.csv"
+    p.write_text(",".join(_time_only_table().columns) + "\n")
+    code, _, _, _ = tt_perf_mapper.process_excel_to_master(str(p), "single", 1.0, allow_missing_noctrace=allow)
+    assert code == (1 if allow else 2)
+
+
+def test_build_stats_row_time_only_omits_noctrace_stats():
+    row = {EXCEL_DURATION_COLUMN: 2_000_000.0, EXCEL_COL_SFPU: 1.0, EXCEL_COL_FPU: 7.0}
+    out = build_stats_row(row, 100.0, [EXCEL_DURATION_COLUMN], EXCEL_DURATION_COLUMN, "CORE COUNT", time_only=True)
+    assert out is not None
+    assert list(out) == list(MASTER_TIME_ONLY_STAT_KEYS)
+    assert out[MASTER_DURATION_MS_KEY] == 2.0
+
+
+def test_build_master_dict_marks_time_only_single_and_curve():
+    stats = {MASTER_DURATION_MS_KEY: 1.0, "vector_pipe_util": 2.0, "matrix_pipe_util": 3.0}
+    single, _ = build_master_dict([(_key9(), 4.0, stats, "add", [stats])], "single")
+    assert single[_key9()][MASTER_STATS_COVERAGE_KEY] == MASTER_STATS_COVERAGE_TIME_ONLY
+    mm = _key9(POLARIS_LAYER_MATMUL)
+    accepted = [(mm, float(c), {**stats, MASTER_DURATION_MS_KEY: float(c)}, POLARIS_LAYER_MATMUL, []) for c in (4, 8)]
+    curve, _ = build_master_dict(accepted, "curve")
+    assert curve[mm][MASTER_STATS_COVERAGE_KEY] == MASTER_STATS_COVERAGE_TIME_ONLY
+    assert not set(curve[mm]) & set(MASTER_NOCTRACE_STAT_KEYS)
+
+
+def test_build_master_dict_full_entries_carry_no_marker():
+    stats = dict(_single_stats_payload())
+    single, _ = build_master_dict([(_key9(), 4.0, stats, "add", [stats])], "single")
+    assert MASTER_STATS_COVERAGE_KEY not in single[_key9()]
+
+
+def test_load_time_only_single_round_trip(tmp_path: Path):
+    m = load_existing_yaml(_write_master(tmp_path, {_key9(): _time_only_single()}))
+    assert payload_stats_coverage(m[_key9()]) == MASTER_STATS_COVERAGE_TIME_ONLY
+    assert not set(m[_key9()]) & set(MASTER_NOCTRACE_STAT_KEYS)
+
+
+def test_loader_does_not_warn_on_stats_coverage_key(tmp_path: Path):
+    p = _write_master(tmp_path, {_key9(): _time_only_single()})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        load_existing_yaml(p)
+
+
+@pytest.mark.parametrize("noc_key", MASTER_NOCTRACE_STAT_KEYS)
+def test_loader_rejects_time_only_single_with_noctrace_stat(tmp_path: Path, noc_key):
+    val = {**_time_only_single(), noc_key: 0.0}
+    with pytest.raises(ValueError, match="must not carry NOC-trace stats"):
+        load_existing_yaml(_write_master(tmp_path, {_key9(): val}))
+
+
+def test_loader_rejects_full_single_missing_noctrace_stat(tmp_path: Path):
+    val = _full_single()
+    del val["mem_util"]
+    with pytest.raises(ValueError, match="missing keys"):
+        load_existing_yaml(_write_master(tmp_path, {_key9(): val}))
+
+
+def test_loader_rejects_unknown_stats_coverage(tmp_path: Path):
+    val = {**_time_only_single(), MASTER_STATS_COVERAGE_KEY: "partial"}
+    with pytest.raises(ValueError, match="must be one of"):
+        load_existing_yaml(_write_master(tmp_path, {_key9(): val}))
+
+
+def test_loader_rejects_time_only_curve_with_noctrace_fit(tmp_path: Path):
+    curve = {
+        MASTER_ENTRY_TYPE_KEY: MASTER_ENTRY_TYPE_CURVE,
+        MASTER_CURVE_FAMILY_KEY: MASTER_CURVE_FAMILY_LINEAR,
+        MASTER_DURATION_MS_KEY: _curve_stat(),
+        "memory_traffic": _curve_stat(),
+        MASTER_STATS_COVERAGE_KEY: MASTER_STATS_COVERAGE_TIME_ONLY,
+    }
+    with pytest.raises(ValueError, match="must not carry NOC-trace stat fits"):
+        load_existing_yaml(_write_master(tmp_path, {_key9("mul"): curve}))
+
+
+def test_serialize_writes_coverage_block_matching_entries():
+    master = {_key9("add"): _full_single(), _key9("mul"): _time_only_single()}
+    doc = serialize_master_for_yaml(master)
+    assert doc[MASTER_YAML_COVERAGE_KEY] == {MASTER_STATS_COVERAGE_FULL: 1, MASTER_STATS_COVERAGE_TIME_ONLY: 1}
+    assert doc[MASTER_YAML_COVERAGE_KEY] == master_coverage_counts(master)
+
+
+def test_loader_rejects_coverage_block_that_disagrees_with_entries(tmp_path: Path):
+    doc = serialize_master_for_yaml({_key9(): _time_only_single()})
+    doc[MASTER_YAML_COVERAGE_KEY] = {MASTER_STATS_COVERAGE_FULL: 1, MASTER_STATS_COVERAGE_TIME_ONLY: 0}
+    p = tmp_path / "m.yaml"
+    p.write_text(yaml.safe_dump(doc, sort_keys=False))
+    with pytest.raises(ValueError, match="coverage"):
+        load_existing_yaml(p)
+
+
+def test_entry_stats_coverage_hybrid_is_time_only_if_any_payload_is():
+    hybrid = {
+        MASTER_ENTRY_TYPE_KEY: MASTER_ENTRY_TYPE_HYBRID,
+        MASTER_HYBRID_SINGLE_KEY: {k: v for k, v in _time_only_single().items() if k != MASTER_ENTRY_TYPE_KEY},
+    }
+    assert entry_stats_coverage(hybrid) == MASTER_STATS_COVERAGE_TIME_ONLY
+    assert entry_stats_coverage(_full_single()) == MASTER_STATS_COVERAGE_FULL
+
+
+def test_merge_time_only_does_not_replace_full():
+    full, time_only = _full_single(), _time_only_single()
+    assert merge_entry_for_key(_key9(), full, time_only) == full
+
+
+def test_merge_full_replaces_time_only():
+    full, time_only = _full_single(), _time_only_single()
+    assert merge_entry_for_key(_key9(), time_only, full) == full
+
+
+def test_merge_hybrid_time_only_single_does_not_replace_full_single():
+    mm = _key9(POLARIS_LAYER_MATMUL)
+    merged = merge_entry_for_key(mm, _full_single(num_cores=2), _time_only_single(num_cores=2))
+    assert payload_stats_coverage(merged[MASTER_HYBRID_SINGLE_KEY]) == MASTER_STATS_COVERAGE_FULL
+    assert set(MASTER_NOCTRACE_STAT_KEYS) <= set(merged[MASTER_HYBRID_SINGLE_KEY])
+
+
+def test_merge_hybrid_single_is_replaced_whole_not_field_merged():
+    # A full single replacing a time-only single must not inherit the old payload's marker.
+    mm = _key9(POLARIS_LAYER_MATMUL)
+    merged = merge_entry_for_key(mm, _time_only_single(num_cores=2), _full_single(num_cores=2))
+    assert MASTER_STATS_COVERAGE_KEY not in merged[MASTER_HYBRID_SINGLE_KEY]
+
+
+def _capture_warnings() -> tuple[list[str], int]:
+    msgs: list[str] = []
+    sink_id = logger.add(lambda m: msgs.append(str(m)), level="WARNING", format="{message}")
+    return msgs, sink_id
+
+
+def test_merge_master_retained_full_payload_is_not_reported_as_overwrite():
+    msgs, sink_id = _capture_warnings()
+    try:
+        full = _full_single()
+        merged = merge_master({_key9(): full}, {_key9(): _time_only_single()}, emit_overwrite_warning=True)
+    finally:
+        logger.remove(sink_id)
+    assert merged[_key9()] == full
+    assert not any("overwriting" in m for m in msgs)
+    assert sum("Keeping the existing full" in m for m in msgs) == 1
+
+
+def test_merge_master_real_change_is_reported_as_overwrite():
+    msgs, sink_id = _capture_warnings()
+    try:
+        merge_master({_key9(): _time_only_single()}, {_key9(): _full_single()}, emit_overwrite_warning=True)
+    finally:
+        logger.remove(sink_id)
+    assert sum("overwriting" in m for m in msgs) == 1
+
+
+def test_merge_hybrid_retained_full_single_equals_old_value():
+    # Dry-run accounting compares merged vs on-disk values; a retained hybrid must compare equal.
+    mm = _key9(POLARIS_LAYER_MATMUL)
+    old = canonicalize_master_for_write({mm: _full_single(num_cores=2)})[mm]
+    assert merge_entry_for_key(mm, old, _time_only_single(num_cores=2)) == old
+
+
+def test_mapper_dry_run_reports_retained_full_entries_as_unchanged(tmp_path: Path, monkeypatch):
+    k_keep, k_upd, k_new = _key9("add"), _key9("mul"), _key9("sub")
+    out = tmp_path / "m.yaml"
+    out.write_text(
+        yaml.safe_dump(
+            serialize_master_for_yaml({k_keep: _full_single(), k_upd: _time_only_single()}), sort_keys=False
+        )
+    )
+    run = {k_keep: _time_only_single(), k_upd: _full_single(), k_new: _full_single()}
+    monkeypatch.setattr(tt_perf_mapper, "process_excel_to_master", lambda *a, **kw: (0, run, {}, None))
+    monkeypatch.setattr(
+        sys, "argv", ["tt_perf_mapper.py", "--model-run", "x.xlsx", "--dram-bw-gbps", "1", "--output", str(out)]
+    )
+    msgs: list[str] = []
+    sink_id = logger.add(lambda m: msgs.append(str(m)), level="INFO", format="{message}")
+    try:
+        assert tt_perf_mapper.main() == 0
+    finally:
+        logger.remove(sink_id)
+    report = next(m for m in msgs if m.startswith("Dry run:"))
+    assert "Would add 1 entry." in report
+    assert "Would update 1 entry." in report
+    assert "Would leave 1 entry unchanged." in report
+    unchanged = report.split("unchanged.")[1]
+    assert str(tuple_to_labeled_key_map(k_keep)) in unchanged
+    assert str(tuple_to_labeled_key_map(k_upd)) not in unchanged
