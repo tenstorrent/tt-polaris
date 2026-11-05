@@ -23,6 +23,7 @@ from .tensor import (
 from .tensor import Layout, as_tensor, arange, stack, ShardStrategy, unsqueeze_to_4D, ReplicateTensorToMesh
 from .config import Conv2dConfig, WormholeComputeKernelConfig, init_device_compute_kernel_config
 from .config import MatmulMultiCoreReuseMultiCast1DProgramConfig
+from .config import BlackholeComputeKernelConfig, SDPAProgramConfig, PagedCacheGeometryOverride
 from .buffer import TensorMemoryLayout, ShardOrientation, BufferType, ShardSpec
 from .memory import MemoryConfig, create_sharded_memory_config_, get_memory_config
 from .types import TILE_HEIGHT, TILE_WIDTH

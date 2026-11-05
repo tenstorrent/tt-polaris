@@ -104,7 +104,8 @@ def test_model_inference_qwen(wlname: str, mesh_device: TTNNDevice, cfg: dict):
             current_pos_tensor,
             rot_mats=rot_mats,
             mode="decode",
-            page_table=None
+            page_table=None,
+            cur_pos=[current_pos_val] * batch_size,
         )
         # We catch the output, check if it's the broken Llama size,
         # slice it back to hidden dim, and manually project it to Qwen Vocab.

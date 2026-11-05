@@ -105,9 +105,27 @@ class ModelArgs:
         self.checkpoint_type = "simulation"
         self.WEIGHTS_DTYPE = ttnn.bfloat8_b
 
+    def sdpa_prefill_program_config(self, seq_len):
+        # tt-metal model_config SDPA_PROGCFG: 8x8 grid, accurate exp, 256-token chunks from 2k tokens up
+        chunk = 256 if seq_len >= 2048 else 64
+        return ttnn.SDPAProgramConfig(compute_with_storage_grid_size=ttnn.CoreCoord(8, 8),
+                                      q_chunk_size=chunk, k_chunk_size=chunk, exp_approx_mode=False)
+
+    def sdpa_decode_program_config(self):
+        # SDPA_DECODE_PROGCFG: chunk 0 lets the kernel size the chunk at run time, cur_pos + 1 in tiles
+        # rounded up to a power of two and capped at the DEST size (rt_args_common.hpp get_dynamic_Sk_chunk_t)
+        return ttnn.SDPAProgramConfig(compute_with_storage_grid_size=ttnn.CoreCoord(8, 8),
+                                      q_chunk_size=0, k_chunk_size=0, exp_approx_mode=False)
+
+    def get_model_config(self):
+        return {
+            "SDPA_PROGCFG": self.sdpa_prefill_program_config,
+            "SDPA_DECODE_PROGCFG": self.sdpa_decode_program_config(),
+        }
+
     def weight_cache_path(self, dtype):
         return None
-    
+
     def ccl_topology(self):
         return None
     

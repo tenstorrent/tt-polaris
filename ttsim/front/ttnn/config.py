@@ -48,6 +48,24 @@ class WormholeComputeKernelConfig:
 
 BlackholeComputeKernelConfig = WormholeComputeKernelConfig
 
+
+@dataclass
+class SDPAProgramConfig:
+    """Mirror of ttnn.SDPAProgramConfig. Field order follows the ttnn struct; a k_chunk_size of 0 on
+    the decode path means the kernel picks the chunk."""
+    compute_with_storage_grid_size : object            # CoreCoord or (x, y)
+    sub_core_grids                 : object = None     # CoreRangeSet, overrides the grid core count
+    q_chunk_size                   : int  = 32
+    k_chunk_size                   : int  = 32
+    exp_approx_mode                : bool | None = None
+    max_cores_per_head_batch       : int  = 16
+
+
+@dataclass
+class PagedCacheGeometryOverride:
+    block_size   : int = 0
+    num_kv_heads : int = 0
+
 #Compute Configs
 def init_device_compute_kernel_config(
         dev_arch,

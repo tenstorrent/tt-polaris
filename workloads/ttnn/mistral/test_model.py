@@ -94,7 +94,8 @@ def test_model_inference(wlname: str, mesh_device: TTNNDevice, cfg: dict):
             current_pos_tensor,
             rot_mats=rot_mats,
             mode="decode",
-            page_table=page_table_tt
+            page_table=page_table_tt,
+            cur_pos=[current_pos_val] * batch,
         )
 
         expected_shape = [1, batch, seqlen, model_args.vocab_size]

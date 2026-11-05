@@ -130,6 +130,7 @@ class Transformer():
         chunk_start_idx=None,
         get_last_token=-1,
         kv_cache=None,
+        cur_pos=None,
         ):
         for i, layer in enumerate(self.layers):
             x = layer(
@@ -142,6 +143,7 @@ class Transformer():
                 chunk_page_table=chunk_page_table,
                 chunk_start_idx=chunk_start_idx,
                 kv_cache=kv_cache[i] if kv_cache is not None else None,
+                cur_pos=cur_pos,
             )
 
         if mode == "prefill" and get_last_token == -1:
@@ -176,6 +178,7 @@ class Transformer():
         chunk_start_idx=None,
         get_last_token=-1,
         kv_cache=None,
+        cur_pos=None,
         ):
         return self.forward(
             x,
@@ -187,7 +190,8 @@ class Transformer():
             chunk_page_table=chunk_page_table,
             chunk_start_idx=chunk_start_idx,
             get_last_token=get_last_token,
-            kv_cache=kv_cache
+            kv_cache=kv_cache,
+            cur_pos=cur_pos,
         )
 
     def ttnn_prefill_forward(

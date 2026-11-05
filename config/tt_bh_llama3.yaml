@@ -68,6 +68,10 @@ packages:
             # Source: tt-metal/tt_metal/core_descriptors/blackhole_140_arch.yaml (end=[12, 9] inclusive → 13×10).
             # p100a has one column reserved → effective 12×10 = 120 cores (matches num_units below).
             compute_grid_size: [12, 10]
+            # Worker cores one op gets from tt-metal on this board: the tracy CORE COUNT of every
+            # whole-grid run in the SDPA campaign reads 110 (an 11 x 10 compute-with-storage grid),
+            # fewer than the 120 tensix above because a further column is reserved at runtime.
+            worker_core_count: 110
             ipgroups:
             -   ipname: tensix
                 iptype: compute

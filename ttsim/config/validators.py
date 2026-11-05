@@ -300,6 +300,10 @@ class TTSimHLWlDevRunOpCSVPerfStats(BaseModel, extra='forbid'):
         default = None,
         description = 'Which lookup path produced the hit: "direct", one of the fallback names (e.g. "halo_height_to_block", "its_l1_to_dram", "move_arity_dup"), or "analytical" when a LUT is configured but no entry matched (LUT miss). None only when no LUT is configured for this device. See MasterPerfStats.hit_source for full enum.'
     )
+    compute_is_lower_bound: bool = Field(
+        default = False,
+        description = 'True when compute_cycles is an SDPA roofline compute floor (lower bound), not a LUT-measured wall-clock; False for other ops and cleared on a LUT hit.'
+    )
 
 # Option 2 - Structured Stats
 
@@ -361,6 +365,9 @@ class TTSimHLWlDevRunOperatorPerfStats(BaseModel, extra='forbid'):
     lut_key: Optional[str] = None
     lut_key_resolved: Optional[str] = None
     lut_hit_source: Optional[str] = None
+    # True when compute_cycles is an SDPA roofline compute floor (lower bound), not a measured
+    # wall-clock; False for other ops and cleared on a LUT hit.
+    compute_is_lower_bound: bool = False
 
 class TTSimHLWlDevRunPerfStats(BaseModel, extra='forbid'):
     """

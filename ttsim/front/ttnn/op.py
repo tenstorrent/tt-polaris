@@ -753,43 +753,265 @@ def repeat(input_tensor, repeats):
     )
 
 
+def _sdpa_config_attrs(program_config, compute_kernel_config):
+    """Scalar attrs from an SDPA program config and compute kernel config, duck-typed so real ttnn
+    objects and the shim dataclasses both work. Fields that are missing go into sdpa_defaulted."""
+    a: dict = {}
+    defaulted: list = []
+    if program_config is not None:
+        a['q_chunk_size'] = int(program_config.q_chunk_size)
+        a['k_chunk_size'] = int(program_config.k_chunk_size)
+        scg = getattr(program_config, 'sub_core_grids', None)
+        if scg is not None and hasattr(scg, 'num_cores'):
+            a['num_cores'] = int(scg.num_cores())
+        else:
+            g = program_config.compute_with_storage_grid_size
+            gx, gy = (g.x, g.y) if hasattr(g, 'x') else (g[0], g[1])
+            a['num_cores'] = int(gx) * int(gy)
+        exp = getattr(program_config, 'exp_approx_mode', None)
+        if exp is None:
+            defaulted.append('exp_approx_mode')
+        else:
+            a['exp_approx_mode'] = bool(exp)
+        a['max_cores_per_head_batch'] = int(getattr(program_config, 'max_cores_per_head_batch', 16) or 16)
+    else:
+        defaulted += ['q_chunk_size', 'k_chunk_size', 'num_cores', 'exp_approx_mode']
+    mf = getattr(compute_kernel_config, 'math_fidelity', None)
+    if mf is None and isinstance(compute_kernel_config, MathFidelity):
+        mf = compute_kernel_config
+    if mf is not None:
+        a['fidelity'] = mf.name if hasattr(mf, 'name') else str(mf)
+        for f in ('fp32_dest_acc_en', 'packer_l1_acc', 'math_approx_mode'):
+            v = getattr(compute_kernel_config, f, None)
+            if v is None:
+                defaulted.append(f)
+            else:
+                a[f] = bool(v)
+    else:
+        defaulted += ['fidelity', 'fp32_dest_acc_en', 'packer_l1_acc', 'math_approx_mode']
+    a['sdpa_defaulted'] = ','.join(defaulted)
+    return a
+
+
+def _shard_cores(t):
+    """Core count of a sharded tensor's grid when the memory config carries one, else 0."""
+    mc = t.memory_config() if hasattr(t, 'memory_config') else None
+    spec = getattr(mc, 'shard_spec', None)
+    grid = getattr(spec, 'grid', None) if spec is not None else None
+    if grid is None:
+        return 0
+    if hasattr(grid, 'num_cores'):
+        try:
+            return int(grid.num_cores())
+        except TypeError:
+            return int(grid.num_cores)
+    try:
+        return len(grid)
+    except TypeError:
+        return 0
+
+
+def _tensor_in_l1(t):
+    """True when the tensor's memory config places it in L1; an unset config reads as DRAM."""
+    mc = t.memory_config() if hasattr(t, 'memory_config') else None
+    return getattr(mc, 'buffer_type', None) == BufferType.L1
+
+
+def _sdpa_decode_attrs(program_config, compute_kernel_config, k, *, q=None, is_causal=True, attn_mask=None,
+                       cur_pos=None, cur_pos_tensor=None, attention_sink=None, sliding_window_size=None,
+                       page_table_tensor=None, paged_cache_geometry=None, cache_position_modulo=None):
+    """Decode-side attrs: configs plus the position, mask, sink and paging fields the roofline prices from."""
+    a = _sdpa_config_attrs(program_config, compute_kernel_config)
+    a['is_causal'] = bool(is_causal)
+    # An L1 sharded query (tt_transformers decode) is not DRAM traffic for the roofline.
+    if q is not None and _tensor_in_l1(q):
+        a['q_in_l1'] = True
+        cores = _shard_cores(q)
+        if cores:
+            a['q_shard_cores'] = cores
+    if attn_mask is not None:
+        a['has_attn_mask'] = True
+    if attention_sink is not None:
+        a['attention_sink'] = True
+    if sliding_window_size:
+        a['sliding_window_size'] = int(sliding_window_size)
+    # List form: the slowest user bounds the wall. Tensor form carries no host-side value.
+    if cur_pos is not None and len(cur_pos) > 0:
+        a['cur_pos'] = int(builtins.max(cur_pos))
+    else:
+        a['cur_pos_unknown'] = True
+    if page_table_tensor is not None:
+        a['paged'] = True
+        bs = getattr(paged_cache_geometry, 'block_size', 0) or 0
+        if bs:
+            a['page_block_size'] = int(bs)
+    if cache_position_modulo:
+        a['cache_position_modulo'] = int(cache_position_modulo)
+    a['kv_element_size'] = k.element_size()
+    return a
+
+
 class transformer:
     def __init__(self, config):
         pass
 
     @staticmethod
-    def scaled_dot_product_attention(q, k, v, *, is_causal=True, scale=None,
-                                     sliding_window_size=None, compute_kernel_config=None,
-                                     program_config=None, memory_config=None, **kwargs):
-        """Prefill SDPA (non-paged, non-chunked); output = q shape."""
+    def scaled_dot_product_attention(q, k, v, attn_mask=None, *, is_causal=True, scale=None,
+                                     sliding_window_size=None, memory_config=None, program_config=None,
+                                     compute_kernel_config=None, attention_sink=None,
+                                     cu_window_seqlens=None, **kwargs):
+        """Prefill SDPA; output = q shape. Program and compute configs land in attrs as scalars."""
         from .ttnn_shim import scaled_dot_product_attention_op as _sdpa
         # Pass scale through unchanged: when the caller omits it (None), the shim op
-        # drops it from the recorded attrs rather than fabricating a 0.0 (which is not
-        # a valid SDPA scale and would pollute attrs / LUT keys vs an omitted attribute).
-        return _sdpa(q, k, v, memory_config=memory_config, is_causal=bool(is_causal),
-                     scale=scale)
+        # drops it from the recorded attrs rather than fabricating a 0.0.
+        # chunk_start_idx 0 is a valid first chunk, so test for presence, not truth.
+        chunk_start = kwargs.get('chunk_start_idx')
+        variant = 'chunked' if chunk_start is not None else 'prefill'
+        extra = _sdpa_config_attrs(program_config, compute_kernel_config)
+        if chunk_start is not None:
+            extra['chunk_start_idx'] = int(chunk_start)
+        if sliding_window_size:
+            extra['sliding_window_size'] = int(sliding_window_size)
+        if attn_mask is not None:
+            extra['has_attn_mask'] = True
+        if attention_sink is not None:
+            extra['attention_sink'] = True
+        if cu_window_seqlens is not None:
+            extra['is_windowed'] = True
+        extra['kv_element_size'] = k.element_size()
+        # The optional tensors are inputs of the op, not only flags, so their producers stay connected.
+        return _sdpa(q, k, v, attn_mask, attention_sink, cu_window_seqlens, memory_config=memory_config,
+                     is_causal=bool(is_causal), scale=scale, sdpa_variant=variant, **extra)
 
     @staticmethod
-    def scaled_dot_product_attention_decode(q, k, v, *, cur_pos_tensor=None, scale=None,
-                                            sliding_window_size=None, program_config=None,
-                                            compute_kernel_config=None, memory_config=None,
-                                            **kwargs):
+    def chunked_scaled_dot_product_attention(q, k, v, page_table_tensor, *, chunk_start_idx=None,
+                                             chunk_start_idx_tensor=None, scale=None, memory_config=None,
+                                             program_config=None, compute_kernel_config=None,
+                                             paged_cache_geometry=None, **kwargs):
+        """Chunked prefill over a paged prefix; output = q shape. The page table rides along as an
+        input; a tensor-only chunk start has no host value and is flagged."""
+        from .ttnn_shim import scaled_dot_product_attention_op as _sdpa
+        extra = _sdpa_config_attrs(program_config, compute_kernel_config)
+        if chunk_start_idx is not None:
+            extra['chunk_start_idx'] = int(chunk_start_idx)
+        elif chunk_start_idx_tensor is not None:
+            extra['chunk_start_unknown'] = True
+        extra['paged'] = True
+        bs = getattr(paged_cache_geometry, 'block_size', 0) or 0
+        if bs:
+            extra['page_block_size'] = int(bs)
+        extra['kv_element_size'] = k.element_size()
+        return _sdpa(q, k, v, page_table_tensor, chunk_start_idx_tensor, memory_config=memory_config,
+                     is_causal=True, scale=scale, sdpa_variant='chunked', **extra)
+
+    @staticmethod
+    def scaled_dot_product_attention_decode(q, k, v, *, is_causal=True, attn_mask=None, cur_pos=None,
+                                            cur_pos_tensor=None, attention_sink=None, scale=None,
+                                            sliding_window_size=None, memory_config=None,
+                                            program_config=None, compute_kernel_config=None,
+                                            share_cache=None, **kwargs):
         """Decode SDPA (non-paged); output = q shape."""
         from .ttnn_shim import scaled_dot_product_attention_op as _sdpa
-        return _sdpa(q, k, v, cur_pos_tensor, memory_config=memory_config,
-                     scale=scale)
+        # Explicit tag: with cur_pos_tensor=None the shim drops the input and the op would
+        # otherwise be classified by arity as a 3-input prefill.
+        extra = _sdpa_decode_attrs(program_config, compute_kernel_config, k, q=q, is_causal=is_causal,
+                                   attn_mask=attn_mask, cur_pos=cur_pos, cur_pos_tensor=cur_pos_tensor,
+                                   attention_sink=attention_sink, sliding_window_size=sliding_window_size)
+        # The mask and sink ride along as inputs so their producers stay connected in the graph.
+        return _sdpa(q, k, v, cur_pos_tensor, attn_mask, attention_sink, memory_config=memory_config,
+                     scale=scale, sdpa_variant='decode', **extra)
 
     @staticmethod
-    def paged_scaled_dot_product_attention_decode(q, k, v, *, page_table_tensor=None,
-                                                  cur_pos_tensor=None, scale=None,
-                                                  sliding_window_size=None, program_config=None,
-                                                  compute_kernel_config=None, memory_config=None,
-                                                  **kwargs):
+    def paged_scaled_dot_product_attention_decode(q, k, v, page_table_tensor=None, *, is_causal=True,
+                                                  attn_mask=None, cur_pos=None, cur_pos_tensor=None,
+                                                  attention_sink=None, scale=None, sliding_window_size=None,
+                                                  memory_config=None, program_config=None,
+                                                  compute_kernel_config=None, paged_cache_geometry=None,
+                                                  cache_position_modulo=None, **kwargs):
         """Paged decode SDPA; output = q shape."""
         from .ttnn_shim import scaled_dot_product_attention_op as _sdpa
-        return _sdpa(q, k, v, cur_pos_tensor, page_table_tensor,
+        extra = _sdpa_decode_attrs(program_config, compute_kernel_config, k, q=q, is_causal=is_causal,
+                                   attn_mask=attn_mask, cur_pos=cur_pos, cur_pos_tensor=cur_pos_tensor,
+                                   attention_sink=attention_sink, sliding_window_size=sliding_window_size,
+                                   page_table_tensor=page_table_tensor,
+                                   paged_cache_geometry=paged_cache_geometry,
+                                   cache_position_modulo=cache_position_modulo)
+        # Mask and sink go before the page table: the decode roofline reads the table as the last input.
+        return _sdpa(q, k, v, cur_pos_tensor, attn_mask, attention_sink, page_table_tensor,
                      memory_config=memory_config,
-                     scale=scale)
+                     scale=scale, sdpa_variant='decode', **extra)
+
+    @staticmethod
+    def flash_mla_prefill(q, k, *, head_dim_v, scale=None, is_causal=True,
+                          program_config=None, compute_kernel_config=None,
+                          memory_config=None, **kwargs):
+        """FlashMLA prefill (latent form): V = K[..., :head_dim_v], so K serves as V. Routes to the
+        MLA roofline via the head_dim_v attr (asymmetric d_qk/d_v)."""
+        from .ttnn_shim import scaled_dot_product_attention_op as _sdpa
+        # Without configs fall back to the calibration family (HiFi4, accurate exp), listed as defaulted.
+        extra = _sdpa_config_attrs(program_config, compute_kernel_config)
+        extra.setdefault('fidelity', 'HiFi4')
+        extra.setdefault('exp_approx_mode', False)
+        extra['kv_element_size'] = k.element_size()
+        return _sdpa(q, k, k, memory_config=memory_config, sdpa_variant='mla',
+                     head_dim_v=int(head_dim_v), is_causal=bool(is_causal), scale=scale, **extra)
+
+    @staticmethod
+    def flash_mla_decode(q, k, v=None, *, head_dim_v, cur_pos_tensor=None, page_table_tensor=None,
+                         cur_pos=None, scale=None, program_config=None, compute_kernel_config=None,
+                         paged_cache_geometry=None, memory_config=None, **kwargs):
+        """FlashMLA decode (memory-bound). Without a V tensor the kernel reuses K's latent part as V and
+        streams K alone; a V tensor is streamed too. Routes to the decode roofline."""
+        from .ttnn_shim import scaled_dot_product_attention_op as _sdpa
+        extra = _sdpa_decode_attrs(program_config, compute_kernel_config, k, q=q, cur_pos=cur_pos,
+                                   cur_pos_tensor=cur_pos_tensor, page_table_tensor=page_table_tensor,
+                                   paged_cache_geometry=paged_cache_geometry)
+        if v is not None:
+            extra['mla_v_read'] = True
+        return _sdpa(q, k, v if v is not None else k, cur_pos_tensor, page_table_tensor, memory_config=memory_config,
+                     sdpa_variant='mla_decode', head_dim_v=int(head_dim_v), scale=scale, **extra)
+
+    @staticmethod
+    def sparse_sdpa(q, kv, sparse_idx, head_dim_v, *, scale=None, is_causal=False, k_chunk_size=None,
+                    program_config=None, compute_kernel_config=None, memory_config=None, **kwargs):
+        """Sparse-MLA: each query attends its TOPK selected latent KV (indices [..., TOPK]). Routes to
+        the roofline as MLA cross-attention with kv_seq=TOPK + the scattered-gather uplift."""
+        from .ttnn_shim import scaled_dot_product_attention_op as _sdpa
+        topk = int(sparse_idx.logical_shape()._shape[-1])
+        extra = _sdpa_config_attrs(program_config, compute_kernel_config)
+        # The sparse kernel takes k_chunk_size (default 128) and has no q chunk parameter, so the
+        # 32x32 prefill fallback does not apply; price at the calibration chunking and say so.
+        defaulted = [d for d in extra['sdpa_defaulted'].split(',') if d]
+        if k_chunk_size is not None:
+            extra['k_chunk_size'] = int(k_chunk_size)
+            defaulted = [d for d in defaulted if d != 'k_chunk_size']
+        for key in ('q_chunk_size', 'k_chunk_size'):
+            if key not in extra:
+                extra[key] = 128
+                if key not in defaulted:
+                    defaulted.append(key)
+        extra['sdpa_defaulted'] = ','.join(defaulted)
+        extra.setdefault('fidelity', 'HiFi4')
+        extra.setdefault('exp_approx_mode', False)
+        extra['kv_element_size'] = kv.element_size()
+        return _sdpa(q, kv, kv, sparse_idx, memory_config=memory_config, sdpa_variant='sparse',
+                     is_sparse=True, head_dim_v=int(head_dim_v), kv_seq=topk, is_causal=bool(is_causal),
+                     scale=scale, **extra)
+
+    @staticmethod
+    def joint_scaled_dot_product_attention(q, k, v, joint_tensor_q, joint_tensor_k, joint_tensor_v,
+                                           *, joint_strategy=None, scale=None, program_config=None,
+                                           compute_kernel_config=None, memory_config=None, **kwargs):
+        """Joint SDPA (SD3/Flux): main + joint streams attend over their concatenation, non-causal.
+        Routes to the joint roofline (cost over S_eff = main + joint). The shim op is single-output,
+        so the second element is joint_tensor_q passed through as a placeholder, not a computed joint_out."""
+        from .ttnn_shim import scaled_dot_product_attention_op as _sdpa
+        joint_seq = int(joint_tensor_q.logical_shape()._shape[-2])
+        extra = _sdpa_config_attrs(program_config, compute_kernel_config)
+        extra['kv_element_size'] = k.element_size()
+        out = _sdpa(q, k, v, memory_config=memory_config, sdpa_variant='joint',
+                    joint_seq=joint_seq, is_causal=False, scale=scale, **extra)
+        return out, joint_tensor_q
 
 
 class experimental:
