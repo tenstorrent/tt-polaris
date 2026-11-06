@@ -91,6 +91,57 @@ def test_shim_emits_single_arity1_slice(device, in_shape, spec):
     assert not any(o.optype == 'Split' for o in g._ops.values()), 'slice must not emit a Split'
 
 
+def _bounds(device):
+    return [ttnn.zeros([4], dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=device) for _ in range(2)]
+
+
+@pytest.mark.unit
+def test_shim_slice_runtime_bounds_real_signature(device):
+    """The exact HW call of the tt-metal f8c634a prefill tail emits an arity-3 Slice.
+
+    ttnn.slice(input_tensor=x, starts=, ends=, slice_dim=2, num_devices=4): HW SliceDeviceOperation with
+    use_tensor_args takes the bound tensors as operands (WH n150 prefill capture: Slice inputs
+    [1,1,128,4096] bf16, [1,1,1,4] INT32, [1,1,1,4] INT32) and sizes the output from slice_dim /
+    num_devices alone (slice_device_operation.cpp). A call without bound tensors stays arity-1.
+    """
+    x = ttnn.zeros([1, 1, 128, 4096], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    starts, ends = _bounds(device)
+    out = ttnn.slice(input_tensor=x, starts=starts, ends=ends, slice_dim=2, num_devices=4)
+
+    g = device.get_graph()
+    (op,) = [o for o in g._ops.values() if o.optype == 'Slice']
+    assert [g._tensors[t].name for t in op.inList] == [x.name, starts.name, ends.name]
+    assert op.attrs['use_tensor_args'] == 1
+    assert list(out.shape) == [1, 1, 32, 4096]
+
+
+@pytest.mark.unit
+def test_shim_slice_runtime_bounds_positional_input_with_matching_spec(device):
+    """Positional input works too, and a slice= spec that agrees with slice_dim/num_devices is accepted."""
+    x = ttnn.zeros([1, 1, 128, 4096], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    starts, ends = _bounds(device)
+    out = ttnn.slice(x, slice=(slice(None), slice(None), slice(64, 96), slice(None)),
+                     starts=starts, ends=ends, slice_dim=2, num_devices=4)
+    assert list(out.shape) == [1, 1, 32, 4096]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('kwargs, match', [
+    ({'ends': None}, 'both be tensors'),                                     # starts without ends
+    ({'ends': [1, 1, 32, 4096]}, 'both be tensors'),                         # non-tensor bound
+    ({'slice_dim': None}, 'slice_dim and num_devices'),                      # tt-metal TT_FATAL
+    ({'num_devices': 3}, 'evenly divisible'),                                # 128 % 3 != 0
+    ({'slice': (slice(None), slice(None), slice(0, 64), slice(None))}, 'slice= gives'),  # spec disagrees
+])
+def test_shim_slice_runtime_bounds_rejects_invalid(device, kwargs, match):
+    x = ttnn.zeros([1, 1, 128, 4096], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    starts, ends = _bounds(device)
+    call = {'input_tensor': x, 'starts': starts, 'ends': ends, 'slice_dim': 2, 'num_devices': 4, **kwargs}
+    call = {k: v for k, v in call.items() if v is not None}
+    with pytest.raises(AssertionError, match=match):
+        ttnn.slice(**call)
+
+
 @pytest.mark.unit
 def test_shim_slice_chunks_are_disjoint_and_cover(device):
     """The decode sampling chunk pattern: n slices tiling the vocab dim, one Slice op each."""

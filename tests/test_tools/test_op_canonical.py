@@ -116,6 +116,8 @@ def test_unary_op_chain_resolution():
         ("RotaryEmbeddingLlamaDeviceOperation", "rotaryembeddingllama"),
         ("PagedFusedUpdateCacheDeviceOperation", "pagedfusedupdatecache"),
         ("PagedFillCacheDeviceOperation", "pagedfillcache"),
+        # llama3 prefill greedy sampler (Untilize -> ArgMax).
+        ("ArgMaxDeviceOperation", "argmax"),
         ("SDPAOperation", "scaleddotproductattention"),
         ("SdpaDecodeDeviceOperation", "scaleddotproductattention"),
     ],
