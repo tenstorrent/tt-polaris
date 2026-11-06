@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Set, Optional, TypeVar
 
 from ttsim.config import TTSimHLRunSummary, get_arspec_from_yaml, get_wlmapspec_from_yaml, get_wlspec_from_yaml
-from ttsim.front.onnx.onnx2nx import onnx2graph  # NOTE: import from ttsim.front had potential cyclic dependency
+from ttsim.front.onnx.onnx2nx import onnx2graph
+from ttsim.front.mlir import mlir2graph  # NOTE: import from ttsim.front had potential cyclic dependency
 from ttsim.front.ttnn import open_device, close_device
 from ttsim.utils.common import get_ttsim_functional_instance, get_ttnn_functional_instance, print_csv, str_to_bool, setup_logger
 from ttsim.utils.types import validate_datatype, get_valid_sim_dtypes
@@ -178,6 +179,15 @@ def get_wlgraph(TBL, wlg, wln, wli, gcfg, wpath, enable_memalloc):
                         0)
             finally:
                 close_device(ttnn_device)
+        elif wlg == 'MLIR':
+            logger.info(">>mlir-wl = {}.{}.{}.b{} = {}", wlg, wln, wli, wlb, wpath)
+            mlir_graph = mlir2graph(wli, wpath)
+            TBL[(wlg,wln,wli,wlb)] = (None, mlir_graph)
+            for _,op in mlir_graph._ops.items():
+                itensors = [mlir_graph._tensors[x] for x in op.inList]
+                otensors = [mlir_graph._tensors[x] for x in op.outList]
+                op.get_perf_counts(itensors, otensors)
+                op.update_tensor_counts(itensors,otensors)
         elif wlg == 'ONNX':
             logger.info(">>onnx-wl = {}.{}.{}.b{} = {}", wlg, wln, wli, wlb, wpath)
             dim_overrides: dict = {}

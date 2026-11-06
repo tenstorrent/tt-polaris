@@ -35,6 +35,9 @@ ipblocks:
             -   {name: max,   tpt: { int32: 32., fp32: 32. }}
             -   {name: sin, tpt: { int32: 32., fp32: 32. }}
             -   {name: cos, tpt: { int32: 32., fp32: 32. }}
+            -   {name: pow, tpt: { int32: 32., fp32: 32. }}
+            -   {name: erf, tpt: { int32: 32., fp32: 32. }}
+            -   {name: gelu, tpt: { int32: 32., fp32: 32. }}
 
     -   name: gddr6
         iptype: memory
