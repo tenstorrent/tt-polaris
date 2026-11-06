@@ -6,13 +6,14 @@
 Basis: shim-only workloads/ttnn/tt_transformers/lm_head.py (simulation path).
 
 Audit vs the shim-only base:
-  - Simulation path only (num_splits=1, num_experts=1): the galaxy / column-split / dram-
-    sharded-matmul machinery is dropped (dead for our single-chip, lean ModelArgs). The
-    output weight is one dummy (dim, vocab_size).
-  - The capture splits the lm_head matmul into column chunks wrapped by InterleavedToSharded
-    / ShardedToInterleaved (ops 48-59) for L1 sizing. This port emits the single-matmul sim
-    path + one sharded_to_interleaved; the chunk-split is a Phase-5 correlation parity item
-    (see project_llama3_prefill_op_sequence).
+  - Single-chip (num_experts=1): the galaxy machinery is dropped (dead for our single-chip,
+    lean ModelArgs). On the TT-Polaris path the output weight is one dummy (dim, vocab_size);
+    the HW path uses one dummy weight per column chunk.
+  - The capture (README, "HW capture") splits the lm_head matmul into column chunks wrapped by
+    InterleavedToSharded / ShardedToInterleaved (ops 48-59) for L1 sizing. The HW path does the
+    column split (model_config.lm_head_split_sizes). The TT-Polaris path emits one GEMM;
+    the backend column-split transform (op_split_spec in config/wl2archmapping.yaml) expands it
+    per arch.
 """
 import os
 import sys
