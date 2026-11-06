@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 from ttsim.ops.op import SimOp
-from ttsim.ops.tensor import SimTensor, Shape
+from ttsim.ops.tensor import SimTensor, Shape, require_shape_list
 from .device import Device, USE_DEFAULT_DEVICE, resolve_device
 from .types import TILE_HEIGHT, TILE_WIDTH
 
@@ -393,7 +393,10 @@ class Tensor(SimTensor):
     def size(self, dim: Optional[int] = None) -> Union[Tuple[int, ...], int]:
         assert self.shape is not None
         if dim is None:
-            return tuple(self.shape.as_list())
+            # require_shape_list, not Shape.as_list: shape is a plain list
+            # whenever it was assigned by a shape-inference descriptor rather
+            # than through set_shape, and as_list raised AttributeError there.
+            return tuple(require_shape_list(self.shape))
         return self.shape[dim]
 
     def gather(self, dim, index):
@@ -411,7 +414,8 @@ class Tensor(SimTensor):
             target_shape = list(sizes)
 
         original_shape = self.shape
-        orig_dims = original_shape.as_list()
+        # Same reason as size(): shape may be a plain list here.
+        orig_dims = require_shape_list(original_shape)
         # Pad original shape with 1s if target has more dimensions
         if len(target_shape) > len(original_shape):
             padded_original = [1] * (
@@ -473,7 +477,7 @@ class Tensor(SimTensor):
             raise ValueError(f"start_dim {start_dim} must be <= end_dim {end_dim}")
 
         # Calculate new shape
-        new_shape = []
+        new_shape: list[Any] = []
 
         # Add dimensions before start_dim
         new_shape.extend(self.shape[:start_dim])
