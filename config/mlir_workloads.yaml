@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+workloads:
+  - api: MLIR
+    name: TOY_MLIR
+    basedir: workloads/mlir/examples
+    instances:
+      toy_mm_add:  { path: toy_mm_add.mlir,  bs: 1 }
+      matmul_only: { path: matmul_only.mlir, bs: 1 }
+      mlp_block:   { path: mlp_block.mlir,   bs: 1 }
+      mlp_forge_real: { path: mlp_forge_real.mlir, bs: 1 }
