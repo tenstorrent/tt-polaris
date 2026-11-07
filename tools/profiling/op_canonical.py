@@ -67,6 +67,7 @@ PROFILER_PREFIX_RULES: tuple[tuple[str, str], ...] = (
     ("TopK", "topk"),
     ("ManualSeed", "manualseed"),
     ("Sampling", "sampling"),
+    ("ArgMax", "argmax"),  # ArgMaxDeviceOperation (llama3 WH decode sampling path)
     ("PlusOne", "plusone"),
     ("UntilizeWithValUnpadding", "untilizewithunpadding"),  # TT-Polaris variant with "Val"
     ("UntilizeWithUnpadding", "untilizewithunpadding"),

@@ -855,6 +855,51 @@ def data_window_sinf(iTList, oTList, op, **kwargs):
     return
 
 
+# ---------------------------------------------------------------------------
+# TopK compute model for the tt-metal TopKDeviceOperation (tiled input).
+#
+# Structure comes from the compute kernel (ttnn/.../reduction/topk/device/kernels/compute/topk.cpp):
+#   - input is [rows, W] in 32x32 tiles: Ht = ceil(rows/32) tile rows, Wt = ceil(W/32) tiles per row
+#   - per tile row it is an insertion sort: the first iteration takes 2 tiles, every later one takes 1,
+#     so Wt-1 merges; each merge runs `output_tiles = ceil(k/32)` topk_local_sort calls (steady state)
+#   - topk_local_sort(end_phase=5) is a full 64-element bitonic sort per column: phases 0..5 =
+#     1+2+...+6 = 21 compare-exchange layers; 64 elems/column x 32 columns = 1024 pairs per layer
+#   - tile rows are split over cores, so a single tile row (Ht=1, i.e. <=32 users) runs on ONE core
+#     (capture: llama3-8B p100a decode, CORE COUNT = 1)
+# The vector-pipe instructions per compare-exchange are calibrated, not derived: _TOPK_VEC_OPS_PER_CE = 6
+# (swap of value + index = 2 `cmp`, load/store of value + index to DST = 4 `mov`) reproduces the capture
+# (13.50M cycles measured for 2003 merges) within ~0.5% at the default DG_COMPUTE_UTIL_CONSTANT = 0.6.
+# Not modeled: the multi-core split-width variant, and the first-iterations ramp for k > 32.
+# ---------------------------------------------------------------------------
+_TOPK_TILE = 32
+_TOPK_CE_LAYERS_PER_MERGE = 21                       # 1+2+3+4+5+6 bitonic layers for 64 elements
+_TOPK_CE_PER_LAYER = _TOPK_TILE * _TOPK_TILE         # 32 columns x 32 pairs
+_TOPK_CMP_PER_CE = 2                                 # value swap + index swap
+_TOPK_MOV_PER_CE = 4                                 # DST load/store of value and of index
+
+
+def _is_tt_tiled_topk(op, X) -> bool:
+    """True for the real-ttnn TopK (k recorded by topk_pp) on a TILE_LAYOUT input; other callers
+    (ONNX-style TopK) keep the legacy memory-only model."""
+    layout = getattr(getattr(X, 'layout', None), 'name', '')
+    return layout == 'TILE_LAYOUT' and op.attrs.get('k') is not None
+
+
+def _tt_topk_compute(in_shape: list, axis: int, k: int):
+    """Returns (instrs, active_cores) for TopKDeviceOperation over `axis` == last dim."""
+    width = int(in_shape[axis])
+    rows = 1
+    for i, d in enumerate(in_shape):
+        if i != axis:
+            rows *= int(d)
+    ht = -(-rows // _TOPK_TILE)
+    wt = -(-width // _TOPK_TILE)
+    output_tiles = -(-int(k) // _TOPK_TILE)
+    merges = ht * max(wt - 1, 0) * output_tiles
+    ce = merges * _TOPK_CE_LAYERS_PER_MERGE * _TOPK_CE_PER_LAYER
+    return {'cmp': ce * _TOPK_CMP_PER_CE, 'mov': ce * _TOPK_MOV_PER_CE}, ht
+
+
 def topk_sinf(iTList, oTList, op, **kwargs):
     X = iTList[0]
     assert X.check_shape(), f"Input tensor-X shape not defined: {X}"
@@ -873,6 +918,7 @@ def topk_sinf(iTList, oTList, op, **kwargs):
     if _axis < 0 or _axis >= XRank:
         raise ValueError(f"Axis {_axis} is out of bounds for X {X}")
 
+    XShape_in = list(XShape)  # input shape, kept before XShape is reused as the output shape
     outshape = XShape
     d_axis   = XShape[_axis]
     # K may come from a second input K-tensor (ONNX-style, a scalar int64) or from the 'k' attr
@@ -898,13 +944,19 @@ def topk_sinf(iTList, oTList, op, **kwargs):
     oTList[0].dtype = X.dtype
     oTList[1].dtype = np.dtype(np.int64)
     in_elems = sum(t.nelems() for t in iTList)
+    instrs: dict = {'mov': 0}
+    active_cores = None
+    if _is_tt_tiled_topk(op, X):
+        instrs, active_cores = _tt_topk_compute(XShape_in, _axis, k_scalar_value)
     op.perf_stats = {
             'inElems' : in_elems,
             'outElems': oTList[0].nelems() + oTList[1].nelems(),
             'inBytes' : sum(t.nbytes(op.precision) for t in iTList),
             'outBytes': oTList[0].nbytes(op.precision) + oTList[1].nbytes(op.precision),
-            'instrs'  : {'mov': 0} #TODO: fix this for TopK
+            'instrs'  : instrs,
             }
+    if active_cores is not None:
+        op.perf_stats['activeCores'] = active_cores
     return
 
 

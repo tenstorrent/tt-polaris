@@ -118,6 +118,8 @@ def test_unary_op_chain_resolution():
         ("PagedFillCacheDeviceOperation", "pagedfillcache"),
         ("SDPAOperation", "scaleddotproductattention"),
         ("SdpaDecodeDeviceOperation", "scaleddotproductattention"),
+        ("ArgMaxDeviceOperation", "argmax"),
+        ("TopKDeviceOperation", "topk"),
     ],
 )
 def test_bare_opcode_prefix_matching(raw, expected):

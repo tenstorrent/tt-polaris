@@ -270,6 +270,14 @@ class Device:
         if TYPE_CHECKING:
             assert op.perf_stats is not None, f"SimOp {op.name} has no perf_stats set, cannot execute"
 
+        # Optional 'activeCores': ops whose work is split over fewer cores than the grid (e.g. TopK
+        # with one tile row runs on a single core) only get that share of the peak throughput.
+        core_share = 1.0
+        active_cores = op.perf_stats.get('activeCores')
+        if active_cores is not None:
+            n_units = self.simconfig_obj.get_ipgroup(iptype='compute').num_units
+            core_share = min(max(int(active_cores), 1), n_units) / n_units
+
         #find compute cycles
         op.compute_cycles = 0
         for instr,instr_count in op.perf_stats['instrs'].items():
@@ -283,7 +291,7 @@ class Device:
                     f"instruction='{instr}', pipe='{op.uses_compute_pipe}', precision='{op.precision}'. "
                     f"Original error: {e}"
                 ) from e
-            real_ipc = peak_ipc * self.DG_COMPUTE_UTIL_CONSTANT
+            real_ipc = peak_ipc * core_share * self.DG_COMPUTE_UTIL_CONSTANT
             op.compute_cycles += math.ceil(instr_count / real_ipc)
 
         # Find memory cycles.
