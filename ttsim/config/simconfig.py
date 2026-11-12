@@ -8,7 +8,7 @@ from math import isclose
 from typing import TYPE_CHECKING, Any, List, Optional, Type, Union
 
 from loguru import logger
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from ttsim.utils.common import convert_units
 
@@ -487,19 +487,49 @@ class PackageInstanceModel(BaseModel, extra='forbid'):
     name: str
     ipgroups: List[IPGroupModel]
     operator_lookup_file: Optional[str] = None
-    #: Core count for tt-perf master ``single`` / ``curve`` evaluation; if unset, uses compute ``num_units``.
+    #: Core count for tt-perf master ``single`` / ``curve`` evaluation; if unset, uses ``compute_units()``
+    #: (``compute_grid_size`` x * y when declared, else the compute ``num_units``).
     operator_lookup_core_count: Optional[int] = None
     #: When True, ``entry_type: hybrid`` LUT rows use embedded ``curve`` stats at runtime core count.
     operator_lookup_hybrid_curve: bool = False
     #: When True, do not load ``operator_lookup_file``; every op uses the analytical model.
     #: Set at run time by ``polaris.py --ignore-lut`` (or per instance in the arch YAML).
     ignore_lut: bool = False
-    #: Logical compute grid [x, y] = (num_cols, num_rows) — mirrors tt-metal's compute_with_storage_grid_range.
-    #: Used by the conv2d parallel-config helper to compute BLOCK_SHARDED channel padding (see
-    #: ttsim/back/device.py::Device._annotate_conv_x_pad_logical).  Optional — only
-    #: required for arches that participate in the LUT-key channel-padding pass;
-    #: otherwise TT-Polaris falls back to unpadded channels.
+    #: Worker (Tensix) compute grid [x, y] = (num_cols, num_rows), i.e. what tt-metal's
+    #: device.compute_with_storage_grid_size() reports (WH n150 8x8 = 64, BH p100a 11x10 = 110).
+    #: Two uses:
+    #:   1. Compute throughput: compute_units() returns x * y, and peak_ipc() / peak_flops() scale the
+    #:      per-core pipe throughput by it. When set, it takes precedence over the compute ipgroup's
+    #:      num_units for throughput; an instance without it falls back to num_units.
+    #:   2. LUT-key channel padding: the conv2d parallel-config helper reads it to compute
+    #:      BLOCK_SHARDED channel padding (ttsim/back/device.py::Device._annotate_conv_x_pad_logical);
+    #:      without it TT-Polaris falls back to unpadded channels.
+    #: Optional; when given it must be exactly two positive integers (validated below).
     compute_grid_size: Optional[List[int]] = None
+
+    @field_validator('compute_grid_size')
+    @classmethod
+    def _check_compute_grid_size(cls, grid: Optional[List[int]]) -> Optional[List[int]]:
+        """Reject a malformed grid at load time. A wrong length used to fall back silently to num_units,
+        and a zero or negative grid made peak_ipc 0 or negative, which failed far from the config
+        (ZeroDivisionError in Device.execute_op)."""
+        if grid is None:
+            return grid
+        if len(grid) != 2 or any(v <= 0 for v in grid):
+            raise ValueError(f"compute_grid_size must be two positive integers [x, y], got {grid!r}")
+        return grid
+
+    def compute_units(self) -> int:
+        """Number of compute units (Tensix cores) the throughput model uses.
+
+        ``compute_grid_size`` (x * y) when the instance declares it -- the worker grid tt-metal
+        reports (WH n150 8x8 = 64, BH p100a 11x10 = 110) -- else the compute group's ``num_units``.
+        Used by ``peak_ipc`` / ``peak_flops`` so analytical compute time follows the real core count.
+        The grid is validated on load, so it is always two positive ints here."""
+        grid = self.compute_grid_size
+        if grid is not None:
+            return int(grid[0]) * int(grid[1])
+        return self.get_ipgroup(iptype='compute').num_units
 
     def get_ipgroup(self, iptype: str) -> IPGroupModel:
         matching = [ipgroup for ipgroup in self.ipgroups if ipgroup.iptype == iptype]
@@ -521,7 +551,7 @@ class PackageInstanceModel(BaseModel, extra='forbid'):
         if TYPE_CHECKING:
             assert compute_group.ipobj is not None
             assert isinstance(compute_group.ipobj, ComputeBlockModel)
-        N        = compute_group.num_units
+        N        = self.compute_units()
         
         # Try primary pipe first
         pipe_obj = compute_group.ipobj.get_pipe(pipe)
@@ -561,7 +591,7 @@ class PackageInstanceModel(BaseModel, extra='forbid'):
             assert isinstance(compute_group.ipobj, ComputeBlockModel)
         pipe_obj = compute_group.ipobj.get_pipe(pipe)
         flops    = pipe_obj.peak_flops(instr, precision, mul_factor=mul_factor, units=units)
-        N        = compute_group.num_units
+        N        = self.compute_units()
         return N * flops
 
     def frequency(self, pipe, units="MHz"):

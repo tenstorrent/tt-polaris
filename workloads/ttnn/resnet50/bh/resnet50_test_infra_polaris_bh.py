@@ -22,13 +22,19 @@ from workloads.ttnn.resnet50.common.model_preprocessing import create_resnet50_m
 from workloads.ttnn.resnet50.common.shim_gate_opt_ins import enable_resnet50_shim_gates
 from workloads.ttnn.resnet50.common.ttnn_functional_resnet50 import resnet50
 
-# Logical tensix grid for this SKU, from config/tt_bh.yaml's `compute_grid_size`
-# for p100a (12 x 10 = 120 cores, one column reserved).  The shim's Device
-# defaults its grid to 0x0 (ttsim/front/ttnn/device.py:70-72) and the model
-# asserts rather than guessing, because the value feeds the fold shard shape
-# and, on Blackhole, the core-count search at tt-metal
+# Worker (Tensix) grid for this SKU; must equal config/tt_bh.yaml's `compute_grid_size`
+# for p100a (11 x 10 = 110 cores, what tt-metal's compute_with_storage_grid_size() reports
+# and what every p100a capture records as AVAILABLE WORKER CORE COUNT).  The shim's Device
+# defaults its grid to 0x0 (ttsim/front/ttnn/device.py:70-72) and the model asserts rather
+# than guessing, because the value feeds the fold shard shape and, on Blackhole, the
+# core-count search at tt-metal
 # tt-metal/models/demos/vision/classification/resnet50/ttnn_resnet/tt/ttnn_functional_resnet50.py:528-535.
-BH_P100A_COMPUTE_GRID = (12, 10)
+# With 110 that search lands on 98 cores for the fold, matching the capture's post-fold
+# Slice / Halo (98 cores); 12 x 10 would land on 112.  Changing 12x10 -> 11x10 leaves the
+# graph unchanged: same 115 ops, LUT keys, tensors and bytes, 115/115 LUT hits, and identical
+# LUT-on and analytical totals.  This constant is not read from the arch YAML;
+# tests/test_workloads/test_resnet50_compute_grid.py fails if the two differ.
+BH_P100A_COMPUTE_GRID = (11, 10)
 # The arch-spec device instance every capture-derived table in this port was
 # measured against (config/tt_bh.yaml:63).  Declared on the Device so SKU-keyed
 # shim tables resolve to p100a's numbers and NOT to p150a/p150b, which sit under

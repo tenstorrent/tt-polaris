@@ -64,13 +64,37 @@ packages:
         instances:
         -   name: p100a
             operator_lookup_file: lfc://hlm-lut/bh_p100a_llama3_lut_v8.yaml
-            # Logical tensix grid (x, y) — see doc/TTNN_SHIM_ARCHITECTURE.md §17.
-            # Source: tt-metal/tt_metal/core_descriptors/blackhole_140_arch.yaml (end=[12, 9] inclusive → 13×10).
-            # p100a has one column reserved → effective 12×10 = 120 cores (matches num_units below).
-            compute_grid_size: [12, 10]
+            # Worker (Tensix) core grid as (columns, rows): 11 x 10 = 110 cores on p100a, i.e. what tt-metal's
+            # device.compute_with_storage_grid_size() reports.
+            # Source: tt-metal/tt_metal/core_descriptors/blackhole_140_arch.yaml, compute_with_storage_grid_range per
+            # harvest tier: unharvested end=[12, 9] -> 13x10; 2xharvested end=[10, 9] -> 11x10 = 110, which is p100a.
+            # All 749 p100a llama3 decode capture rows report AVAILABLE WORKER CORE COUNT = 110. With the LUT on, 12x10
+            # and 11x10 give identical op counts, LUT hits (749/749) and total msecs for llama3 decode.
+            #
+            # How it is accessed:
+            #   - Compute throughput: SimConfig.compute_units() (ttsim/config/simconfig.py) returns x * y of
+            #     this field. SimConfig.peak_ipc() and peak_flops() multiply the per-core pipe throughput by it,
+            #     and Device.execute_op (ttsim/back/device.py) turns peak_ipc into compute_cycles, so analytical
+            #     compute time is for 110 cores.
+            #   - Conv channel padding: Device._annotate_conv_x_pad_logical (ttsim/back/device.py) reads this grid
+            #     to derive the BLOCK_SHARDED channel padding used in LUT keys.
+            # An instance that omits this field falls back to the compute ipgroup's num_units
+            # (SimConfig.compute_units()).
+            #
+            # num_units below (120) is not used on this instance: compute_grid_size takes precedence in
+            # SimConfig.compute_units(), which sets compute throughput and is also the lookup's core_count
+            # when operator_lookup_core_count is unset (tools/perf_lookup/lookup_operator_perf.py,
+            # resolve_operator_lookup_core_count). core_count is only used to evaluate a LUT row's curve at the
+            # device's core count; bh_p100a_llama3_lut_v8.yaml embeds no curve data (35 single, 6 hybrid entries) and
+            # operator_lookup_hybrid_curve is unset, so a LUT hit yields the table's own msecs.
+            compute_grid_size: [11, 10]
             ipgroups:
             -   ipname: tensix
                 iptype: compute
+                # num_units is not used on this instance: compute_grid_size above takes precedence in
+                # SimConfig.compute_units(), which sets both compute throughput and the LUT core count
+                # (resolve_operator_lookup_core_count). The Device config dump prints both num_units and the
+                # effective compute_units.
                 num_units   : 120
                 ramp_penalty: 100
                 ip_overrides:
@@ -83,6 +107,9 @@ packages:
             ipgroups:
             -   ipname: tensix
                 iptype: compute
+                # No compute_grid_size on this instance: SimConfig.compute_units() uses this num_units for
+                # compute throughput (peak_ipc / peak_flops), and the operator-lookup core count falls
+                # back to it (tools/perf_lookup/lookup_operator_perf.py).
                 num_units   : 120
                 ramp_penalty: 100
                 ip_overrides:
@@ -95,6 +122,9 @@ packages:
             ipgroups:
             -   ipname: tensix
                 iptype: compute
+                # No compute_grid_size on this instance: SimConfig.compute_units() uses this num_units for
+                # compute throughput (peak_ipc / peak_flops), and the operator-lookup core count falls
+                # back to it (tools/perf_lookup/lookup_operator_perf.py).
                 num_units   : 120
                 ramp_penalty: 100
                 ip_overrides:

@@ -22,11 +22,15 @@ from workloads.ttnn.resnet50.common.model_preprocessing import create_resnet50_m
 from workloads.ttnn.resnet50.common.shim_gate_opt_ins import enable_resnet50_shim_gates
 from workloads.ttnn.resnet50.common.ttnn_functional_resnet50 import resnet50
 
-# Logical tensix grid for this SKU, from config/tt_wh.yaml's `compute_grid_size`
-# for n150 (8 x 9 = 72 cores, one row harvested).  The shim's Device defaults
-# its grid to 0x0 (ttsim/front/ttnn/device.py:70-72) and the model asserts
-# rather than guessing, because the value feeds the fold shard shape.
-WH_N150_COMPUTE_GRID = (8, 9)
+# Worker (Tensix) grid for this SKU; must equal config/tt_wh.yaml's `compute_grid_size`
+# for n150 (8 x 8 = 64 cores, what tt-metal's compute_with_storage_grid_size() reports).
+# The shim's Device defaults its grid to 0x0 (ttsim/front/ttnn/device.py:70-72) and the
+# model asserts rather than guessing, because the value feeds the fold shard shape.
+# Changing 8x9 -> 8x8 leaves the graph unchanged: same 108 ops, LUT keys, tensors and
+# bytes, 108/108 LUT hits, and identical LUT-on and analytical totals.  This constant is
+# not read from the arch YAML; tests/test_workloads/test_resnet50_compute_grid.py fails if
+# the two differ.
+WH_N150_COMPUTE_GRID = (8, 8)
 # The arch-spec device instance every capture-derived table in this port was
 # measured against (config/tt_wh.yaml:51).  Declared on the Device so SKU-keyed
 # shim tables resolve to n150's numbers and NOT to n300 (tt_wh.yaml:97), which
