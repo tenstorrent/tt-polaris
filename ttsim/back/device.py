@@ -1241,6 +1241,12 @@ class Device:
         xstr += f"{prefix}Compute:\n"
         xstr += f"{prefix*2}ipname      : {self.compute_ip.ipname}\n"
         xstr += f"{prefix*2}num_units   : {self.compute_ip.num_units}\n"
+        # The core count actually used: compute throughput (peak_ipc / peak_flops) and the LUT core
+        # count. It is compute_grid_size x * y when the instance declares one, else num_units.
+        _compute_units = getattr(self.simconfig_obj, 'compute_units', None)
+        if callable(_compute_units):
+            xstr += f"{prefix*2}compute_units: {_compute_units()}\n"
+        xstr += f"{prefix*2}lut_core_count: {self._operator_lookup_core_count}\n"
         xstr += f"{prefix*2}freq_MHz    : {self.compute_ip.freq_MHz}\n"
         xstr += f"{prefix*2}ramp_penalty: {self.compute_ip.ramp_penalty}\n"
         if self.compute_ip.ipobj.l2_cache:

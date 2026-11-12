@@ -1474,8 +1474,10 @@ def resolve_operator_lookup_core_count(simcfg_obj: Any, package_model: Any) -> i
     """
     Core count for master single/curve evaluation.
 
-    Order: ``operator_lookup_core_count`` on package if set; else compute IPGroup
-    ``num_units``; else ``_DEFAULT_CORE_COUNT_FALLBACK``.
+    Order: ``operator_lookup_core_count`` on package if set; else the package's
+    ``compute_units()`` (``compute_grid_size`` x * y when declared, else the compute
+    IPGroup ``num_units``) -- the same core count the analytical throughput model uses;
+    else compute IPGroup ``num_units``; else ``_DEFAULT_CORE_COUNT_FALLBACK``.
     """
     raw = getattr(package_model, "operator_lookup_core_count", None)
     if raw is not None:
@@ -1484,6 +1486,18 @@ def resolve_operator_lookup_core_count(simcfg_obj: Any, package_model: Any) -> i
             if n > 0:
                 return n
         except (TypeError, ValueError):
+            pass
+
+    # One source of truth with the throughput model: on an instance that declares
+    # compute_grid_size (p100a 11x10 = 110, n150 8x8 = 64), num_units (120, 72) is not the
+    # device's worker-core count, so curve evaluation must not use it.
+    compute_units = getattr(package_model, "compute_units", None)
+    if callable(compute_units):
+        try:
+            cu = int(compute_units())
+            if cu > 0:
+                return cu
+        except Exception:
             pass
 
     try:
