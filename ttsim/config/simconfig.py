@@ -501,6 +501,17 @@ class PackageInstanceModel(BaseModel, extra='forbid'):
     #: otherwise TT-Polaris falls back to unpadded channels.
     compute_grid_size: Optional[List[int]] = None
 
+    def compute_units(self) -> int:
+        """Number of compute units (Tensix cores) the throughput model uses.
+
+        ``compute_grid_size`` (x * y) when the instance declares it -- the worker grid tt-metal
+        reports (WH n150 8x8 = 64, BH p100a 11x10 = 110) -- else the compute group's ``num_units``.
+        Used by ``peak_ipc`` / ``peak_flops`` so analytical compute time follows the real core count."""
+        grid = self.compute_grid_size
+        if grid is not None and len(grid) == 2:
+            return int(grid[0]) * int(grid[1])
+        return self.get_ipgroup(iptype='compute').num_units
+
     def get_ipgroup(self, iptype: str) -> IPGroupModel:
         matching = [ipgroup for ipgroup in self.ipgroups if ipgroup.iptype == iptype]
         if len(matching) != 1:
@@ -521,7 +532,7 @@ class PackageInstanceModel(BaseModel, extra='forbid'):
         if TYPE_CHECKING:
             assert compute_group.ipobj is not None
             assert isinstance(compute_group.ipobj, ComputeBlockModel)
-        N        = compute_group.num_units
+        N        = self.compute_units()
         
         # Try primary pipe first
         pipe_obj = compute_group.ipobj.get_pipe(pipe)
@@ -561,7 +572,7 @@ class PackageInstanceModel(BaseModel, extra='forbid'):
             assert isinstance(compute_group.ipobj, ComputeBlockModel)
         pipe_obj = compute_group.ipobj.get_pipe(pipe)
         flops    = pipe_obj.peak_flops(instr, precision, mul_factor=mul_factor, units=units)
-        N        = compute_group.num_units
+        N        = self.compute_units()
         return N * flops
 
     def frequency(self, pipe, units="MHz"):

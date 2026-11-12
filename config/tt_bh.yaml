@@ -63,73 +63,65 @@ packages:
         -   name: p100a
             # operator_lookup_file can be a local path or LFC path starting with lfc://
             operator_lookup_file: lfc://hlm-lut/bh_p100a_lut_v6.yaml
-            # Logical tensix grid (x, y).  This field stands in for tt-metal's
-            # device.compute_with_storage_grid_size().
+            # Worker (Tensix) core grid as (columns, rows): 11 x 10 = 110 cores on p100a, i.e. what tt-metal's
+            # device.compute_with_storage_grid_size() reports.
             #
-            # Source: tt-metal/tt_metal/core_descriptors/blackhole_140_arch.yaml,
-            # field compute_with_storage_grid_range.  That descriptor keys the
-            # grid PER HARVEST TIER, and the value below is taken from the wrong
-            # tier:
+            # Source: tt-metal/tt_metal/core_descriptors/blackhole_140_arch.yaml, field
+            # compute_with_storage_grid_range, which keys the grid PER HARVEST TIER:
             #
             #   unharvested   end=[12, 9]  ->  13x10  =  130
-            #   1xharvested   end=[11, 9]  ->  12x10  =  120   <- what this says
-            #   2xharvested   end=[10, 9]  ->  11x10  =  110   <- what p100a is
+            #   1xharvested   end=[11, 9]  ->  12x10  =  120
+            #   2xharvested   end=[10, 9]  ->  11x10  =  110   <- p100a
             #
-            # p100a is 2xharvested, so the descriptor's answer for this field is
-            # 11x10 = 110.  The 12x10 = 120 below is the 1xharvested tier, which
-            # also happens to equal the card's Tensix count in the table above --
-            # a different quantity that made the wrong tier look right.
+            # p100a is 2xharvested, so this field is 11x10 = 110. (It was 12x10 = 120, the 1xharvested tier, which
+            # equals the card's Tensix count in the table above -- a different quantity.)
             #
-            # UNRESOLVED, and currently harmless: the refrun disagrees with this
-            # value.  Example : Every row of
-            # __refrun_cache/resnet50/bh/p100a/merged_ops_resnet50-02b76a9-blackhole-p100a-260816.csv
-            # reports AVAILABLE WORKER CORE COUNT = 110, and no op dispatches
-            # on more than 110 (110 = 11x10).  This says 12x10 = 120.  Not a
-            # resnet50 quirk: vit (195 ops), vgg_unet (107 ops) and llama3-decode
-            # (749 ops) on this SKU report 110 too, and across all 1166 ops the
-            # value is constant and nothing exceeds it.  So the capture, the
-            # descriptor's 2xharvested tier and AVAILABLE WORKER CORE COUNT all
-            # agree on 110; only this field disagrees.
+            # Capture agreement: every row of the p100a refruns (resnet50 115, vit 195, vgg_unet 107, llama3-decode
+            # 749 = 1166 ops; e.g. __refrun_cache/resnet50/bh/p100a/merged_ops_resnet50-02b76a9-blackhole-p100a-260816.csv)
+            # reports AVAILABLE WORKER CORE COUNT = 110, and no op dispatches on more.
             #
-            # Left as-is deliberately.  Measured at both values across resnet50,
-            # vgg_unet, vit and llama3: identical op counts, identical
-            # per-optype census, identical LUT hits.  Three things mask it:
-            #   1. _HALO_EXT_Y_OVERRIDES_BY_DEVICE is TRANSCRIBED from the
-            #      capture, so the largest grid consumer never reads this;
-            #   2. everywhere else the grid only feeds values that are compared
-            #      against each other, so a uniformly-wrong grid cancels;
-            #   3. find_closest_largest_divisor_with_num_padding walks down to
-            #      the same divisor from either start.
+            # How it is accessed:
+            #   - Compute throughput: SimConfig.compute_units() (ttsim/config/simconfig.py) returns x * y of
+            #     this field. SimConfig.peak_ipc() and peak_flops() multiply the per-core pipe throughput by it,
+            #     and Device.execute_op (ttsim/back/device.py) turns peak_ipc into compute_cycles, so analytical
+            #     compute time is for 110 cores.
+            #   - Conv channel padding: Device._annotate_conv_x_pad_logical (ttsim/back/device.py) reads this grid
+            #     to derive the BLOCK_SHARDED channel padding used in LUT keys.
+            # An instance that omits this field falls back to the compute ipgroup's num_units
+            # (SimConfig.compute_units()).
+            #
+            # Measured with the LUT on at 12x10 and 11x10 across resnet50, vgg_unet, vit and llama3: identical op counts,
+            # per-optype census, LUT hits and total msecs. Three things keep LUT keys independent of the grid:
+            #   1. _HALO_EXT_Y_OVERRIDES_BY_DEVICE is TRANSCRIBED from the capture, so the largest
+            #      grid consumer never reads this;
+            #   2. everywhere else the grid only feeds values that are compared against each other,
+            #      so a uniformly-wrong grid cancels;
+            #   3. find_closest_largest_divisor_with_num_padding walks down to the same divisor from either start for
+            #      every BLOCK_SHARDED conv config in these captures (not in general: input channels 1440..1536 pad
+            #      differently at 12x10 and 11x10).
             #
             # Mask (1) LIFTS if anyone ports the halo derivation
             # (tt-metal/ttnn/cpp/ttnn/operations/sliding_window/sliding_window.cpp:
-            # generate_shard_boundaries ->
-            # generate_max_out_nsticks_per_core), which reads
-            # config.num_cores_nhw directly.  VERIFY THIS GRID AGAINST THE
-            # CAPTURE BEFORE DOING THAT, or the derived table will be wrong in a
-            # way the transcribed one currently hides.
+            # generate_shard_boundaries -> generate_max_out_nsticks_per_core), which reads
+            # config.num_cores_nhw directly: the derived table would then depend on this grid.
             #
-            # num_units below carries the same discrepancy (120 where the
-            # captures report 110) and cannot change a LUT-backed run.  It is the
-            # fallback source for the lookup's core_count
-            # (tools/perf_lookup/lookup_operator_perf.py:1333-1355 -- no config
-            # sets operator_lookup_core_count, so num_units is what is used), and
-            # core_count reaches only two places: _eval_curve_value (:304), which
-            # evaluates a regression AT core_count and is unreachable here
-            # because both v6 LUTs are entirely single-entry and
-            # operator_lookup_hybrid_curve is unset; and
-            # _maybe_warn_single_core_mismatch (:346), which logs at debug level
-            # and returns, "using table scalars as-is".  A single-entry hit
-            # therefore yields the table's own msecs whatever num_units says.
-            # Measured sweep agrees: total LUT msecs is identical at 110 and 120.
-            #
-            # It DOES feed the analytical model (ttsim/config/simconfig.py:521,
-            # :561), so LUT_OFF projections depend on it and correcting it to
-            # 110 would move them.
-            compute_grid_size: [12, 10]
+            # num_units below (120) is not used for compute throughput (compute_grid_size takes precedence). It is
+            # the fallback for the lookup's core_count (tools/perf_lookup/lookup_operator_perf.py:1473,
+            # resolve_operator_lookup_core_count -- no config sets operator_lookup_core_count), and core_count
+            # reaches only two places: _eval_curve_value (:318), which evaluates a regression AT core_count and is
+            # not reached because bh_p100a_lut_v6.yaml embeds no curve data (150 single, 23 hybrid
+            # entries) and operator_lookup_hybrid_curve is unset; and _maybe_warn_single_core_mismatch (:384), which
+            # logs at debug level and returns, "using table scalars as-is". A LUT hit therefore yields the table's
+            # own msecs whatever num_units says (total LUT msecs is identical at the old and new grid).
+            compute_grid_size: [11, 10]
             ipgroups:
             -   ipname: tensix
                 iptype: compute
+                # num_units is not used for compute throughput here: compute_grid_size above takes
+                # precedence in SimConfig.compute_units(). It is still read by
+                #   - resolve_operator_lookup_core_count (tools/perf_lookup/lookup_operator_perf.py): the
+                #     LUT core count when operator_lookup_core_count is unset;
+                #   - the config dump in Device (ttsim/back/device.py).
                 num_units   : 120
                 ramp_penalty: 100
                 ip_overrides:
@@ -142,6 +134,9 @@ packages:
             ipgroups:
             -   ipname: tensix
                 iptype: compute
+                # No compute_grid_size on this instance: SimConfig.compute_units() uses this num_units for
+                # compute throughput (peak_ipc / peak_flops), and the operator-lookup core count falls
+                # back to it (tools/perf_lookup/lookup_operator_perf.py).
                 num_units   : 120
                 ramp_penalty: 100
                 ip_overrides:
@@ -154,6 +149,9 @@ packages:
             ipgroups:
             -   ipname: tensix
                 iptype: compute
+                # No compute_grid_size on this instance: SimConfig.compute_units() uses this num_units for
+                # compute throughput (peak_ipc / peak_flops), and the operator-lookup core count falls
+                # back to it (tools/perf_lookup/lookup_operator_perf.py).
                 num_units   : 120
                 ramp_penalty: 100
                 ip_overrides:
