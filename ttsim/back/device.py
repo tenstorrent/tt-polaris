@@ -85,6 +85,19 @@ class TTDevice:
     def __getitem__(self, i):
         return self.arch[i]
 
+
+# Float slack for the memory-bandwidth validation in Device.get_exec_stats.
+_MEM_VALIDATION_TOL = 1e-6
+
+
+def _mem_cycles_within_slack(actual_cycles: float, expected_cycles: float,
+                             tol: float = _MEM_VALIDATION_TOL) -> bool:
+    """Memory-bandwidth validation bound: ``actual`` within one cycle of ``expected`` (the final ceil),
+    plus ``tol`` of float slack. Tile-exact byte totals can make ``expected`` land exactly on an integer
+    while the summed fractional cycles ceil one above it (e.g. 1886186 vs 1886185.0)."""
+    return expected_cycles - 1 - tol <= actual_cycles <= expected_cycles + 1 + tol
+
+
 class Device:
     """
         Hard coded for now
@@ -1206,7 +1219,7 @@ class Device:
                 # Allow for a single cycle of rounding error from the final ceil operation
                 expected_cycles = (tot_inBytes / self.eff_bw_bytes_per_cycle) * mem_to_dev_ratio
                 # Check both directions: cycles should be close to expected (within +1 for ceiling)
-                if tot_mem_rd_cycles > expected_cycles + 1 or tot_mem_rd_cycles < expected_cycles - 1:
+                if not _mem_cycles_within_slack(tot_mem_rd_cycles, expected_cycles):
                     raise ValueError(
                         f"Memory bandwidth validation failed (read):\n"
                         f"  Calculated bytes_per_device_clock: {actual_bytes_per_device_clock:.2f}\n"
@@ -1219,7 +1232,7 @@ class Device:
                 actual_bytes_per_device_clock = tot_outBytes / tot_mem_wr_cycles
                 expected_cycles = (tot_outBytes / self.eff_bw_bytes_per_cycle) * mem_to_dev_ratio
                 # Check both directions: cycles should be close to expected (within +1 for ceiling)
-                if tot_mem_wr_cycles > expected_cycles + 1 or tot_mem_wr_cycles < expected_cycles - 1:
+                if not _mem_cycles_within_slack(tot_mem_wr_cycles, expected_cycles):
                     raise ValueError(
                         f"Memory bandwidth validation failed (write):\n"
                         f"  Calculated bytes_per_device_clock: {actual_bytes_per_device_clock:.2f}\n"

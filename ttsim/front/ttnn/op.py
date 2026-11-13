@@ -84,7 +84,11 @@ def _propagate_ttnn_dtype(inputs: list[Tensor], outputs: list[Tensor]) -> None:
         # Pick the first dtype in precedence order that appears in candidates
         src = next((d for d in _COMPACT_DTYPE_PRECEDENCE if d in compact), compact[0])
     else:
-        src = candidates[0]
+        # Prefer a data dtype over an index/mask dtype: Embedding(indices uint32, table bf16) produces
+        # bf16, not uint32. Output bytes are sized from this dtype, so taking the first input's dtype
+        # would size an embedding output at 4 B per element. An op whose inputs are all integer keeps it.
+        data = [d for d in candidates if d not in _INDEX_DTYPES]
+        src = data[0] if data else candidates[0]
 
     for o in outputs:
         if getattr(o, "_ttnn_dtype", None) is None:
@@ -92,6 +96,9 @@ def _propagate_ttnn_dtype(inputs: list[Tensor], outputs: list[Tensor]) -> None:
 
 
 _COMPACT_DTYPES = frozenset({DataType.BFLOAT8_B, DataType.BFLOAT4_B})
+# Index / mask dtypes: they never decide the output dtype of an op that also takes a data tensor.
+_INDEX_DTYPES = frozenset({DataType.UINT8, DataType.UINT16, DataType.UINT32,
+                           DataType.INT32, DataType.INT64, DataType.BOOL})
 # BFLOAT4_B (4 bits) is more compact than BFLOAT8_B (8 bits)
 _COMPACT_DTYPE_PRECEDENCE = [DataType.BFLOAT4_B, DataType.BFLOAT8_B]
 
@@ -225,10 +232,8 @@ def single_output_immediate_op(optype, /, preprocess=None):
                 assert False, f"Unknown input type in ttnn.op({optype}) : {type(x)}"
         opinfo["outList"] = [C.name]
 
-        opobj = SimOp(opinfo)
-        opobj.get_perf_counts(new_args, [C])
-        opobj.update_tensor_counts(new_args, [C])
-
+        # Resolve the output TT dtype BEFORE get_perf_counts: outBytes is computed there, and
+        # sizing by dtype needs C._ttnn_dtype already set.
         _propagate_ttnn_dtype(tensor_args, [C])
         # An explicit output dtype (e.g. ttnn.mul(..., dtype=bfloat8_b) — the MLP
         # gate*up downcast) wins over the propagated dtype, matching real ttnn where
@@ -236,6 +241,10 @@ def single_output_immediate_op(optype, /, preprocess=None):
         out_dt = kwargs.get("output_dtype", kwargs.get("dtype", None))
         if isinstance(out_dt, DataType):
             C._ttnn_dtype = out_dt
+
+        opobj = SimOp(opinfo)
+        opobj.get_perf_counts(new_args, [C])
+        opobj.update_tensor_counts(new_args, [C])
         _propagate_memory_config(tensor_args, [C])
 
         mem_cfg = kwargs.get("memory_config", None)
@@ -282,11 +291,12 @@ def multiple_output_immediate_op(optype, /, preprocess=None):
                 assert False, f"Unknown input type in ttnn.op({optype}) : {type(x)}"
         opinfo["outList"] = [C.name for C in out_tensors]
 
+        # Resolve output TT dtypes before get_perf_counts (outBytes is sized there).
+        _propagate_ttnn_dtype(tensor_args, out_tensors)
+
         opobj = SimOp(opinfo)
         opobj.get_perf_counts(new_args, out_tensors)
         opobj.update_tensor_counts(new_args, out_tensors)
-
-        _propagate_ttnn_dtype(tensor_args, out_tensors)
         _propagate_memory_config(tensor_args, out_tensors)
         device.add_op(opobj)  # type: ignore[union-attr]
 
@@ -1180,8 +1190,12 @@ def pad_channels_nchw(input_tensor: 'Tensor', target_channels: int) -> 'Tensor':
     opobj = SimOp(opinfo)
 
     # Manual perf stats (bypass pad_sinf which requires a pad_tensor input).
-    # Pad is dtype-preserving; query the input tensor for the correct byte
-    # width (handles BFLOAT8_B, BFLOAT4_B etc.) instead of hardcoding bfloat16.
+    # Pad is dtype-preserving. Bytes follow each tensor's own TT dtype through
+    # SimTensor.storage_nbytes, so block-float tensors carry their exponent
+    # overhead (bfp8 1088 B and bfp4 576 B per 1024 elements); elements *
+    # element_size() is the fallback for a tensor with no TT dtype. The output
+    # dtype is resolved first so the output count sees it.
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     elem_size = input_tensor.element_size()
     nelems_in = 1
     for d in in_shape:
@@ -1189,11 +1203,16 @@ def pad_channels_nchw(input_tensor: 'Tensor', target_channels: int) -> 'Tensor':
     nelems_out = 1
     for d in out_shape:
         nelems_out *= int(d)
+
+    def _pad_bytes(t: Tensor, shape: Sequence[int], nelems: int) -> int:
+        nb = t.storage_nbytes(list(shape))
+        return int(nb) if nb is not None else int(nelems * elem_size)
+
     opobj.perf_stats = {
         'inElems': nelems_in,
         'outElems': nelems_out,
-        'inBytes': nelems_in * elem_size,
-        'outBytes': nelems_out * elem_size,
+        'inBytes': _pad_bytes(input_tensor, in_shape, nelems_in),
+        'outBytes': _pad_bytes(out_tensor, out_shape, nelems_out),
         'instrs': {'mov': nelems_out},
     }
     # Pre-populating ``perf_stats`` short-circuits ``SimOp.get_perf_counts()``
@@ -2591,11 +2610,8 @@ def linear(*args, **kwargs):
         input_tensors.append(bias_tensor)
 
     opinfo["outList"] = [C.name]
-    opobj = SimOp(opinfo)
-    opobj.get_perf_counts(input_tensors, [C])
-    opobj.update_tensor_counts(input_tensors, [C])
-
-    # Handle both dtype and output_dtype parameters (dtype is an alias for output_dtype)
+    # Handle both dtype and output_dtype parameters (dtype is an alias for output_dtype).
+    # Resolved BEFORE get_perf_counts: outBytes is sized there and needs C._ttnn_dtype.
     output_dtype = kwargs.get("output_dtype", None)
     if output_dtype is None:
         output_dtype = kwargs.get("dtype", None)
@@ -2609,6 +2625,10 @@ def linear(*args, **kwargs):
         # despite bf4 weights). Propagating from all inputs would leak the weight's
         # compact dtype into every downstream activation.
         _propagate_ttnn_dtype([A], [C])
+
+    opobj = SimOp(opinfo)
+    opobj.get_perf_counts(input_tensors, [C])
+    opobj.update_tensor_counts(input_tensors, [C])
 
     _propagate_memory_config(input_tensors, [C])
 
@@ -2732,9 +2752,10 @@ def fold(
             'attrs': fold_attrs,
         }
         opobj = SimOp(opinfo)
+        # Output TT dtype first: get_perf_counts sizes outBytes from it (see permute_op).
+        _propagate_ttnn_dtype([ttnn_tensor_like], [out_tensor])
         opobj.get_perf_counts([ttnn_tensor_like], [out_tensor])
         opobj.update_tensor_counts([ttnn_tensor_like], [out_tensor])
-        _propagate_ttnn_dtype([ttnn_tensor_like], [out_tensor])
         out_tensor._memory_config = MemoryConfig(
             TensorMemoryLayout.HEIGHT_SHARDED, BufferType.L1,
         )

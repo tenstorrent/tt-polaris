@@ -219,6 +219,7 @@ class Tensor(SimTensor):
             else:
                 raise TypeError(f"Invalid padded_shape type: {type(padded_shape)}")
 
+        self._record_padded_basis()
         logger.debug("Tensor constructor: {} logical_shape {} and padded_shape {}", self.name, self._logical_shape, self._padded_shape)
 
         self.fill_value = kwargs.get('fill_value', None)
@@ -266,6 +267,15 @@ class Tensor(SimTensor):
 
     def padded_shape(self):
         return self._padded_shape
+
+    def _record_padded_basis(self) -> None:
+        """Remember the logical shape the current ``_padded_shape`` was set for.
+
+        Byte accounting (SimTensor._storage_shape_list) trusts ``padded_shape()`` only while the tensor's
+        shape still equals this basis. A shape assigned directly (``t.shape = ...``, bypassing
+        ``set_shape``) leaves the basis behind, which marks the padded shape as stale. ``_logical_shape``
+        cannot serve: ``set_shape`` does not update it. Call this wherever ``_padded_shape`` is assigned."""
+        self._padded_basis = None if self.shape is None else [int(d) for d in self.shape]
 
     def _calculate_padded_shape(self, logical_shape, layout):
         """Calculate padded shape based on logical shape and layout."""
@@ -371,6 +381,7 @@ class Tensor(SimTensor):
         super().set_shape(newshape) 
         if newshape is not None:
             self._padded_shape = self._calculate_padded_shape(Shape(newshape), self.layout)
+            self._record_padded_basis()
         logger.debug("set_shape: {} layout {} newshape {} and padded_shape {}", self.name, self.layout, newshape, self._padded_shape)
 
 

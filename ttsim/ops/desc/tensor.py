@@ -693,8 +693,12 @@ def concat_sinf(iTList, oTList, op, **kwargs):
     #out2_shape = [len(iTList)]
     #out2_data  = [x.shape for x in Xs]
 
-    inBytes = sum((x.nbytes(op.precision) for x in norm))
-    inElems = sum((x.nelems() for x in norm))
+    # Size the inputs from the ORIGINAL tensors, not the normalised copies: squeezing spurious size-1
+    # dims does not change what is stored, and only the originals carry the TT dtype, layout and
+    # padded shape that nbytes() reads (a _detached_copy has none of them, so a bfp8 input was
+    # counted at the numpy fallback width while the output was tile-exact).
+    inBytes = sum((x.nbytes(op.precision) for x in iTList))
+    inElems = sum((x.nelems() for x in iTList))
     op.perf_stats = {
             'inBytes' : inBytes,
             'inElems' : inElems,

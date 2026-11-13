@@ -539,6 +539,7 @@ def _propagate_bcast_hw_shape(X0: Any, X1: Any, Y: Any) -> None:
     if list(getattr(X0, 'shape', [])) != list(getattr(Y, 'shape', [])):
         return
     Y.hw_shape = list(src)
+    Y._hw_shape_halo = bool(getattr(X0, '_hw_shape_halo', False))
 
 
 def bidir_bcast(iTList, oTList, op, **kwargs):

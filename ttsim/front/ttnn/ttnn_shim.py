@@ -1621,6 +1621,7 @@ def _reshape_simop_tracked_output(
     if padded_list is not None:
         SimTensor.set_shape(out, logical_list)
         out._padded_shape = Shape(padded_list)
+        out._record_padded_basis()   # padded_list belongs to logical_list (see Tensor._record_padded_basis)
     return out
 
 
@@ -1900,9 +1901,12 @@ def permute_op(input_tensor, dims, memory_config=None):
         'attrs': attrs,
     }
     opobj = SimOp(opinfo)
+    # Resolve the output TT dtype BEFORE get_perf_counts: the Permute descriptor sizes outBytes with
+    # SimTensor.nbytes(), which reads the tensor's own dtype, so a bfp8 / bfp4 output would otherwise
+    # be counted at the fallback width.
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     input_tensor.device.add_op(opobj)
     return out_tensor
 
