@@ -927,9 +927,15 @@ def test_conv_transpose2d_memory_validation(capsys, request):
         )
 
         # Validate data movement
-        expected_in_bytes = (
-            input_elems + weight_elems + bias_elems
-        ) * bytes_per_element
+        # The ConvTranspose descriptor models weights/bias as they sit on HW: preprocessed to
+        # BFLOAT8_B TILE (1088 B per 32x32 tile) with weight shape [1, 1, C_in*kH*kW, C_out] and bias
+        # [1, 1, 1, C_out]. Activations stay fp32 (this test's tensors carry no TT dtype).
+        bfp8_tile_bytes = 1088
+        weight_bytes = (
+            -(-(W_shape[0] * kH * kW) // 32) * -(-C_out // 32) * bfp8_tile_bytes
+        )
+        bias_bytes = (1 * -(-C_out // 32) * bfp8_tile_bytes) if has_bias else 0
+        expected_in_bytes = input_elems * bytes_per_element + weight_bytes + bias_bytes
         expected_out_bytes = output_elems * bytes_per_element
 
         assert (
@@ -1004,8 +1010,8 @@ def test_conv_transpose2d_memory_validation(capsys, request):
         logger.debug("\n  ══ Memory Estimation ══")
 
         input_memory = input_elems * bytes_per_element
-        weight_memory = weight_elems * bytes_per_element
-        bias_memory = bias_elems * bytes_per_element if has_bias else 0
+        weight_memory = weight_bytes  # HW layout: BFLOAT8_B TILE (see data-movement check above)
+        bias_memory = bias_bytes
         output_memory = output_elems * bytes_per_element
 
         logger.debug(

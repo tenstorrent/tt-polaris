@@ -1200,13 +1200,16 @@ class Device:
             # analytical mem cycles, making the aggregate inconsistent.
             mem_to_dev_ratio = self.freq_MHz / self.memfreq_MHz
             expected_bytes_per_device_clock = self.eff_bw_bytes_per_cycle / mem_to_dev_ratio
+            # Float-noise slack: tile-exact byte totals can make expected_cycles land exactly on an integer
+            # while the summed fractional cycles ceil one above it (e.g. 1886186 vs 1886185.0).
+            tol = 1e-6
 
             if tot_mem_rd_cycles > 0:
                 actual_bytes_per_device_clock = tot_inBytes / tot_mem_rd_cycles
                 # Allow for a single cycle of rounding error from the final ceil operation
                 expected_cycles = (tot_inBytes / self.eff_bw_bytes_per_cycle) * mem_to_dev_ratio
                 # Check both directions: cycles should be close to expected (within +1 for ceiling)
-                if tot_mem_rd_cycles > expected_cycles + 1 or tot_mem_rd_cycles < expected_cycles - 1:
+                if tot_mem_rd_cycles > expected_cycles + 1 + tol or tot_mem_rd_cycles < expected_cycles - 1 - tol:
                     raise ValueError(
                         f"Memory bandwidth validation failed (read):\n"
                         f"  Calculated bytes_per_device_clock: {actual_bytes_per_device_clock:.2f}\n"
@@ -1219,7 +1222,7 @@ class Device:
                 actual_bytes_per_device_clock = tot_outBytes / tot_mem_wr_cycles
                 expected_cycles = (tot_outBytes / self.eff_bw_bytes_per_cycle) * mem_to_dev_ratio
                 # Check both directions: cycles should be close to expected (within +1 for ceiling)
-                if tot_mem_wr_cycles > expected_cycles + 1 or tot_mem_wr_cycles < expected_cycles - 1:
+                if tot_mem_wr_cycles > expected_cycles + 1 + tol or tot_mem_wr_cycles < expected_cycles - 1 - tol:
                     raise ValueError(
                         f"Memory bandwidth validation failed (write):\n"
                         f"  Calculated bytes_per_device_clock: {actual_bytes_per_device_clock:.2f}\n"

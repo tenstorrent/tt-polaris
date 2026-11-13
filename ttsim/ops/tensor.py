@@ -2,11 +2,27 @@
 # SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 import functools, operator
+import math
 import warnings
 from typing import Any, Optional, Union
 
 import numpy as np
 from ttsim.utils.types import get_bpe, get_sim_dtype
+
+# Bytes per 32x32 tile for TT block-float formats: mantissas + one shared exponent byte per 16 values.
+# tt-metal tt_backend_api_types.hpp: Bfp8_b = 256*4 + 16*4, Bfp4_b = 128*4 + 16*4.
+_BLOCK_FLOAT_TILE_BYTES = {'BFLOAT8_B': 1088, 'BFLOAT4_B': 576}
+_TILE = 32
+
+
+def _tile_exact_nbytes(shape: list, tile_bytes: int) -> int:
+    """Bytes of a tiled tensor: last two dims rounded up to whole 32x32 tiles."""
+    dims = [int(d) for d in shape] or [1]
+    if len(dims) == 1:
+        dims = [1] + dims
+    lead = functools.reduce(operator.mul, dims[:-2], 1)
+    return lead * math.ceil(dims[-2] / _TILE) * math.ceil(dims[-1] / _TILE) * tile_bytes
+
 
 class Shape:
     """
@@ -233,6 +249,68 @@ class SimTensor:
     #   to represent tiling formats here.
     # Note: Caching nbytes for instance methods can cause memory leaks due to references held by lru_cache.
     # If caching is needed, consider using a static cache or external memoization.
+    def _storage_shape_list(self, storage_shape=None) -> list:
+        """Physical (stored) shape as a list. Precedence: explicit ``storage_shape`` > ``hw_shape``
+        (conv-path NHWC-flattened / weight layout) > ``padded_shape()`` (ttnn tensors; carries explicit
+        padding beyond tile rounding) > logical shape."""
+        if storage_shape is not None:
+            return [int(d) for d in storage_shape]
+        hw = getattr(self, 'hw_shape', None)
+        if hw is not None:
+            return [int(d) for d in hw]
+        padded = getattr(self, 'padded_shape', None)
+        if callable(padded):
+            try:
+                ps = padded()
+            except Exception:
+                ps = None
+            if ps is not None:
+                ps_list = [int(d) for d in ps]
+                logical = [int(d) for d in require_shape_list(self.shape, 'storage shape: tensor shape must be set')]
+                # A stale padded shape (output tensors whose shape was assigned directly during shape
+                # inference) is inconsistent with the logical shape; only trust a consistent one.
+                if len(ps_list) == len(logical) and all(p >= l for p, l in zip(ps_list, logical)):
+                    return ps_list
+        return [int(d) for d in require_shape_list(self.shape, 'storage shape: tensor shape must be set')]
+
+    def _poc_nbytes(self, storage_shape=None):
+        """Bytes from the tensor's own TT dtype (always on); None when the tensor has no TT dtype.
+
+        dtype/layout precedence: ``_hw_dtype``/``_hw_layout`` (what the tensor is on HW, e.g. conv
+        weights preprocessed to BFLOAT8_B TILE) over ``_ttnn_dtype``/``layout``. Tiled tensors of ANY
+        dtype are padded to whole 32x32 tiles of the stored shape (see ``_storage_shape_list``);
+        block-float formats use tt-metal tile sizes, other dtypes ``1024 * itemsize`` per tile.
+        """
+        if self.shape is None:
+            return None
+        hw_dtype = getattr(self, '_hw_dtype', None)
+        tt_dtype = hw_dtype if hw_dtype is not None else getattr(self, '_ttnn_dtype', None)
+        if tt_dtype is None:
+            return None
+        sshape = self._storage_shape_list(storage_shape)
+        selems = functools.reduce(operator.mul, sshape, 1)
+        layout = getattr(self, '_hw_layout', None) if hw_dtype is not None else None
+        if layout is None:
+            layout = getattr(self, 'layout', None)
+        tiled = getattr(layout, 'name', '') == 'TILE_LAYOUT'
+        if tt_dtype.name in _BLOCK_FLOAT_TILE_BYTES:
+            tile_bytes = _BLOCK_FLOAT_TILE_BYTES[tt_dtype.name]
+            # Tile padding applies only to tensors stored tiled. Row-major block-float tensors (e.g. conv
+            # weights in OIHW) are re-laid-out before tiling on HW, so padding their logical last two dims
+            # would overstate them; count exponent overhead only.
+            if not tiled:
+                return int(selems * tile_bytes / (_TILE * _TILE))
+            return _tile_exact_nbytes(sshape, tile_bytes)
+        if not tiled:
+            return int(selems * tt_dtype.itemsize)
+        return int(_tile_exact_nbytes(sshape, _TILE * _TILE * tt_dtype.itemsize))
+
+    def storage_nbytes(self, storage_shape=None):
+        """Dtype- and tile-aware bytes of this tensor stored as ``storage_shape`` (default: its own
+        stored shape). ``None`` when the tensor has no TT dtype; callers
+        then fall back to ``elements * element_size``."""
+        return self._poc_nbytes(storage_shape)
+
     def nbytes(self, itemprec=None):
         def typesize(dtype):
             if isinstance(dtype, np.dtype):
@@ -241,6 +319,12 @@ class SimTensor:
                 return get_bpe(get_sim_dtype(dtype))
             else:
                 raise TypeError(f"Unsupported dtype type: {type(dtype)}")
+        # The tensor's own TT dtype wins over the caller's itemprec. Descriptors
+        # pass op.precision, which the backend always sets (WorkloadGraph.set_precision), so gating on
+        # itemprec is None would skip this for nearly every op.
+        poc = self._poc_nbytes()
+        if poc is not None:
+            return poc
         if itemprec is None:
             assert self.dtype is not None, f"SimTensor({self.name}) has no dtype to calculate nbytes"
             itemsize = typesize(self.dtype)
