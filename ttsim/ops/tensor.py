@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 import functools, operator
+import math
 import warnings
 from collections.abc import Iterable, Iterator, Sequence
 from typing import Any, Optional, Union, overload
 
 import numpy as np
+from loguru import logger
 from ttsim.utils.types import get_bpe, get_sim_dtype
 
 # One dimension of a shape, as stored by Shape.
@@ -65,6 +67,22 @@ def _as_int_dim(d: Any) -> Any:
     of [2**20, 2**12] otherwise reduces to np.int32(0) with an overflow warning.
     """
     return int(d) if isinstance(d, np.integer) else d
+
+
+# Bytes per 32x32 tile for TT block-float formats: mantissas + one shared exponent byte per 16 values.
+# tt-metal tt_backend_api_types.hpp: Bfp8_b = 256*4 + 16*4, Bfp4_b = 128*4 + 16*4.
+_BLOCK_FLOAT_TILE_BYTES = {'BFLOAT8_B': 1088, 'BFLOAT4_B': 576}
+_TILE = 32
+
+
+def _tile_exact_nbytes(shape: list, tile_bytes: int) -> int:
+    """Bytes of a tiled tensor: last two dims rounded up to whole 32x32 tiles."""
+    dims = [int(d) for d in shape] or [1]
+    if len(dims) == 1:
+        dims = [1] + dims
+    lead = functools.reduce(operator.mul, dims[:-2], 1)
+    return lead * math.ceil(dims[-2] / _TILE) * math.ceil(dims[-1] / _TILE) * tile_bytes
+
 
 class Shape:
     """
@@ -201,8 +219,9 @@ def nchw_to_nhwc_flat(shape: list[int]) -> list[int]:
     """Convert NCHW [N, C, H, W] to hardware NHWC-flattened [1, 1, N*H*W, C].
 
     Tenstorrent hardware stores activations as [1, 1, N*H*W, C] (spatial dims
-    folded into rows, channels last).  This hw_shape drives LUT key construction
-    and profiler-shape comparison; the logical NCHW shape is kept in tensor.shape.
+    folded into rows, channels last).  This hw_shape drives LUT key construction,
+    profiler-shape comparison and byte accounting (SimTensor._storage_shape_list);
+    the logical NCHW shape is kept in tensor.shape.
 
     Only valid for rank-4 NCHW inputs with 2 spatial dims.
 
@@ -237,10 +256,23 @@ class SimTensor:
         self.has_grad    = cfg.get('has_grad', True)  # Has a gradient during bwd pass? Boolean
         self.link_module = None                       # Associated Module
         # hw_shape: NHWC-flattened [1, 1, N*H*W, C] used for LUT key matching and profiler comparison.
+        # It also drives byte accounting: it is the stored shape nbytes() sizes the tensor on (see
+        # _storage_shape_list), and is ignored, with a warning, if it holds fewer elements than shape --
+        # except on halo outputs (_hw_shape_halo), where a strided halo is legitimately smaller.
         # Set by conv/pool sinfs; propagated by Move/ITS/STI/Reshard/Concat passthrough sinfs.
         # None for ops that produce non-NCHW outputs (attention projections, embeddings, etc.).
         # TODO: set hw_shape for MaxPool/AvgPool descriptors if LUT coverage is extended.
         self.hw_shape: list[int] | None = None
+        # True when hw_shape is a halo output (set by halo_sinf, carried by _propagate_hw_shape). Its
+        # hw_shape is the halo buffer: each core's shard plus the boundary sticks and padding the conv
+        # window needs, so it can be larger than the logical tensor (zero-inserted transposed-conv input)
+        # or smaller (a strided conv skips sticks), and byte accounting uses it at any size.
+        # This is intended: an op that reads a halo output (Conv, ConvTranspose, MaxPool) reads that buffer
+        # on hardware, and the capture records it as the op's input. Example, VGG-UNet WH's last
+        # ConvTranspose: logical [1, 128, 128, 128] = 16384 sticks, halo buffer and captured input 82240
+        # sticks. These buffers are L1-resident; the analytical model still charges them at the DRAM
+        # rate, which is a separate L1-modelling gap.
+        self._hw_shape_halo: bool = False
         # x_pad_logical: padded channel count for LUT key construction when this tensor feeds
         # a BLOCK_SHARDED conv2d/conv_transpose2d.  Set by the Device.execute_graph annotation
         # pass (post-shim, post-arch-load) via determine_block_sharded_channel_padding.
@@ -321,13 +353,105 @@ class SimTensor:
         else:
             self.shape = Shape(newshape)
 
-    # Note:
-    #   data size may not be just data-count * precision, because you may have compression/sparsity
-    #   how is the tensor stored in memory? channel first, batch later or something else. may have
-    #   to represent tiling formats here.
+    # Note: bytes are sized from the TT dtype and the stored shape: TILE layout pads to whole 32x32 tiles
+    # and block-float formats use their tile sizes (see _storage_shape_list / _tt_dtype_nbytes).
+    # Compression and sparsity are not modelled.
+    def _storage_shape_list(self, storage_shape: Sequence[int] | None = None) -> list[int]:
+        """Physical (stored) shape as a list. Precedence: explicit ``storage_shape`` > ``hw_shape``
+        (conv-path NHWC-flattened / weight layout) > ``padded_shape()`` (ttnn tensors; carries explicit
+        padding beyond tile rounding) > logical shape.
+
+        ``hw_shape`` and ``padded_shape()`` are checked before use, because both now drive byte counts:
+          * ``hw_shape`` must hold at least as many elements as the logical shape (it is a re-layout of the
+            same data), unless it is a halo output (``_hw_shape_halo``): a strided halo keeps only the
+            sticks the conv reads, so it can be smaller. Any other smaller one is stale or mis-propagated:
+            it is logged once per tensor and the logical shape is used instead.
+          * ``padded_shape()`` is used only while the tensor's shape still equals the shape it was computed
+            for (``_padded_basis``, recorded wherever ``_padded_shape`` is assigned). A shape assigned
+            directly afterwards makes it stale, and it is ignored.
+        """
+        if storage_shape is not None:
+            return [int(d) for d in storage_shape]
+        logical = [int(d) for d in require_shape_list(self.shape, 'storage shape: tensor shape must be set')]
+        hw = getattr(self, 'hw_shape', None)
+        if hw is not None:
+            hw_list = [int(d) for d in hw]
+            if (getattr(self, '_hw_shape_halo', False)
+                    or functools.reduce(operator.mul, hw_list, 1) >= functools.reduce(operator.mul, logical, 1)):
+                return hw_list
+            if not getattr(self, '_hw_shape_mismatch_logged', False):
+                self._hw_shape_mismatch_logged = True
+                logger.warning(
+                    "SimTensor({}): hw_shape {} holds fewer elements than shape {}; "
+                    "sizing bytes on the logical shape", self.name, hw_list, logical)
+        padded = getattr(self, 'padded_shape', None)
+        if callable(padded):
+            try:
+                ps = padded()
+            except (AttributeError, TypeError) as e:     # no padded shape on this tensor
+                logger.debug("SimTensor({}): padded_shape() unavailable ({}); using logical shape", self.name, e)
+                ps = None
+            if ps is not None:
+                ps_list = [int(d) for d in ps]
+                basis = getattr(self, '_padded_basis', None)
+                fresh = logical == basis if basis is not None else True
+                if fresh and len(ps_list) == len(logical) and all(p >= l for p, l in zip(ps_list, logical)):
+                    return ps_list
+        return logical
+
+    def _tt_dtype_nbytes(self, storage_shape: Sequence[int] | None = None) -> int | None:
+        """Bytes from the tensor's own TT dtype (always on); None when the tensor has no TT dtype.
+
+        dtype/layout precedence: ``_hw_dtype``/``_hw_layout`` (what the tensor is on HW, e.g. conv
+        weights preprocessed to BFLOAT8_B TILE) over ``_ttnn_dtype``/``layout``. Tiled tensors of ANY
+        dtype are padded to whole 32x32 tiles of the stored shape (see ``_storage_shape_list``);
+        block-float formats use tt-metal tile sizes, other dtypes ``1024 * itemsize`` per tile.
+        """
+        if self.shape is None:
+            return None
+        hw_dtype = getattr(self, '_hw_dtype', None)
+        tt_dtype = hw_dtype if hw_dtype is not None else getattr(self, '_ttnn_dtype', None)
+        if tt_dtype is None:
+            return None
+        sshape = self._storage_shape_list(storage_shape)
+        selems = functools.reduce(operator.mul, sshape, 1)
+        layout = getattr(self, '_hw_layout', None) if hw_dtype is not None else None
+        if layout is None:
+            layout = getattr(self, 'layout', None)
+        tiled = getattr(layout, 'name', '') == 'TILE_LAYOUT'
+        if tt_dtype.name in _BLOCK_FLOAT_TILE_BYTES:
+            tile_bytes = _BLOCK_FLOAT_TILE_BYTES[tt_dtype.name]
+            # Tile padding applies only to tensors stored tiled. Row-major block-float tensors (e.g. conv
+            # weights in OIHW) are re-laid-out before tiling on HW, so padding their logical last two dims
+            # would overstate them; count exponent overhead only. int() floors the fractional exponent
+            # bytes (under 1 B per tensor).
+            if not tiled:
+                return int(selems * tile_bytes / (_TILE * _TILE))
+            return _tile_exact_nbytes(sshape, tile_bytes)
+        if not tiled:
+            return int(selems * tt_dtype.itemsize)
+        return int(_tile_exact_nbytes(sshape, _TILE * _TILE * tt_dtype.itemsize))
+
+    def storage_nbytes(self, storage_shape: Sequence[int] | None = None) -> int | None:
+        """Dtype- and tile-aware bytes of this tensor stored as ``storage_shape`` (default: its own
+        stored shape). ``None`` when the tensor has no TT dtype; callers
+        then fall back to ``elements * element_size``."""
+        return self._tt_dtype_nbytes(storage_shape)
+
     # Note: Caching nbytes for instance methods can cause memory leaks due to references held by lru_cache.
     # If caching is needed, consider using a static cache or external memoization.
     def nbytes(self, itemprec: Optional[Union[np.dtype, str]] = None) -> int:
+        """Size of this tensor in bytes.
+
+        Precedence:
+          1. The tensor's own TT dtype (``_hw_dtype`` if set, else ``_ttnn_dtype``): bytes of its stored
+             shape (see ``_storage_shape_list``). TILE tensors are padded to whole 32x32 tiles; block-float
+             tiles are 1088 B (bfp8) / 576 B (bfp4); row-major block-float counts the exponent overhead.
+          2. ``itemprec`` (descriptors pass ``op.precision``, i.e. the WL2Arch ``data_type_spec``):
+             ``nelems() * itemsize``. It applies only to tensors with no TT dtype, so a ``data_type_spec``
+             "what-if" precision does not change ttnn tensors that carry a TT dtype.
+          3. The tensor's numpy ``dtype``: ``nelems() * itemsize``.
+        """
         def typesize(dtype):
             if isinstance(dtype, np.dtype):
                 return dtype.itemsize
@@ -335,12 +459,18 @@ class SimTensor:
                 return get_bpe(get_sim_dtype(dtype))
             else:
                 raise TypeError(f"Unsupported dtype type: {type(dtype)}")
+        # The tensor's own TT dtype wins over the caller's itemprec. Descriptors
+        # pass op.precision, which the backend always sets (WorkloadGraph.set_precision), so gating on
+        # itemprec is None would skip this for nearly every op.
+        tt_nbytes = self._tt_dtype_nbytes()
+        if tt_nbytes is not None:
+            return tt_nbytes
         if itemprec is None:
             assert self.dtype is not None, f"SimTensor({self.name}) has no dtype to calculate nbytes"
             itemsize = typesize(self.dtype)
         else:
             itemsize = typesize(itemprec)
-        return self.nelems() * itemsize #assumes np.dtype
+        return self.nelems() * itemsize
 
     def check_shape(self) -> bool:
         if self.shape is None:

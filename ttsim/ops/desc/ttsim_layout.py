@@ -11,7 +11,7 @@ Used by the TTNN front-end tracking-only operator APIs (*_op helpers) in ttnn_sh
 """
 
 from ttsim.ops.desc.registry import register_ops
-from ttsim.ops.tensor import _coerce_shape_to_list, require_shape_list
+from ttsim.ops.tensor import SimTensor, _coerce_shape_to_list, require_shape_list
 
 TILE_HEIGHT = 32
 TILE_WIDTH = 32
@@ -446,6 +446,15 @@ def untilize_with_unpadding_sinf(iTList, oTList, op, **kwargs):
     return
 
 
+def _propagate_hw_shape(X: SimTensor, Y: SimTensor) -> None:
+    """Copy ``hw_shape`` from ``X`` to ``Y`` together with the halo marker (``_hw_shape_halo``).
+
+    A halo output's ``hw_shape`` may hold fewer elements than its logical shape (strided halo); the marker
+    tells byte accounting that this is real, not stale, wherever the shape is passed on."""
+    Y.hw_shape = getattr(X, 'hw_shape', None)
+    Y._hw_shape_halo = bool(getattr(X, '_hw_shape_halo', False))
+
+
 def interleaved_to_sharded_sinf(iTList, oTList, op, **kwargs):
     """Shape inference for InterleavedToSharded: 1->1, same logical shape (memory layout change only)."""
     assert len(iTList) == 1 and len(oTList) == 1
@@ -456,7 +465,7 @@ def interleaved_to_sharded_sinf(iTList, oTList, op, **kwargs):
     )
     oTList[0].shape = list(in_shape)
     oTList[0].dtype = X.dtype
-    oTList[0].hw_shape = getattr(X, 'hw_shape', None)  # propagate NHWC-flattened hw shape
+    _propagate_hw_shape(X, oTList[0])  # propagate NHWC-flattened hw shape (and its halo marker)
 
     elem_size = op.attrs.get('element_size', 2)
     elems = _nelems(in_shape)
@@ -480,7 +489,7 @@ def sharded_to_interleaved_sinf(iTList, oTList, op, **kwargs):
     )
     oTList[0].shape = list(in_shape)
     oTList[0].dtype = X.dtype
-    oTList[0].hw_shape = getattr(X, 'hw_shape', None)  # propagate NHWC-flattened hw shape
+    _propagate_hw_shape(X, oTList[0])  # propagate NHWC-flattened hw shape (and its halo marker)
 
     elem_size = op.attrs.get('element_size', 2)
     elems = _nelems(in_shape)
@@ -504,7 +513,7 @@ def reshard_sinf(iTList, oTList, op, **kwargs):
     )
     oTList[0].shape = list(in_shape)
     oTList[0].dtype = X.dtype
-    oTList[0].hw_shape = getattr(X, 'hw_shape', None)  # propagate NHWC-flattened hw shape
+    _propagate_hw_shape(X, oTList[0])  # propagate NHWC-flattened hw shape (and its halo marker)
 
     elem_size = op.attrs.get('element_size', 2)
     elems = _nelems(in_shape)
@@ -702,9 +711,13 @@ def halo_sinf(iTList, oTList, op, **kwargs):
         # estimates from analytical fallback are consistent with hw_shape.
         C = in_shape[1]  # NCHW channel dim
         oTList[0].hw_shape = [1, 1, ext_y, C]
+        # A strided halo keeps only the sticks the conv reads, so ext_y can be BELOW the logical N*H*W
+        # (WH resnet50 layer2.0 downsample: 46984 < 50176, as the capture records). Mark it so byte
+        # accounting does not treat the smaller hw_shape as stale (SimTensor._storage_shape_list).
+        oTList[0]._hw_shape_halo = True
         out_elems = ext_y * C
     else:
-        oTList[0].hw_shape = getattr(X, 'hw_shape', None)
+        _propagate_hw_shape(X, oTList[0])
         out_elems = elems  # logical passthrough
 
     op.perf_stats = {
@@ -732,7 +745,7 @@ def copy_sinf(iTList, oTList, op, **kwargs):
     )
     oTList[0].shape = list(in_shape)
     oTList[0].dtype = X.dtype
-    oTList[0].hw_shape = getattr(X, 'hw_shape', None)  # propagate NHWC-flattened hw shape
+    _propagate_hw_shape(X, oTList[0])  # propagate NHWC-flattened hw shape (and its halo marker)
 
     elem_size = op.attrs.get('element_size', 2)
     elems = _nelems(in_shape)
@@ -761,7 +774,7 @@ def move_sinf(iTList, oTList, op, **kwargs):
     )
     oTList[0].shape = list(in_shape)
     oTList[0].dtype = X.dtype
-    oTList[0].hw_shape = getattr(X, 'hw_shape', None)  # propagate NHWC-flattened hw shape
+    _propagate_hw_shape(X, oTList[0])  # propagate NHWC-flattened hw shape (and its halo marker)
 
     elem_size = op.attrs.get('element_size', 2)
     elems = _nelems(in_shape)
