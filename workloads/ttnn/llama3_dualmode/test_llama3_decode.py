@@ -57,6 +57,10 @@ def run_llama3_dualmode_decode(wlname: str, ttnn_device, cfg: dict):
         max_batch_size=batch, max_seq_len=cfg.get('max_seq_len', 4096), dummy_weights=True,
     )
     args.n_layers = num_layers
+    if IS_POLARIS:
+        # Decode reads the paged KV cache for positions 0..max_seq_len-1; the SDPA/KV-cache perf model
+        # sizes its traffic from this position (the last slot, the worst case for max_seq_len).
+        ttnn_device.kv_cache_pos = args.max_seq_len - 1
 
     state_dict = None
     model = Transformer(
