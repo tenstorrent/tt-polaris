@@ -1432,9 +1432,9 @@ def tilize_op(input_tensor, use_multicore=True, element_size=2, memory_config=No
         'attrs': {'use_multicore': use_multicore, 'element_size': element_size},
     }
     opobj = SimOp(opinfo)
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     if memory_config is not None:
         out_tensor._memory_config = memory_config
     input_tensor.device.add_op(opobj)
@@ -1524,9 +1524,9 @@ def tilize_with_val_padding_op(input_tensor, output_padded_shape, pad_value,
         'attrs': attrs,
     }
     opobj = SimOp(opinfo)
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     if memory_config is not None:
         out_tensor._memory_config = memory_config
     input_tensor.device.add_op(opobj)
@@ -1900,9 +1900,11 @@ def permute_op(input_tensor, dims, memory_config=None):
         'attrs': attrs,
     }
     opobj = SimOp(opinfo)
+    # Resolve the output TT dtype BEFORE get_perf_counts: outBytes is sized there from the tensor's
+    # own dtype, so a bfp8 / bfp4 output would otherwise be counted at the fallback width.
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     input_tensor.device.add_op(opobj)
     return out_tensor
 
@@ -2350,10 +2352,11 @@ def interleaved_to_sharded_op(input_tensor, memory_config=None, element_size=2):
             'memory_config': memory_config_attr,
         },
     }
+    # Resolve the output TT dtype BEFORE get_perf_counts: outBytes is sized there from the dtype.
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj = SimOp(opinfo)
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     if memory_config is not None:
         out_tensor._memory_config = memory_config
     input_tensor.device.add_op(opobj)
@@ -2448,10 +2451,11 @@ def sharded_to_interleaved_op(input_tensor, memory_config=None, element_size=2):
             'memory_config': memory_config_attr,
         },
     }
+    # Resolve the output TT dtype BEFORE get_perf_counts: outBytes is sized there from the dtype.
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj = SimOp(opinfo)
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     if memory_config is not None:
         out_tensor._memory_config = memory_config
     else:
@@ -2498,9 +2502,9 @@ def copy_op(input_tensor, memory_config, element_size=2):
         },
     }
     opobj = SimOp(opinfo)
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     out_tensor._memory_config = memory_config
     input_tensor.device.add_op(opobj)
     return out_tensor
@@ -2601,10 +2605,11 @@ def reshard_op(input_tensor, memory_config=None, element_size=2):
             'memory_config': memory_config_attr,
         },
     }
+    # Resolve the output TT dtype BEFORE get_perf_counts: outBytes is sized there from the dtype.
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj = SimOp(opinfo)
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     if memory_config is not None:
         out_tensor._memory_config = memory_config
     input_tensor.device.add_op(opobj)
@@ -2801,9 +2806,9 @@ def nlp_concat_heads_op(input_tensor, memory_config=None, element_size=2):
         'attrs': {'element_size': element_size},
     }
     opobj = SimOp(opinfo)
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
 
     # nlp_concat_heads always produces L1_BLOCK_SHARDED output on hardware regardless of input.
     out_tensor._memory_config = memory_config if memory_config is not None else MemoryConfig(
@@ -2967,9 +2972,9 @@ def nlp_create_qkv_heads_op(input_tensor, kv_input_tensor=None, *,
     }
     opobj = SimOp(opinfo)
     out_tensors = [q_tensor, k_tensor, v_tensor]
+    _propagate_ttnn_dtype(in_tensors, out_tensors)
     opobj.get_perf_counts(in_tensors, out_tensors)
     opobj.update_tensor_counts(in_tensors, out_tensors)
-    _propagate_ttnn_dtype(in_tensors, out_tensors)
 
     out_mc = memory_config if memory_config is not None else MemoryConfig(
         TensorMemoryLayout.HEIGHT_SHARDED, BufferType.L1,
@@ -3174,9 +3179,9 @@ def rotary_embedding_llama_op(x, cos, sin, trans_mat, is_decode_mode=False,
         'attrs': {'is_decode_mode': bool(is_decode_mode), 'element_size': element_size},
     }
     opobj = SimOp(opinfo)
+    _propagate_ttnn_dtype([x], [out_tensor])
     opobj.get_perf_counts(in_tensors, [out_tensor])
     opobj.update_tensor_counts(in_tensors, [out_tensor])
-    _propagate_ttnn_dtype([x], [out_tensor])
     out_tensor._memory_config = memory_config if memory_config is not None else getattr(x, '_memory_config', None)
     x.device.add_op(opobj)
     return out_tensor
@@ -3210,10 +3215,10 @@ def rotary_embedding_llama_fused_qk_op(q, k, cos, sin, trans_mat,
     }
     opobj = SimOp(opinfo)
     out_tensors = [q_out, k_out]
-    opobj.get_perf_counts(in_tensors, out_tensors)
-    opobj.update_tensor_counts(in_tensors, out_tensors)
     _propagate_ttnn_dtype([q], [q_out])
     _propagate_ttnn_dtype([k], [k_out])
+    opobj.get_perf_counts(in_tensors, out_tensors)
+    opobj.update_tensor_counts(in_tensors, out_tensors)
     if memory_config is not None:
         q_out._memory_config = memory_config
         k_out._memory_config = memory_config
@@ -3284,9 +3289,9 @@ def manual_seed_op(seeds, user_ids=None, sub_core_grids=None, element_size=2):
         'attrs': {'element_size': element_size},
     }
     opobj = SimOp(opinfo)
+    _propagate_ttnn_dtype([seeds], [out_tensor])
     opobj.get_perf_counts(in_tensors, [out_tensor])
     opobj.update_tensor_counts(in_tensors, [out_tensor])
-    _propagate_ttnn_dtype([seeds], [out_tensor])
     seeds.device.add_op(opobj)
     return out_tensor
 
@@ -3327,9 +3332,9 @@ def sampling_op(topk_values, topk_indices, k=None, p=None, temp=None,
         'attrs': {'element_size': element_size},
     }
     opobj = SimOp(opinfo)
+    _propagate_ttnn_dtype([topk_indices], [out_tensor])
     opobj.get_perf_counts(in_tensors, [out_tensor])
     opobj.update_tensor_counts(in_tensors, [out_tensor])
-    _propagate_ttnn_dtype([topk_indices], [out_tensor])
     topk_values.device.add_op(opobj)
     return out_tensor
 
@@ -3362,10 +3367,10 @@ def paged_fused_update_cache_op(k_cache, k, v_cache, v, update_idxs_tensor=None,
     }
     opobj = SimOp(opinfo)
     out_tensors = [k_out, v_out]
-    opobj.get_perf_counts(in_tensors, out_tensors)
-    opobj.update_tensor_counts(in_tensors, out_tensors)
     _propagate_ttnn_dtype([k_cache], [k_out])
     _propagate_ttnn_dtype([v_cache], [v_out])
+    opobj.get_perf_counts(in_tensors, out_tensors)
+    opobj.update_tensor_counts(in_tensors, out_tensors)
     if memory_config is not None:
         k_out._memory_config = memory_config
         v_out._memory_config = memory_config
@@ -3428,9 +3433,9 @@ def nlp_create_qkv_heads_decode_op(input_tensor, *, num_heads, num_kv_heads=None
     }
     opobj = SimOp(opinfo)
     out_tensors = [q_tensor, k_tensor, v_tensor]
+    _propagate_ttnn_dtype([input_tensor], out_tensors)
     opobj.get_perf_counts([input_tensor], out_tensors)
     opobj.update_tensor_counts([input_tensor], out_tensors)
-    _propagate_ttnn_dtype([input_tensor], out_tensors)
     out_mc = memory_config if memory_config is not None else MemoryConfig(
         TensorMemoryLayout.HEIGHT_SHARDED, BufferType.L1,
     )
@@ -3468,9 +3473,9 @@ def nlp_concat_heads_decode_op(input_tensor, num_heads=None, memory_config=None,
         'attrs': {'num_heads': num_heads, 'element_size': element_size},
     }
     opobj = SimOp(opinfo)
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     out_tensor._memory_config = memory_config if memory_config is not None else MemoryConfig(
         TensorMemoryLayout.WIDTH_SHARDED, BufferType.L1,
     )
@@ -3510,9 +3515,9 @@ def scaled_dot_product_attention_op(q, k, v, *extra_inputs, memory_config=None,
         'attrs': op_attrs,
     }
     opobj = SimOp(opinfo)
+    _propagate_ttnn_dtype([q], [out_tensor])
     opobj.get_perf_counts(in_tensors, [out_tensor])
     opobj.update_tensor_counts(in_tensors, [out_tensor])
-    _propagate_ttnn_dtype([q], [out_tensor])
     # SDPA materializes a fresh output; on HW it is DRAM-interleaved (it does NOT preserve the
     # sharded q layout — cf. tt_transformers attention.py decode: sdpa-decode output is DRAM-
     # interleaved, then interleaved_to_sharded for concat-heads). Inheriting q's (height-sharded)
