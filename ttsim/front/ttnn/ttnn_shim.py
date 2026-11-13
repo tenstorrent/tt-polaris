@@ -2354,6 +2354,9 @@ def interleaved_to_sharded_op(input_tensor, memory_config=None, element_size=2):
     _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj = SimOp(opinfo)
     opobj.get_perf_counts([input_tensor], [out_tensor])
+    # Shape inference (set_shape) recomputes the padded shape from the logical shape and layout, losing
+    # any explicit padding on the input; a data-movement op keeps the input's padded storage.
+    out_tensor.set_padded_shape(input_tensor.padded_shape())
     opobj.update_tensor_counts([input_tensor], [out_tensor])
     if memory_config is not None:
         out_tensor._memory_config = memory_config
@@ -2453,6 +2456,9 @@ def sharded_to_interleaved_op(input_tensor, memory_config=None, element_size=2):
     _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj = SimOp(opinfo)
     opobj.get_perf_counts([input_tensor], [out_tensor])
+    # Shape inference (set_shape) recomputes the padded shape from the logical shape and layout, losing
+    # any explicit padding on the input; a data-movement op keeps the input's padded storage.
+    out_tensor.set_padded_shape(input_tensor.padded_shape())
     opobj.update_tensor_counts([input_tensor], [out_tensor])
     if memory_config is not None:
         out_tensor._memory_config = memory_config
@@ -2502,6 +2508,7 @@ def copy_op(input_tensor, memory_config, element_size=2):
     opobj = SimOp(opinfo)
     _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj.get_perf_counts([input_tensor], [out_tensor])
+    out_tensor.set_padded_shape(input_tensor.padded_shape())
     opobj.update_tensor_counts([input_tensor], [out_tensor])
     out_tensor._memory_config = memory_config
     input_tensor.device.add_op(opobj)
@@ -2607,6 +2614,9 @@ def reshard_op(input_tensor, memory_config=None, element_size=2):
     _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj = SimOp(opinfo)
     opobj.get_perf_counts([input_tensor], [out_tensor])
+    # Shape inference (set_shape) recomputes the padded shape from the logical shape and layout, losing
+    # any explicit padding on the input; a data-movement op keeps the input's padded storage.
+    out_tensor.set_padded_shape(input_tensor.padded_shape())
     opobj.update_tensor_counts([input_tensor], [out_tensor])
     if memory_config is not None:
         out_tensor._memory_config = memory_config
