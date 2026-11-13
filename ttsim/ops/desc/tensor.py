@@ -389,6 +389,12 @@ def _detached_copy(t):
     have data" guard keeps working. hw_shape/x_pad_logical/y_pad_logical are
     instance attrs that the SimTensor constructor does NOT accept via cfg, so
     they must be assigned explicitly; they participate in LUT key construction.
+
+    The TT dtype and layout (_ttnn_dtype, _hw_dtype, _hw_layout, layout) are
+    copied too: byte counts on the copy (e.g. Concat's inBytes) read them to
+    size block-float tiles and to round TILE tensors up to whole tiles. Without
+    them a bfp8 / bfp4 TILE input was counted at the op precision on its
+    logical shape.
     """
     c = SimTensor({
         'name'   : t.name + '.norm',
@@ -402,6 +408,9 @@ def _detached_copy(t):
     c.hw_shape      = getattr(t, 'hw_shape', None)
     c.x_pad_logical = getattr(t, 'x_pad_logical', None)
     c.y_pad_logical = getattr(t, 'y_pad_logical', None)
+    for attr in ('_ttnn_dtype', '_hw_dtype', '_hw_layout', 'layout'):
+        if hasattr(t, attr):
+            setattr(c, attr, getattr(t, attr))
     return c
 
 def _squeeze_to_rank1(t):

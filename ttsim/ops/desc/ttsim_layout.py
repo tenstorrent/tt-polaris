@@ -284,6 +284,94 @@ def _input_storage_shape_for_perf(X, op, logical_shape_list):
     return list(logical_shape_list)
 
 
+def _movement_storage_shape(X, op, logical_shape_list):
+    """Physical shape the hardware moves for a data-movement op's tensor.
+
+    Precedence: ``input_padded_shape`` op attr > ``hw_shape`` (conv-path NHWC-flattened) > the tensor's
+    ``padded_shape()`` (tile-rounded, or an explicit larger padding) > the logical shape. ``hw_shape``
+    comes before ``padded_shape()`` because the latter is derived from the logical NCHW shape and would
+    over-pad conv-path tensors.
+    """
+    attr_ps = op.attrs.get('input_padded_shape')
+    if attr_ps is not None:
+        try:
+            ps_list = _coerce_shape_to_list(attr_ps)
+        except TypeError:
+            ps_list = []
+        if ps_list:
+            return ps_list
+    storage_shape_list = getattr(X, '_storage_shape_list', None)
+    if callable(storage_shape_list):
+        return storage_shape_list()       # hw_shape > consistent padded_shape() > logical
+    return list(logical_shape_list)
+
+
+def _movement_bytes(T, storage_shape, elem_size):
+    """Bytes for tensor ``T`` stored as ``storage_shape``: dtype- and tile-aware when the tensor has a TT dtype,
+    otherwise ``elements * element_size`` (elements counted on the padded storage shape)."""
+    storage_nbytes = getattr(T, 'storage_nbytes', None)
+    if callable(storage_nbytes):
+        nb = storage_nbytes(storage_shape)
+        if nb is not None:
+            return nb
+    return _nelems(storage_shape) * elem_size
+
+
+def _passthrough_movement_perf(X, Y, op, in_shape):
+    """perf_stats for a 1->1 data-movement op that moves the padded storage unchanged
+    (InterleavedToSharded, ShardedToInterleaved, Reshard, Move). Output logical shape is unchanged."""
+    elem_size = op.attrs.get('element_size', 2)
+    storage = _movement_storage_shape(X, op, in_shape)
+    elems = _nelems(storage)
+    return {
+        'inElems': elems,
+        'outElems': elems,
+        'inBytes': _movement_bytes(X, storage, elem_size),
+        'outBytes': _movement_bytes(Y, storage, elem_size),
+        'instrs': {'mov': elems},
+    }
+
+
+def _tensor_storage_shape(T):
+    """Stored shape of one tensor: hw_shape > consistent padded_shape() > logical, then last two dims
+    rounded to whole tiles when the tensor is TILE layout (so a directly-assigned logical shape, e.g. an
+    op output, is still counted as the tiles the hardware allocates)."""
+    sl = getattr(T, '_storage_shape_list', None)
+    shape = sl() if callable(sl) else [int(d) for d in T.shape]
+    if getattr(getattr(T, 'layout', None), 'name', '') == 'TILE_LAYOUT':
+        shape = _pad_to_tile_shape(shape)
+    return shape
+
+
+def _tensor_traffic(tensors, elem_size):
+    """(elements, bytes) over ``tensors`` counted on their padded storage (tile-aware for TILE tensors;
+    dtype-aware bytes when the tensor has a TT dtype, else elements * element_size)."""
+    elems = 0
+    nbytes = 0
+    for T in tensors:
+        if not T.shape:
+            continue
+        storage = _tensor_storage_shape(T)
+        elems += _nelems(storage)
+        nbytes += _movement_bytes(T, storage, elem_size)
+    return elems, nbytes
+
+
+def _storage_perf(iTList, oTList, op, mov='out'):
+    """perf_stats for an op that reads ``iTList`` and writes ``oTList``, counted on padded storage.
+    ``mov`` selects the movement-instruction count: 'out' (elements written) or 'in'."""
+    elem_size = op.attrs.get('element_size', 2)
+    in_elems, in_bytes = _tensor_traffic(iTList, elem_size)
+    out_elems, out_bytes = _tensor_traffic(oTList, elem_size)
+    return {
+        'inElems': in_elems,
+        'outElems': out_elems,
+        'inBytes': in_bytes,
+        'outBytes': out_bytes,
+        'instrs': {'mov': out_elems if mov == 'out' else in_elems},
+    }
+
+
 def tilize_sinf(iTList, oTList, op, **kwargs):
     """Shape inference for Tilize: 1 input (ROW_MAJOR), output same logical shape, padded to tile."""
     assert len(iTList) == 1 and len(oTList) == 1
@@ -316,8 +404,8 @@ def tilize_sinf(iTList, oTList, op, **kwargs):
     elem_size = op.attrs.get('element_size', 2)
     in_elems = _nelems(in_shape)
     out_elems = _nelems(out_padded)
-    in_bytes = in_elems * elem_size
-    out_bytes = out_elems * elem_size
+    in_bytes = _movement_bytes(X, in_shape, elem_size)
+    out_bytes = _movement_bytes(oTList[0], out_padded, elem_size)
 
     op.perf_stats = {
         'inElems': in_elems,
@@ -371,15 +459,7 @@ def typecast_sinf(iTList, oTList, op, **kwargs):
         "Typecast shape inference: input tensor shape must be known for element/byte accounting",
     )
     oTList[0].shape = in_shape
-    elem_size = op.attrs.get('element_size', 2)
-    n = _nelems(in_shape)
-    op.perf_stats = {
-        'inElems': n,
-        'outElems': n,
-        'inBytes': n * elem_size,
-        'outBytes': n * elem_size,
-        'instrs': {'mov': n},
-    }
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 
@@ -408,8 +488,8 @@ def tilize_with_val_padding_sinf(iTList, oTList, op, **kwargs):
     op.perf_stats = {
         'inElems': in_elems,
         'outElems': out_elems,
-        'inBytes': in_elems * elem_size,
-        'outBytes': out_elems * elem_size,
+        'inBytes': _movement_bytes(X, in_shape, elem_size),
+        'outBytes': _movement_bytes(oTList[0], out_padded, elem_size),
         'instrs': {'mov': out_elems},
     }
     return
@@ -458,15 +538,7 @@ def interleaved_to_sharded_sinf(iTList, oTList, op, **kwargs):
     oTList[0].dtype = X.dtype
     oTList[0].hw_shape = getattr(X, 'hw_shape', None)  # propagate NHWC-flattened hw shape
 
-    elem_size = op.attrs.get('element_size', 2)
-    elems = _nelems(in_shape)
-    op.perf_stats = {
-        'inElems': elems,
-        'outElems': elems,
-        'inBytes': elems * elem_size,
-        'outBytes': elems * elem_size,
-        'instrs': {'mov': elems},
-    }
+    op.perf_stats = _passthrough_movement_perf(X, oTList[0], op, in_shape)
     return
 
 
@@ -482,15 +554,7 @@ def sharded_to_interleaved_sinf(iTList, oTList, op, **kwargs):
     oTList[0].dtype = X.dtype
     oTList[0].hw_shape = getattr(X, 'hw_shape', None)  # propagate NHWC-flattened hw shape
 
-    elem_size = op.attrs.get('element_size', 2)
-    elems = _nelems(in_shape)
-    op.perf_stats = {
-        'inElems': elems,
-        'outElems': elems,
-        'inBytes': elems * elem_size,
-        'outBytes': elems * elem_size,
-        'instrs': {'mov': elems},
-    }
+    op.perf_stats = _passthrough_movement_perf(X, oTList[0], op, in_shape)
     return
 
 
@@ -506,15 +570,7 @@ def reshard_sinf(iTList, oTList, op, **kwargs):
     oTList[0].dtype = X.dtype
     oTList[0].hw_shape = getattr(X, 'hw_shape', None)  # propagate NHWC-flattened hw shape
 
-    elem_size = op.attrs.get('element_size', 2)
-    elems = _nelems(in_shape)
-    op.perf_stats = {
-        'inElems': elems,
-        'outElems': elems,
-        'inBytes': elems * elem_size,
-        'outBytes': elems * elem_size,
-        'instrs': {'mov': elems},
-    }
+    op.perf_stats = _passthrough_movement_perf(X, oTList[0], op, in_shape)
     return
 
 
@@ -533,15 +589,7 @@ def nlp_concat_heads_sinf(iTList, oTList, op, **kwargs):
     oTList[0].shape = out_shape
     oTList[0].dtype = X.dtype
 
-    elem_size = op.attrs.get('element_size', 2)
-    elems = _nelems(in_shape)
-    op.perf_stats = {
-        'inElems': elems,
-        'outElems': elems,
-        'inBytes': elems * elem_size,
-        'outBytes': elems * elem_size,
-        'instrs': {'mov': elems},
-    }
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 
@@ -589,16 +637,7 @@ def nlp_create_qkv_heads_sinf(iTList, oTList, op, **kwargs):
     oTList[2].shape = v_shape
     oTList[2].dtype = X.dtype
 
-    elem_size = op.attrs.get('element_size', 2)
-    in_elems = sum(_nelems(t.shape) for t in iTList if t.shape)
-    out_elems = _nelems(q_shape) + _nelems(k_shape) + _nelems(v_shape)
-    op.perf_stats = {
-        'inElems': in_elems,
-        'outElems': out_elems,
-        'inBytes': in_elems * elem_size,
-        'outBytes': out_elems * elem_size,
-        'instrs': {'mov': out_elems},
-    }
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 
@@ -707,11 +746,20 @@ def halo_sinf(iTList, oTList, op, **kwargs):
         oTList[0].hw_shape = getattr(X, 'hw_shape', None)
         out_elems = elems  # logical passthrough
 
+    # Traffic is counted on the padded storage the hardware moves, not the logical elements.
+    in_storage = _movement_storage_shape(X, op, in_shape)
+    in_elems = _nelems(in_storage)
+    if ext_y is not None:
+        out_storage = [1, 1, ext_y, C]
+        out_elems = ext_y * C
+    else:
+        out_storage = in_storage      # passthrough: same physical buffer
+        out_elems = in_elems
     op.perf_stats = {
-        'inElems': elems,
+        'inElems': in_elems,
         'outElems': out_elems,
-        'inBytes': elems * elem_size,
-        'outBytes': out_elems * elem_size,
+        'inBytes': _movement_bytes(X, in_storage, elem_size),
+        'outBytes': _movement_bytes(oTList[0], out_storage, elem_size),
         'instrs': {'mov': out_elems},
     }
     return
@@ -734,15 +782,7 @@ def copy_sinf(iTList, oTList, op, **kwargs):
     oTList[0].dtype = X.dtype
     oTList[0].hw_shape = getattr(X, 'hw_shape', None)  # propagate NHWC-flattened hw shape
 
-    elem_size = op.attrs.get('element_size', 2)
-    elems = _nelems(in_shape)
-    op.perf_stats = {
-        'inElems': elems,
-        'outElems': elems,
-        'inBytes': elems * elem_size,
-        'outBytes': elems * elem_size,
-        'instrs': {'mov': elems},
-    }
+    op.perf_stats = _passthrough_movement_perf(X, oTList[0], op, in_shape)
     return
 
 
@@ -763,15 +803,7 @@ def move_sinf(iTList, oTList, op, **kwargs):
     oTList[0].dtype = X.dtype
     oTList[0].hw_shape = getattr(X, 'hw_shape', None)  # propagate NHWC-flattened hw shape
 
-    elem_size = op.attrs.get('element_size', 2)
-    elems = _nelems(in_shape)
-    op.perf_stats = {
-        'inElems': elems,
-        'outElems': elems,
-        'inBytes': elems * elem_size,
-        'outBytes': elems * elem_size,
-        'instrs': {'mov': elems},
-    }
+    op.perf_stats = _passthrough_movement_perf(X, oTList[0], op, in_shape)
     return
 
 
@@ -802,8 +834,7 @@ def rotary_embedding_llama_sinf(iTList, oTList, op, **kwargs):
     oTList[0].shape = list(in_shape)
     oTList[0].dtype = X.dtype
 
-    elem_size = op.attrs.get('element_size', 2)
-    op.perf_stats = _passthrough_perf([t.shape for t in iTList], in_shape, elem_size)
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 
@@ -816,8 +847,7 @@ def plus_one_sinf(iTList, oTList, op, **kwargs):
     )
     oTList[0].shape = list(in_shape)
     oTList[0].dtype = X.dtype
-    elem_size = op.attrs.get('element_size', 2)
-    op.perf_stats = _passthrough_perf([t.shape for t in iTList], in_shape, elem_size)
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 
@@ -828,8 +858,7 @@ def manual_seed_sinf(iTList, oTList, op, **kwargs):
     in_shape = require_shape_list(X.shape, "ManualSeed shape inference: seeds shape must be known")
     oTList[0].shape = list(in_shape)
     oTList[0].dtype = X.dtype
-    elem_size = op.attrs.get('element_size', 2)
-    op.perf_stats = _passthrough_perf([t.shape for t in iTList], in_shape, elem_size)
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 
@@ -845,8 +874,7 @@ def sampling_sinf(iTList, oTList, op, **kwargs):
     out_shape = list(in_shape[:-1]) + [1]
     oTList[0].shape = out_shape
     oTList[0].dtype = iTList[1].dtype
-    elem_size = op.attrs.get('element_size', 2)
-    op.perf_stats = _passthrough_perf([t.shape for t in iTList], out_shape, elem_size)
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 
@@ -869,16 +897,7 @@ def rotary_embedding_llama_fused_qk_sinf(iTList, oTList, op, **kwargs):
     oTList[1].shape = list(k_shape)
     oTList[1].dtype = K.dtype
 
-    elem_size = op.attrs.get('element_size', 2)
-    in_elems = sum(_nelems(t.shape) for t in iTList if t.shape)
-    out_elems = _nelems(q_shape) + _nelems(k_shape)
-    op.perf_stats = {
-        'inElems': in_elems,
-        'outElems': out_elems,
-        'inBytes': in_elems * elem_size,
-        'outBytes': out_elems * elem_size,
-        'instrs': {'mov': out_elems},
-    }
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 
@@ -924,15 +943,7 @@ def paged_fused_update_cache_sinf(iTList, oTList, op, **kwargs):
     oTList[1].dtype = v_cache.dtype
 
     elem_size = op.attrs.get('element_size', 2)
-    in_elems = sum(_nelems(t.shape) for t in iTList if t.shape)
-    out_elems = _nelems(k_cache_shape) + _nelems(v_cache_shape)
-    op.perf_stats = {
-        'inElems': in_elems,
-        'outElems': out_elems,
-        'inBytes': in_elems * elem_size,
-        'outBytes': out_elems * elem_size,
-        'instrs': {'mov': out_elems},
-    }
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 
@@ -979,16 +990,7 @@ def nlp_create_qkv_heads_decode_sinf(iTList, oTList, op, **kwargs):
     oTList[2].shape = v_shape
     oTList[2].dtype = X.dtype
 
-    elem_size = op.attrs.get('element_size', 2)
-    in_elems = _nelems(in_shape)
-    out_elems = _nelems(q_shape) + _nelems(k_shape) + _nelems(v_shape)
-    op.perf_stats = {
-        'inElems': in_elems,
-        'outElems': out_elems,
-        'inBytes': in_elems * elem_size,
-        'outBytes': out_elems * elem_size,
-        'instrs': {'mov': out_elems},
-    }
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 
@@ -1013,8 +1015,7 @@ def nlp_concat_heads_decode_sinf(iTList, oTList, op, **kwargs):
     oTList[0].shape = out_shape
     oTList[0].dtype = X.dtype
 
-    elem_size = op.attrs.get('element_size', 2)
-    op.perf_stats = _passthrough_perf([in_shape], out_shape, elem_size)
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 
@@ -1034,7 +1035,7 @@ def sdpa_sinf(iTList, oTList, op, **kwargs):
     oTList[0].dtype = Q.dtype
 
     elem_size = op.attrs.get('element_size', 2)
-    op.perf_stats = _passthrough_perf([t.shape for t in iTList], q_shape, elem_size)
+    op.perf_stats = _storage_perf(iTList, oTList, op)
     return
 
 

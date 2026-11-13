@@ -267,6 +267,11 @@ class Tensor(SimTensor):
     def padded_shape(self):
         return self._padded_shape
 
+    def set_padded_shape(self, padded_shape):
+        """Restore an explicit padded shape (``set_shape`` recomputes it from the logical shape and
+        layout, which drops padding beyond tile rounding)."""
+        self._padded_shape = Shape(list(padded_shape))
+
     def _calculate_padded_shape(self, logical_shape, layout):
         """Calculate padded shape based on logical shape and layout."""
         if len(logical_shape) == 0:
@@ -368,7 +373,7 @@ class Tensor(SimTensor):
             f"got args={args}, kwargs={kwargs}"
         )
     def set_shape(self, newshape):
-        super().set_shape(newshape) 
+        super().set_shape(newshape)
         if newshape is not None:
             self._padded_shape = self._calculate_padded_shape(Shape(newshape), self.layout)
         logger.debug("set_shape: {} layout {} newshape {} and padded_shape {}", self.name, self.layout, newshape, self._padded_shape)
