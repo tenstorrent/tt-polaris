@@ -1,9 +1,5 @@
 [![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/release/python-3132/)
 &nbsp;&nbsp;&nbsp;![Checkin Tests](https://github.com/tenstorrent/tt-polaris/actions/workflows/checkin_tests.yml/badge.svg?branch=main)
-&nbsp;&nbsp;&nbsp;![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/ssapreTT/c230835a5065366c13d3bbfb79f23bf6/raw/polaris_coverage_badge.json)
-&nbsp;&nbsp;&nbsp;![Unit Tests](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/ssapreTT/c230835a5065366c13d3bbfb79f23bf6/raw/polaris_tests_badge.json)
-&nbsp;&nbsp;&nbsp;![MyPy](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/ssapreTT/c230835a5065366c13d3bbfb79f23bf6/raw/polaris_mypy_status.json)
-&nbsp;&nbsp;&nbsp;![SPDX](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/ssapreTT/c230835a5065366c13d3bbfb79f23bf6/raw/polaris_spdx_status.json)
 
 <!-- RTL/NeoSim badges -->
 <!--

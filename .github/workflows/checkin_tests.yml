@@ -32,6 +32,11 @@ jobs:
       # expected to be present, so an absent secret indicates admin
       # misconfiguration rather than fork policy. Issue #461.
       IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+      # Boolean gate for the gist badge steps. Interim measure (issue #558):
+      # the gist write is optional, so a push run without POLARIS_GIST_TOKEN
+      # skips the badge steps instead of failing. Same job-level pattern as
+      # HAS_LFC_SECRET above.
+      HAS_GIST_SECRET: ${{ secrets.POLARIS_GIST_TOKEN != '' }}
 
     runs-on: tt-ubuntu-2204-large-stable
     strategy:
@@ -92,9 +97,20 @@ jobs:
       if: '!cancelled()'
       uses: ./.github/actions/run-static-analysis
 
+    # Gist badge steps — dormant on purpose (issue #558).
+    # POLARIS_GIST_TOKEN is not expected to be set, so these steps normally
+    # skip. They are kept, not deleted, until a permanent badge-storage
+    # solution replaces them; remove them as part of that change, not
+    # separately. The README no longer links the gist badges.
+    - id: gist-badges-skip-notice
+      name: Badge update skipped (POLARIS_GIST_TOKEN not set)
+      if: ${{ !cancelled() && github.event_name == 'push' && env.HAS_GIST_SECRET == 'false' }}
+      run: |
+        echo "::notice title=Badge update skipped::POLARIS_GIST_TOKEN is not set, so the gist badge steps are skipped. This is expected (issue #558)."
+
     - id: generate-test-badges
       name: Generate Test and Coverage Badges
-      if: ${{ !cancelled() && github.event_name == 'push' }}
+      if: ${{ !cancelled() && github.event_name == 'push' && env.HAS_GIST_SECRET == 'true' }}
       uses: ./.github/actions/generate-test-badges
       with:
         gist-id: ${{ env.GIST_ID }}
@@ -108,7 +124,7 @@ jobs:
 
     - id: generate-status-badges
       name: Generate Status Badges
-      if: ${{ !cancelled() && github.event_name == 'push' }}
+      if: ${{ !cancelled() && github.event_name == 'push' && env.HAS_GIST_SECRET == 'true' }}
       uses: ./.github/actions/generate-status-badges
       with:
         gist-id: ${{ env.GIST_ID }}

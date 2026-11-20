@@ -4,6 +4,7 @@
 import os
 import tempfile
 import time
+import traceback
 import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -13,8 +14,14 @@ import pytest
 from ttsim.utils.lfc import (
     CACHE_AGE_SECONDS,
     _get_lfc_base_urls,
+    _redact_lfc_urls,
     resolve_lfc_path,
 )
+
+# Sentinel LFC hosts for the redaction tests. No output may contain them.
+SENTINEL_HOST_A = 'lfc-sentinel-a.invalid'
+SENTINEL_HOST_B = 'lfc-sentinel-b.invalid'
+SENTINEL_URLS = f' http://{SENTINEL_HOST_A}:8080/ ,http://{SENTINEL_HOST_B}'
 
 
 @pytest.fixture(autouse=True)
@@ -389,3 +396,188 @@ def test_download_first_url_fails_second_succeeds(monkeypatch):
             assert Path("__ext/multi/file.yaml").read_text() == "v2-content"
     finally:
         os.chdir(original_cwd)
+
+# No LFC base URL or host may appear in any message.
+
+
+def _assert_no_sentinel_host(text: str) -> None:
+    for host in (SENTINEL_HOST_A, SENTINEL_HOST_B):
+        assert host not in text, f'LFC host found in output: {text!r}'
+
+
+@pytest.mark.unit
+def test_redact_lfc_urls_replaces_every_form():
+    """Base URL, host:port and bare host are each replaced by a label."""
+    base_urls = [
+        f'http://{SENTINEL_HOST_A}:8080/simulators-ai-perf/',
+        f'http://{SENTINEL_HOST_B}/simulators-ai-perf/',
+    ]
+    text = (
+        f'GET http://{SENTINEL_HOST_A}:8080/simulators-ai-perf/x; '
+        f'connect {SENTINEL_HOST_A}:8080; resolve {SENTINEL_HOST_A}; '
+        f'resolve {SENTINEL_HOST_B}'
+    )
+    redacted = _redact_lfc_urls(text, base_urls)
+    _assert_no_sentinel_host(redacted)
+    assert '<LFC server 1 of 2>' in redacted
+    assert '<LFC server 2 of 2>' in redacted
+
+
+@pytest.mark.unit
+def test_redact_lfc_urls_handles_user_info():
+    """A base URL with user-info still has its bare host redacted."""
+    base_urls = [f'http://user:pass@{SENTINEL_HOST_A}:8080/simulators-ai-perf/']
+    text = f'resolve {SENTINEL_HOST_A}; connect {SENTINEL_HOST_A}:8080'
+    _assert_no_sentinel_host(_redact_lfc_urls(text, base_urls))
+
+
+@pytest.mark.unit
+def test_redact_lfc_urls_handles_ipv6_literal():
+    """An IPv6 literal is redacted bare, not only in its [bracketed] form."""
+    base_urls = ['http://[2001:db8::558]:8080/simulators-ai-perf/']
+    redacted = _redact_lfc_urls('connect 2001:db8::558 port 8080', base_urls)
+    assert '2001:db8::558' not in redacted
+
+
+# Entries that urllib or wget would escape or normalize: full-width colon,
+# control byte, non-ASCII host, inner space.
+MALFORMED_URLS = [
+    f'http://{SENTINEL_HOST_A}：8080',
+    f'http://{SENTINEL_HOST_A}\x01:8080',
+    f'http://{SENTINEL_HOST_A}ë:8080',
+    f'http://{SENTINEL_HOST_A} x:8080',
+    f'http://{SENTINEL_HOST_A}\nextra:8080',
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('ci', [True, False], ids=['ci', 'dev-with-stale-file'])
+@pytest.mark.parametrize(
+    'urls', MALFORMED_URLS, ids=['fullwidth-colon', 'control-byte', 'non-ascii', 'space', 'newline']
+)
+def test_lfc_malformed_url_rejected_without_host(monkeypatch, tmp_path, capsys, urls, ci):
+    """An entry outside printable ASCII is rejected by position, before any request.
+
+    Dev mode does not fall back to a stale local file for it: the setting is wrong.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('LFC_SERVER_URLS', f'http://ok.invalid,{urls}')
+    if ci:
+        monkeypatch.setenv('GITHUB_ACTIONS', 'true')
+    else:
+        monkeypatch.delenv('GITHUB_ACTIONS', raising=False)
+        local_path = Path('__ext/test/file.yaml')
+        local_path.parent.mkdir(parents=True)
+        local_path.write_text('cached content')
+        old_time = time.time() - CACHE_AGE_SECONDS - 1
+        os.utime(local_path, (old_time, old_time))
+    with patch('urllib.request.urlopen') as mock_urlopen:
+        with pytest.raises(RuntimeError, match='entry 2 of 2 contains characters outside printable ASCII') as excinfo:
+            resolve_lfc_path('lfc://test/file.yaml')
+        mock_urlopen.assert_not_called()
+    captured = capsys.readouterr()
+    _assert_no_sentinel_host(''.join(traceback.format_exception(excinfo.value)) + captured.out + captured.err)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('ci', [True, False], ids=['ci', 'dev-with-stale-file'])
+@pytest.mark.parametrize(
+    'host_suffix',
+    ['%01', '%20x', '%01?@cover.invalid', '%01#@cover.invalid'],
+    ids=['pct-control-byte', 'pct-space', 'at-in-query', 'at-in-fragment'],
+)
+def test_lfc_invalid_host_rejected_without_host(monkeypatch, tmp_path, capsys, host_suffix, ci):
+    """A host outside the DNS-name / IPv6-literal grammar is rejected by position.
+
+    urllib would decode %-escapes and print the decoded host, which redaction cannot match.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('LFC_SERVER_URLS', f'http://ok.invalid,http://{SENTINEL_HOST_A}{host_suffix}:8080')
+    if ci:
+        monkeypatch.setenv('GITHUB_ACTIONS', 'true')
+    else:
+        monkeypatch.delenv('GITHUB_ACTIONS', raising=False)
+        local_path = Path('__ext/test/file.yaml')
+        local_path.parent.mkdir(parents=True)
+        local_path.write_text('cached content')
+        old_time = time.time() - CACHE_AGE_SECONDS - 1
+        os.utime(local_path, (old_time, old_time))
+    with patch('urllib.request.urlopen') as mock_urlopen:
+        with pytest.raises(RuntimeError, match='entry 2 of 2 has an invalid host') as excinfo:
+            resolve_lfc_path('lfc://test/file.yaml')
+        mock_urlopen.assert_not_called()
+    captured = capsys.readouterr()
+    _assert_no_sentinel_host(''.join(traceback.format_exception(excinfo.value)) + captured.out + captured.err)
+
+
+@pytest.mark.unit
+def test_get_lfc_base_urls_accepts_valid_host_forms(monkeypatch):
+    """User-info (even %-encoded), ports, and bracketed IPv6 literals stay valid."""
+    monkeypatch.setenv(
+        'LFC_SERVER_URLS',
+        'http://user%40corp@lfc.example:8080,https://[2001:db8::1]:443/,http://LFC.Example',
+    )
+    assert len(_get_lfc_base_urls()) == 3
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('url', MALFORMED_URLS)
+def test_redact_lfc_urls_never_raises(url):
+    """The redaction helper parses with string operations, so no entry makes it raise."""
+    _assert_no_sentinel_host(_redact_lfc_urls(f'error at {url}', [url + '/simulators-ai-perf/']))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('rest', ['?c=u@other.invalid', '#u@other.invalid'], ids=['query', 'fragment'])
+def test_redact_lfc_urls_ignores_at_after_authority(rest):
+    """An '@' in a query or fragment is not user-info; the real host is redacted."""
+    redacted = _redact_lfc_urls(f'resolve {SENTINEL_HOST_A}', [f'http://{SENTINEL_HOST_A}{rest}/simulators-ai-perf/'])
+    _assert_no_sentinel_host(redacted)
+
+
+@pytest.mark.unit
+def test_lfc_401_traceback_has_no_host(monkeypatch, tmp_path):
+    """The full traceback, not only the message, names no host."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('LFC_SERVER_URLS', SENTINEL_URLS)
+    http_error = urllib.error.HTTPError(
+        url=f'http://{SENTINEL_HOST_A}:8080/simulators-ai-perf/test/file.yaml',
+        code=401, msg=f'Authentication required at {SENTINEL_HOST_A}', hdrs={}, fp=None,  # type: ignore[arg-type]
+    )
+    with patch('urllib.request.urlopen', side_effect=http_error):
+        with pytest.raises(RuntimeError, match='Authentication required') as excinfo:
+            resolve_lfc_path('lfc://test/file.yaml')
+    _assert_no_sentinel_host(''.join(traceback.format_exception(excinfo.value)))
+
+
+@pytest.mark.unit
+def test_lfc_download_failure_has_no_host(monkeypatch, tmp_path):
+    """A urllib error that names the host is redacted and not chained (CI mode)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('LFC_SERVER_URLS', SENTINEL_URLS)
+    monkeypatch.setenv('GITHUB_ACTIONS', 'true')
+    error = urllib.error.URLError(f"hostname '{SENTINEL_HOST_A}' doesn't match; {SENTINEL_HOST_B}:80 refused")
+    with patch('urllib.request.urlopen', side_effect=error):
+        with pytest.raises(RuntimeError, match='Download failed') as excinfo:
+            resolve_lfc_path('lfc://test/file.yaml')
+    _assert_no_sentinel_host(str(excinfo.value))
+    assert excinfo.value.__cause__ is None
+
+
+@pytest.mark.unit
+def test_lfc_stale_fallback_warning_has_no_host(monkeypatch, tmp_path, capsys):
+    """Dev mode: the stale-cache warning on stderr names no host."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('LFC_SERVER_URLS', SENTINEL_URLS)
+    monkeypatch.delenv('GITHUB_ACTIONS', raising=False)
+    local_path = Path('__ext/test/file.yaml')
+    local_path.parent.mkdir(parents=True)
+    local_path.write_text('cached content')
+    old_time = time.time() - CACHE_AGE_SECONDS - 1
+    os.utime(local_path, (old_time, old_time))
+    error = urllib.error.URLError(f'cannot connect to {SENTINEL_HOST_A}:8080')
+    with patch('urllib.request.urlopen', side_effect=error):
+        assert resolve_lfc_path('lfc://test/file.yaml') == str(local_path)
+    captured = capsys.readouterr()
+    assert 'using existing local file' in captured.err
+    _assert_no_sentinel_host(captured.out + captured.err)
