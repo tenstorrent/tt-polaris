@@ -263,6 +263,12 @@ if [[ -z "${LFC_SERVER_URLS:-}" ]]; then
     echo "       for setup instructions." >&2
     exit 1
 fi
+# A newline would end `read` early and drop the rest of the setting
+# unchecked. lfc.py rejects it as well.
+if [[ "$LFC_SERVER_URLS" == *$'\n'* ]]; then
+    echo "Error: LFC_SERVER_URLS contains a newline." >&2
+    exit 1
+fi
 IFS=',' read -r -a LFC_BASE_URLS <<< "$LFC_SERVER_URLS"
 
 # Normalize each entry: trim leading/trailing whitespace, strip trailing slash,
@@ -290,9 +296,75 @@ fi
 
 # Validate at least one URL survived normalization.
 if [[ ${#LFC_BASE_URLS[@]} -eq 0 ]]; then
-    echo "Error: no usable LFC base URLs after parsing. LFC_SERVER_URLS='${LFC_SERVER_URLS:-(unset)}'." >&2
+    echo "Error: no usable LFC base URLs after parsing LFC_SERVER_URLS." >&2
     exit 1
 fi
+
+# Reject, never print: an entry with other characters reaches wget, whose
+# messages escape or normalize the host beyond redaction.
+for i in "${!LFC_BASE_URLS[@]}"; do
+    if printf '%s' "${LFC_BASE_URLS[$i]}" | LC_ALL=C grep -q '[^!-~]'; then
+        echo "Error: LFC_SERVER_URLS entry $((i + 1)) of ${#LFC_BASE_URLS[@]} contains characters outside printable ASCII." >&2
+        exit 1
+    fi
+    # A host limited to this grammar (DNS name or bracketed IPv6 literal) is
+    # printed exactly as configured, apart from case, which redact_lfc covers.
+    hostport="${LFC_BASE_URLS[$i]#*://}"
+    hostport="${hostport%%[/?#]*}"  # the authority ends at /, ? or #
+    hostport="${hostport##*@}"
+    if ! printf '%s' "$hostport" | LC_ALL=C grep -Eq '^([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]+)?$'; then
+        echo "Error: LFC_SERVER_URLS entry $((i + 1)) of ${#LFC_BASE_URLS[@]} has an invalid host." >&2
+        exit 1
+    fi
+done
+
+# Server URLs are configuration, not output. Messages name a server by its
+# position ("LFC server 2 of 3"), and wget output passes through redact_lfc.
+LFC_HOSTS=()       # host[:port], without user-info
+LFC_BARE_HOSTS=()  # host only; an IPv6 literal without its brackets
+LFC_HOSTS_LC=()    # lowercase copies: wget prints host names in lowercase
+LFC_BARE_HOSTS_LC=()
+for url in "${LFC_BASE_URLS[@]}"; do
+    host="${url#*://}"
+    host="${host%%[/?#]*}"  # the authority ends at /, ? or #
+    host="${host##*@}"  # drop any user-info
+    LFC_HOSTS+=("$host")
+    if [[ "$host" == \[* ]]; then
+        bare="${host#\[}"
+        bare="${bare%%]*}"
+    else
+        bare="${host%%:*}"
+    fi
+    LFC_BARE_HOSTS+=("$bare")
+    # tr, not ${var,,}: macOS ships bash 3.2.
+    LFC_HOSTS_LC+=("$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')")
+    LFC_BARE_HOSTS_LC+=("$(printf '%s' "$bare" | tr '[:upper:]' '[:lower:]')")
+done
+
+# Label for the LFC server at 0-based index $1.
+lfc_label() {
+    echo "LFC server $(($1 + 1)) of ${#LFC_BASE_URLS[@]}"
+}
+
+# Filter stdin to stdout, replacing every LFC base URL, host:port, host and
+# IP address with a neutral label. The IPv6 patterns need "::" or at least
+# five groups, so a time such as 07:36:25 is left alone.
+redact_lfc() {
+    local line i value label
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        for i in "${!LFC_BASE_URLS[@]}"; do
+            label="<$(lfc_label "$i")>"
+            for value in "${LFC_BASE_URLS[$i]}" "${LFC_HOSTS[$i]}" "${LFC_HOSTS_LC[$i]}" \
+                         "${LFC_BARE_HOSTS[$i]}" "${LFC_BARE_HOSTS_LC[$i]}"; do
+                [[ -n "$value" ]] && line="${line//"$value"/$label}"
+            done
+        done
+        printf '%s\n' "$line"
+    done | sed -E \
+        -e 's/([0-9a-fA-F]{1,4}:){4,7}[0-9a-fA-F]{1,4}/<ip>/g' \
+        -e 's/[0-9a-fA-F:]*::[0-9a-fA-F:]*/<ip>/g' \
+        -e 's/[0-9]{1,3}(\.[0-9]{1,3}){3}/<ip>/g'
+}
 
 # Initial choice — first candidate.  The dev-mode and CI-multi-URL probes
 # below may re-assign SERVER_BASE_URL / SERVER_URL to a different reachable
@@ -300,14 +372,17 @@ fi
 #   - Dev mode (CI != true):            always probe
 #   - CI mode with >1 LFC_BASE_URLS:    probe to pick the first reachable URL
 #   - CI mode with exactly 1 URL:       skip probe (use index 0 as-is)
+SERVER_INDEX=0
 SERVER_BASE_URL="${LFC_BASE_URLS[0]}"
 SERVER_URL="$SERVER_BASE_URL/simulators-ai-perf/$SERVER_PATH"
+# Printable stand-in for SERVER_URL; see redact_lfc above.
+DISPLAY_URL="<$(lfc_label "$SERVER_INDEX")>/simulators-ai-perf/$SERVER_PATH"
 
 # Set wget verbosity based on verbose flag
 if [[ "$VERBOSE" == true ]]; then
     WGET_VERBOSE_FLAG="-v"
     echo "Verbose mode enabled"
-    echo "Server URL: $SERVER_URL"
+    echo "Server URL: $DISPLAY_URL"
     echo "Local path: $LOCAL_PATH"
 else
     WGET_VERBOSE_FLAG="-nv"
@@ -464,17 +539,18 @@ if [[ "$CI" != true || ${#LFC_BASE_URLS[@]} -gt 1 ]]; then
     ANY_PING_SUCCESS=false  # true if any candidate responded to ping
     ANY_HTTP_SUCCESS=false  # true if any candidate passed the HTTP probe
 
-    for CANDIDATE_BASE_URL in "${LFC_BASE_URLS[@]}"; do
+    for CANDIDATE_INDEX in "${!LFC_BASE_URLS[@]}"; do
+        CANDIDATE_BASE_URL="${LFC_BASE_URLS[$CANDIDATE_INDEX]}"
         # Extract hostname from this candidate
         CANDIDATE_HOST="${CANDIDATE_BASE_URL#http*://}"
         CANDIDATE_HOST="${CANDIDATE_HOST%%/*}"
         if [[ -z "$CANDIDATE_HOST" ]]; then
-            echo "Warning: Skipping invalid LFC base URL (no host): $CANDIDATE_BASE_URL" >&2
+            echo "Warning: Skipping $(lfc_label "$CANDIDATE_INDEX"): invalid base URL (no host)" >&2
             continue
         fi
 
         if [[ "$VERBOSE" == true ]]; then
-            echo "Trying $CANDIDATE_BASE_URL"
+            echo "Trying $(lfc_label "$CANDIDATE_INDEX")"
         fi
 
         # Reset per-candidate flags
@@ -508,8 +584,10 @@ if [[ "$CI" != true || ${#LFC_BASE_URLS[@]} -gt 1 ]]; then
             HTTP_SUCCESS=true
             ANY_HTTP_SUCCESS=true
             SERVER_ACCESSIBLE=true
+            SERVER_INDEX="$CANDIDATE_INDEX"
             SERVER_BASE_URL="$CANDIDATE_BASE_URL"
             SERVER_URL="$SERVER_BASE_URL/simulators-ai-perf/$SERVER_PATH"
+            DISPLAY_URL="<$(lfc_label "$SERVER_INDEX")>/simulators-ai-perf/$SERVER_PATH"
             if [[ "$VERBOSE" == true ]]; then
                 echo "  [HTTP] Application layer accessible (wget exit code: $WGET_STATUS) — selected"
             fi
@@ -522,7 +600,7 @@ if [[ "$CI" != true || ${#LFC_BASE_URLS[@]} -gt 1 ]]; then
     # Provide diagnostic summary and check Tailscale if needed
     if [[ "$SERVER_ACCESSIBLE" == true ]]; then
         if [[ "$VERBOSE" == true ]]; then
-            echo "Connectivity check: $SERVER_BASE_URL is accessible via HTTP"
+            echo "Connectivity check: $(lfc_label "$SERVER_INDEX") is accessible via HTTP"
         fi
     else
         # Server not accessible - provide diagnostic info
@@ -533,13 +611,10 @@ if [[ "$CI" != true || ${#LFC_BASE_URLS[@]} -gt 1 ]]; then
             echo "Server not accessible: No candidate passed ping or HTTP checks."
         fi
 
-        # CI mode: no Tailscale fallback exists.  Bail with a clear error
-        # listing the URLs that were tried.
+        # CI mode: no Tailscale fallback exists.  Bail with a clear error.
+        # The URLs themselves are not listed; see redact_lfc above.
         if [[ "$CI" == true ]]; then
-            echo "Error: none of the ${#LFC_BASE_URLS[@]} candidate LFC URL(s) are reachable from CI:" >&2
-            for u in "${LFC_BASE_URLS[@]}"; do
-                echo "  - $u" >&2
-            done
+            echo "Error: none of the ${#LFC_BASE_URLS[@]} candidate LFC server(s) are reachable from CI." >&2
             exit 1
         fi
 
@@ -590,12 +665,12 @@ if [[ "$CI" != true || ${#LFC_BASE_URLS[@]} -gt 1 ]]; then
 fi
 
 # Download models from LFCache server
-echo "Downloading from $SERVER_URL to $LOCAL_PATH..."
+echo "Downloading from $DISPLAY_URL to $LOCAL_PATH..."
 if [[ "$DRYRUN" == true ]]; then
     echo "Dry run mode enabled"
     if [[ "$TYPE" == "file" ]]; then
         echo "mkdir -p \"$(dirname "$LOCAL_PATH")\""
-        echo "wget \"$WGET_VERBOSE_FLAG\" --timeout=30 --read-timeout=60 -O \"$LOCAL_PATH\" \"$SERVER_URL\""
+        echo "wget \"$WGET_VERBOSE_FLAG\" --timeout=30 --read-timeout=60 -O \"$LOCAL_PATH\" \"$DISPLAY_URL\""
         if [[ "$EXTRACT" == true ]]; then
             echo "tar -xzf \"$LOCAL_PATH\" -C \"$(dirname "$LOCAL_PATH")\""
             echo "# Would report number of non-directory files extracted"
@@ -603,14 +678,16 @@ if [[ "$DRYRUN" == true ]]; then
         fi
     else
         echo "mkdir -p \"$LOCAL_PATH\""
-        echo "wget -np -nH --mirror \"$WGET_VERBOSE_FLAG\" --timeout=30 --read-timeout=60 --cut-dir \"$CUT_DIR\" -P \"$LOCAL_PATH\" \"$SERVER_URL\""
+        echo "wget -np -nH --mirror \"$WGET_VERBOSE_FLAG\" --timeout=30 --read-timeout=60 --cut-dir \"$CUT_DIR\" -P \"$LOCAL_PATH\" \"$DISPLAY_URL\""
     fi
     exit 0
 fi
 
+# wget writes its log, which names the URL and host, to stderr. It is routed
+# through redact_lfc and back to stderr; pipefail keeps wget's exit status.
 if [[ "$TYPE" == "file" ]]; then
-    wget "$WGET_VERBOSE_FLAG" --timeout=30 --read-timeout=60 -O "$LOCAL_PATH" "$SERVER_URL" || {
-        echo "Error: Failed to download from $SERVER_URL" >&2
+    wget "$WGET_VERBOSE_FLAG" --timeout=30 --read-timeout=60 -O "$LOCAL_PATH" "$SERVER_URL" 2>&1 | redact_lfc >&2 || {
+        echo "Error: Failed to download from $DISPLAY_URL" >&2
         echo "Check network connectivity and server availability." >&2
         exit 1
     }
@@ -655,8 +732,8 @@ if [[ "$TYPE" == "file" ]]; then
         rm "$LOCAL_PATH" || true  # Allow failure - not critical
     fi
 else
-    wget -np -nH --mirror "$WGET_VERBOSE_FLAG" --timeout=30 --read-timeout=60 --cut-dir "$CUT_DIR" -P "$LOCAL_PATH" "$SERVER_URL" || {
-        echo "Error: Failed to download directory from $SERVER_URL" >&2
+    wget -np -nH --mirror "$WGET_VERBOSE_FLAG" --timeout=30 --read-timeout=60 --cut-dir "$CUT_DIR" -P "$LOCAL_PATH" "$SERVER_URL" 2>&1 | redact_lfc >&2 || {
+        echo "Error: Failed to download directory from $DISPLAY_URL" >&2
         echo "Check network connectivity and server availability." >&2
         exit 1
     }

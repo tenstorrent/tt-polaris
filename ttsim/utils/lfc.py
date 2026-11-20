@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import re
 import sys
 import tempfile
 import time
@@ -17,6 +18,9 @@ except ImportError:
     HAS_FCNTL = False
 
 CACHE_AGE_SECONDS = 604800  # 1 week
+LFC_URL_SUFFIX = '/simulators-ai-perf/'
+# host[:port] of an LFC_SERVER_URLS entry: a DNS name or a bracketed IPv6 literal.
+LFC_HOSTPORT_RE = re.compile(r'(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?')
 
 def _validate_server_path(server_path: str) -> None:
     """
@@ -136,10 +140,50 @@ def _get_lfc_base_urls() -> list[str]:
         )
     candidates = [u.strip().rstrip('/') for u in env.split(',') if u.strip()]
     if not candidates:
-        raise RuntimeError(
-            f'LFC_SERVER_URLS is set but contains no usable URLs: {env!r}'
-        )
-    return [c + '/simulators-ai-perf/' for c in candidates]
+        raise RuntimeError('LFC_SERVER_URLS is set but contains no usable URLs')
+    # Reject, never print: an entry with other characters would reach urllib,
+    # whose error text escapes or normalizes the host beyond redaction.
+    for index, candidate in enumerate(candidates, start=1):
+        if not all('!' <= ch <= '~' for ch in candidate):
+            raise RuntimeError(
+                f'LFC_SERVER_URLS entry {index} of {len(candidates)} contains '
+                'characters outside printable ASCII'
+            )
+        # A host limited to this grammar is printed exactly as configured,
+        # apart from case, which _redact_lfc_urls covers.
+        if not LFC_HOSTPORT_RE.fullmatch(_lfc_hostport(candidate)):
+            raise RuntimeError(f'LFC_SERVER_URLS entry {index} of {len(candidates)} has an invalid host')
+    return [c + LFC_URL_SUFFIX for c in candidates]
+
+
+def _lfc_hostport(url: str) -> str:
+    """Return ``host[:port]`` of ``url`` without user-info, using string operations only.
+
+    urlsplit() is not used: it raises on a malformed entry, with the host in its message.
+    """
+    # The authority ends at the first '/', '?' or '#': an '@' after it is not user-info.
+    return re.split(r'[/?#]', url.split('://', 1)[-1], maxsplit=1)[0].rpartition('@')[2]
+
+
+def _redact_lfc_urls(text: str, base_urls: list[str]) -> str:
+    """Replace every LFC base URL and host in ``text`` with a neutral label.
+
+    Server URLs are configuration, not output.  Any text that can carry one
+    (an exception message from urllib) passes through here before it is
+    printed or raised.  ``tools/ci/lfc_downloader.sh`` applies the same rule.
+    """
+    for index, base_url in enumerate(base_urls, start=1):
+        label = f'<LFC server {index} of {len(base_urls)}>'
+        root = base_url.removesuffix(LFC_URL_SUFFIX)
+        hostport = _lfc_hostport(root)
+        if hostport.startswith('['):
+            host = hostport[1:].split(']', 1)[0]  # IPv6 literal
+        else:
+            host = hostport.split(':', 1)[0]
+        for value in (root, hostport, host, host.lower()):
+            if value:
+                text = text.replace(value, label)
+    return text
 
 
 def _attempt_download(url: str, local_file: Path, local_path: str) -> None:
@@ -222,7 +266,8 @@ def download_lfc_file(server_path: str, local_path: str):
                         # All LFC hosts share the same auth domain, so a 401 on
                         # one host will repeat on every other host — bail early
                         # rather than burning retries on a credential problem.
-                        raise RuntimeError(f"Authentication required for {url}") from e
+                        # ``from None``: the HTTPError reason text comes from the server.
+                        raise RuntimeError(f"Authentication required for LFC path {server_path}") from None
                     last_err = e
                     # Retry within this URL unless it's the last attempt
                 except Exception as e:
@@ -233,8 +278,8 @@ def download_lfc_file(server_path: str, local_path: str):
         # preferable to a hard failure when VPN is temporarily down).
         # In CI, skip the fallback and fail fast — a stale cached file in CI
         # silently produces wrong results, which is worse than a clear failure.
+        err_desc = f" ({_redact_lfc_urls(str(last_err), base_urls)})" if last_err else ""
         if local_file.exists() and not is_ci:
-            err_desc = f" ({last_err})" if last_err else ""
             print(
                 f"Download failed across {len(base_urls)} LFC URL(s){err_desc}; "
                 f"using existing local file: {local_path}",
@@ -246,12 +291,13 @@ def download_lfc_file(server_path: str, local_path: str):
         http_detail = (
             f" (HTTP {last_err.code})"
             if isinstance(last_err, urllib.error.HTTPError)
-            else ""
+            else err_desc
         )
+        # ``from None``: the redacted urllib detail is already in the message.
         raise RuntimeError(
             f"Download failed across {len(base_urls)} LFC URL(s){http_detail} "
             f"and no local file exists: {local_path}"
-        ) from last_err
+        ) from None
     finally:
         # Release lock and clean up lock file
         if lock_file:
