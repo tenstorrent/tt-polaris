@@ -4,7 +4,7 @@
 import pytest
 
 import numpy as np
-from ttsim.ops.tensor import make_tensor
+from ttsim.ops.tensor import Shape, make_tensor
 import ttsim.front.functional.op as F
 
 @pytest.mark.unit
@@ -271,3 +271,120 @@ def test_rank_and_nelems():
     # Test zero-sized dimension
     tensor = F._from_shape('zero', [2, 0, 4], np_dtype=np.float32)
     assert tensor.nelems() == 0, "Tensor with zero dimension should have nelems() == 0"
+
+
+@pytest.mark.unit
+@pytest.mark.opunit
+def test_shape_normalises_accepted_numpy_dims():
+    """Shape stores plain ints, so every dimension query returns int."""
+    shape = Shape([np.int64(2), 3])
+    assert all(type(d) is int for d in shape), f"dims not normalised: {shape}"
+    assert type(shape[0]) is int, "int index must yield int"
+    assert all(type(d) is int for d in shape[1:]), "slice must yield ints"
+    assert all(type(d) is int for d in shape.as_list()), "as_list must yield ints"
+    assert type(shape.volume()) is int, "volume must be int"
+
+
+@pytest.mark.unit
+@pytest.mark.opunit
+def test_shape_normalises_on_mutation():
+    """Assignment normalises too, or the int contracts break after a write."""
+    shape = Shape([1, 2, 3])
+    shape[0] = np.int64(9)
+    assert type(shape[0]) is int, "int assignment must normalise"
+    shape[1:3] = [np.int64(7), np.int64(8)]
+    assert all(type(d) is int for d in shape), f"slice assignment must normalise: {shape}"
+    assert type(shape.volume()) is int, "volume must stay int after mutation"
+
+
+@pytest.mark.unit
+@pytest.mark.opunit
+def test_check_shape_still_rejects_unaccepted_dim_types():
+    """Normalising must not widen which shapes count as valid.
+
+    check_shape accepted `int` and `np.int64` only. A np.int32 or float dim was
+    rejected before dimension normalisation was introduced and must stay
+    rejected: normalising only the accepted numpy type keeps that boundary.
+    """
+    accepted = make_tensor('accepted')
+    accepted.set_shape([np.int64(1), 2])
+    assert accepted.check_shape(), "int and np.int64 dims must remain valid"
+
+    for bad in ([np.int32(1), 2], [2.9, 3]):
+        tensor = make_tensor('rejected')
+        # Passing a rejected dim type is the point of this test, so the
+        # argument deliberately does not satisfy set_shape's signature.
+        tensor.set_shape(bad)  # type: ignore[arg-type]
+        assert not tensor.check_shape(), f"{[type(d).__name__ for d in bad]} must stay invalid"
+
+
+@pytest.mark.unit
+@pytest.mark.opunit
+def test_shape_accepts_any_sequence():
+    """The constructor accepts what its signature promises, not just list/tuple."""
+    assert Shape(range(3)) == [0, 1, 2], "a range is a Sequence of dims"
+    assert Shape((1, 2)) == [1, 2], "a tuple is a Sequence of dims"
+    assert Shape(Shape([4, 5])) == [4, 5], "a Shape copies"
+    for bad in ('abc', b'abc', 3):
+        with pytest.raises(TypeError):
+            Shape(bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+@pytest.mark.opunit
+def test_nelems_is_int_when_shape_bypasses_normalisation():
+    """`SimTensor.shape` can be assigned directly, skipping Shape's normalisation.
+
+    That state is valid -- check_shape accepts np.int64 dims -- so nelems() has
+    to normalise during its reduction. Coercing the result would be too late:
+    np.int64 dims overflow while multiplying, before any cast could run.
+    """
+    tensor = make_tensor('direct')
+    tensor.shape = [np.int64(2), 3]          # type: ignore[assignment]
+    assert tensor.check_shape(), "np.int64 dims are a valid shape"
+    assert type(tensor.nelems()) is int, "nelems must be int even via direct assignment"
+    assert tensor.nelems() == 6
+
+    big = make_tensor('big')
+    big.shape = [np.int64(2 ** 62), 4]       # type: ignore[assignment]
+    assert big.nelems() == 2 ** 64, "the product must be exact, not wrapped"
+
+
+@pytest.mark.unit
+@pytest.mark.opunit
+def test_nelems_normalises_every_numpy_integer_width():
+    """nelems() must return an exact int for any numpy integer dtype.
+
+    Shape's own coercion is restricted to np.int64, because widening it would
+    change which shapes check_shape calls valid. nelems decides no such thing,
+    so it normalises every width: a np.int32 shape otherwise reduces in
+    fixed-width numpy arithmetic and wraps, feeding a zero-element, zero-byte
+    op to the cost model.
+    """
+    tensor = make_tensor('int32_dims')
+    tensor.shape = [np.int32(2 ** 20), np.int32(2 ** 12)]   # type: ignore[assignment]
+    assert type(tensor.nelems()) is int, "nelems must be int for any numpy width"
+    assert tensor.nelems() == 2 ** 32, "the product must be exact, not wrapped"
+
+    tensor.dtype = np.dtype(np.float32)
+    assert tensor.nbytes() == 2 ** 32 * 4, "nbytes follows nelems"
+
+
+@pytest.mark.unit
+@pytest.mark.opunit
+def test_shim_tensor_queries_accept_a_raw_list_shape():
+    """Shape-inference descriptors assign a plain list to SimTensor.shape.
+
+    Tensor.size() and Tensor.expand() read that attribute, so they must not
+    assume a Shape. Both raised AttributeError on a list before.
+    """
+    import ttsim.front.ttnn as ttnn
+    from ttsim.front.ttnn.tensor import Tensor
+
+    device = ttnn.open_device(device_id=0)
+    tensor = Tensor(shape=[2, 3], dtype=ttnn.float32, device=device)
+    tensor.shape = [2, 3]                                    # type: ignore[assignment]
+    assert type(tensor.shape) is list, "precondition: a raw list shape"
+
+    assert tensor.size() == (2, 3)
+    assert tensor.expand(2, 3) is not None
