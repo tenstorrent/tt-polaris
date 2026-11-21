@@ -62,7 +62,7 @@ packages:
         instances:
         -   name: p100a
             # operator_lookup_file can be a local path or LFC path starting with lfc://
-            operator_lookup_file: lfc://hlm-lut/bh_p100a_lut_v6.yaml
+            operator_lookup_file: __ext/hlm-lut/bh_p100a_lut_v6.yaml
             # Worker (Tensix) core grid as (columns, rows): 11 x 10 = 110 cores on p100a, i.e. what tt-metal's
             # device.compute_with_storage_grid_size() reports.
             #

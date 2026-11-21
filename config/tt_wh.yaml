@@ -50,7 +50,7 @@ packages:
         instances:
         -   name: n150
             # operator_lookup_file can be a local path or LFC path starting with lfc://
-            operator_lookup_file: lfc://hlm-lut/whb0_n150_lut_v6.yaml
+            operator_lookup_file: __ext/hlm-lut/whb0_n150_lut_v6.yaml
             # Worker (Tensix) core grid as (columns, rows): 8 x 8 = 64 cores on n150, i.e. what tt-metal's
             # device.compute_with_storage_grid_size() reports.
             #

@@ -63,7 +63,7 @@ packages:
     -   name: Blackhole
         instances:
         -   name: p100a
-            operator_lookup_file: lfc://hlm-lut/bh_p100a_llama3_lut_v8.yaml
+            operator_lookup_file: __ext/hlm-lut/bh_p100a_llama3_lut_v9-1.yaml
             # Worker (Tensix) core grid as (columns, rows) -- see doc/TTNN_SHIM_ARCHITECTURE.md §17: 11 x 10 = 110
             # cores on p100a, i.e. what tt-metal's device.compute_with_storage_grid_size() reports.
             # Source: tt-metal/tt_metal/core_descriptors/blackhole_140_arch.yaml, compute_with_storage_grid_range per

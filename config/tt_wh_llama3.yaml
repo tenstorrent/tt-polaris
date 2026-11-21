@@ -53,12 +53,12 @@ packages:
     -   name: Wormhole
         instances:
         -   name: n150
-            operator_lookup_file: whb0_n150_llama3_lut_v1.yaml
+            operator_lookup_file: __ext/hlm-lut/whb0_n150_llama3_lut_v1.yaml
             # Logical tensix grid (x, y) — see doc/TTNN_SHIM_ARCHITECTURE.md §17.
             # Source: tt-metal/tt_metal/core_descriptors/wormhole_b0_80_arch_eth_dispatch.yaml
             # (end=[7, 9] → 8×10 physical). n150 has one row harvested → 8×9 = 72 cores
             # (matches num_units below).
-            compute_grid_size: [8, 9]
+            compute_grid_size: [8, 8]
             ipgroups:
             -   ipname: tensix
                 iptype: compute
