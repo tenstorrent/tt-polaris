@@ -7,8 +7,7 @@ Basis: shim-only workloads/ttnn/tt_transformers/decoder.py.
 
 Block: attention_norm -> attention -> residual add -> ff_norm -> mlp -> residual add.
 Maps to capture ops 24 (LayerNorm/attn-norm), 25-38 (attention), 39 (BinaryNg residual),
-40 (LayerNorm/ff-norm), 41-44 (mlp), 45 (BinaryNg residual) — see
-project_llama3_prefill_op_sequence.
+40 (LayerNorm/ff-norm), 41-44 (mlp), 45 (BinaryNg residual).
 
 Audit vs the shim-only base:
   - llama3-only: the moe / Mixtral (TtMoeLayer / MixtralRMSNorm / TtMixtralMLP) branches are
