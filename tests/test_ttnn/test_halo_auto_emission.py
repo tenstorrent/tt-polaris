@@ -18,6 +18,7 @@ from ttsim.front.ttnn.device import ARCH, Device
 from ttsim.front.ttnn.tensor import DataType, Layout, Tensor
 from ttsim.front.ttnn.memory import MemoryConfig
 from ttsim.front.ttnn.buffer import TensorMemoryLayout, BufferType
+from ttsim.front.ttnn.ttnn_shim import ExecutionMode, set_execution_mode
 
 
 def _make_device():
@@ -934,3 +935,69 @@ def test_suppression_does_not_fire_on_the_halo_output_key(monkeypatch):
         'the guard suppressed on the halo OUTPUT key -- it is keyed off the '
         'wrong side of the Halo'
     )
+
+
+# ---------------------------------------------------------------------------
+# to_memory_config: interleaved→different-interleaved emits Copy (tt-metal prim::copy fallback)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_to_memory_config_interleaved_l1_to_dram_emits_one_copy():
+    device = _make_device()
+    x = _make_tensor("x", [1, 1, 32, 128256], device)
+    l1 = MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.L1)
+    dram = MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.DRAM)
+    x._memory_config = l1
+
+    out = ttnn.to_memory_config(x, dram)
+
+    seq = _op_sequence(device)
+    assert [s[0] for s in seq] == ["Copy"]
+    assert out is not x
+    assert out._memory_config == dram
+    assert x._memory_config == l1  # the input tensor is not relabelled
+    assert out.logical_shape().as_list() == x.logical_shape().as_list()
+
+
+@pytest.mark.unit
+def test_to_memory_config_same_interleaved_no_ops():
+    device = _make_device()
+    x = _make_tensor("x", [1, 1, 32, 64], device)
+    dram = MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.DRAM)
+    x._memory_config = dram
+
+    out = ttnn.to_memory_config(x, MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.DRAM))
+
+    assert _op_sequence(device) == []
+    assert out is x
+
+
+@pytest.mark.unit
+def test_copy_optype_matches_profiler_canonical():
+    # The LUT key must match between the shim op and the profiler's CopyDeviceOperation.
+    from tools.profiling.op_canonical import normalize_polaris_optype, normalize_profiler_opcode
+
+    assert normalize_polaris_optype("Copy") == normalize_profiler_opcode("CopyDeviceOperation")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "mode, expect_data",
+    [(ExecutionMode.EXECUTE_AND_TRACK, True), (ExecutionMode.TRACK_ONLY, False)],
+    ids=["execute_and_track", "track_only"],
+)
+def test_to_memory_config_copy_carries_data_when_executing(mode, expect_data):
+    device = _make_device()
+    x = _make_tensor("x", [1, 1, 32, 64], device)
+    x.data = np.arange(32 * 64, dtype=np.float32).reshape(1, 1, 32, 64)
+    x._memory_config = MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.L1)
+    set_execution_mode(mode)
+    try:
+        out = ttnn.to_memory_config(x, MemoryConfig(TensorMemoryLayout.INTERLEAVED, BufferType.DRAM))
+    finally:
+        set_execution_mode(ExecutionMode.TRACK_ONLY)
+
+    assert [s[0] for s in _op_sequence(device)] == ["Copy"]
+    assert out.has_data() == expect_data
+    if expect_data:
+        np.testing.assert_array_equal(out.get_data(), x.get_data())

@@ -44,7 +44,7 @@ op_rsrc_spec:
     matrix: [Matmul, Conv, ConvTranspose, Einsum, Gemm, MultiheadAttention, ScaledDotProductAttention]
     vector: [Abs, Add, And, ArgMax, AveragePool,
              BatchNormalization,
-             Cast, Clip, Concat, Constant, ConstantOfShape, Cos, CumSum,
+             Cast, Clip, Concat, Constant, ConstantOfShape, Copy, Cos, CumSum,
              DequantizeLinear, Div, Dropout,
              Equal, Erf, Exp, Expand,
              Flatten, Fold,
