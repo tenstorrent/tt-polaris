@@ -438,11 +438,13 @@ def untilize_sinf(iTList, oTList, op, **kwargs):
     in_elems = _nelems(in_storage)
     out_elems = _nelems(in_shape)
 
+    # Bytes follow each tensor's own TT dtype (block-float tiles are 1088 / 576 B, not elements * element_size);
+    # elements * element_size is the fallback for tensors with no TT dtype.
     op.perf_stats = {
         'inElems': in_elems,
         'outElems': out_elems,
-        'inBytes': in_elems * elem_size,
-        'outBytes': out_elems * elem_size,
+        'inBytes': _movement_bytes(X, in_storage, elem_size),
+        'outBytes': _movement_bytes(oTList[0], in_shape, elem_size),
         'instrs': {'mov': out_elems},
     }
     return
@@ -516,11 +518,12 @@ def untilize_with_unpadding_sinf(iTList, oTList, op, **kwargs):
     in_storage = _input_storage_shape_for_perf(X, op, in_shape)
     in_elems = _nelems(in_storage)
     out_elems = _nelems(out_shape)
+    # Same dtype-aware bytes as Untilize: the input is read as block-float tiles when it is bfp8 / bfp4.
     op.perf_stats = {
         'inElems': in_elems,
         'outElems': out_elems,
-        'inBytes': in_elems * elem_size,
-        'outBytes': out_elems * elem_size,
+        'inBytes': _movement_bytes(X, in_storage, elem_size),
+        'outBytes': _movement_bytes(oTList[0], out_shape, elem_size),
         'instrs': {'mov': out_elems},
     }
     return

@@ -1471,9 +1471,11 @@ def untilize_op(input_tensor, use_multicore=True, use_pack_untilize=True, elemen
         },
     }
     opobj = SimOp(opinfo)
+    # Resolve the output dtype BEFORE counting bytes, as tilize_op does: the byte count reads the
+    # tensor's own TT dtype, so a block-float input would otherwise be costed at element_size.
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     if memory_config is not None:
         out_tensor._memory_config = memory_config
     input_tensor.device.add_op(opobj)
@@ -1844,9 +1846,10 @@ def untilize_with_unpadding_op(input_tensor, output_shape,
         'attrs': attrs_dict,
     }
     opobj = SimOp(opinfo)
+    # Output dtype first, so the byte counts see the tensor's own TT dtype (see untilize_op).
+    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     opobj.get_perf_counts([input_tensor], [out_tensor])
     opobj.update_tensor_counts([input_tensor], [out_tensor])
-    _propagate_ttnn_dtype([input_tensor], [out_tensor])
     # Memory config propagation: explicit kwarg wins; otherwise inherit the input's
     # memory_config so direct callers (e.g. BH ViT patch embeddings) don't silently
     # land in DRAM_INTERLEAVED when the HW path is L1_INTERLEAVED.  Mirrors
