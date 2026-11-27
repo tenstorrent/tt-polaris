@@ -6,7 +6,7 @@
 Based on the shim-only workloads/ttnn/tt_transformers/model_config.py, made
 dual-mode (IS_POLARIS gate) and audited against tt-metal
 models/tt_transformers/tt/model_config.py. Config-only + dummy weights — the
-TT-Polaris path never reads an HF checkpoint (see design doc §5).
+TT-Polaris path never reads an HF checkpoint.
 
 Audit fixes vs the shim-only base:
   - qkv_size now COMPUTED as head_dim*(2*n_kv_heads + n_heads) per tt-metal
