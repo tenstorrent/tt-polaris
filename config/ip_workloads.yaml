@@ -111,6 +111,17 @@ workloads:
       bert_base : { path: 'onnx/bert-fixed-128.onnx', seq_len: 128, bs: 1 }
 
   - api: ONNX
+    name: WHISPER-BASE
+    basedir: workloads/onnx
+    module: whisper-base-fixed.onnx
+    instances:
+      default: { path: whisper-base-fixed.onnx,
+                 bs: 1,
+                 audio_seq_len: 3000,
+                 decoder_seq_len: 16,
+                 feature_dim: 80 }
+
+  - api: ONNX
     name: VIT-BASE
     basedir: workloads/onnx
     module: vit-base-fixed-224.onnx

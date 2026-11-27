@@ -764,6 +764,77 @@ def ln_sinf(iTList, oTList, op, **kwargs):
     return
 
 
+def skip_ln_sinf(iTList, oTList, op, **kwargs):
+    X = iTList[0]
+    skip = iTList[1]
+    gamma = iTList[2]
+    beta = iTList[3] if len(iTList) > 3 else None
+    bias = iTList[4] if len(iTList) > 4 else None
+    assert X.check_shape(), f"Illegal Shape for {X}"
+
+    input_count = X.nelems()
+    reduction_count = prod_ints(X.shape[:-1]) if X.rank() > 0 else 1
+
+    instr_count = {
+        "add": 0,
+        "sub": 0,
+        "mul": 0,
+        "div": 0,
+        "mac": 0,
+        "rsqrt": 0,
+    }
+    # value = input + skip (+ bias)
+    instr_count["add"] += input_count           # + skip
+    if bias is not None:
+        instr_count["add"] += input_count       # + bias
+    # LayerNorm over last dim
+    instr_count["add"] += input_count           # sum for mean
+    instr_count["div"] += reduction_count       # mean
+    instr_count["sub"] += input_count           # x - mean
+    instr_count["mul"] += input_count           # squared diff
+    instr_count["add"] += input_count           # sum for variance
+    instr_count["div"] += reduction_count       # variance
+    instr_count["add"] += reduction_count       # variance + epsilon
+    instr_count["rsqrt"] += reduction_count     # 1/sqrt(var + eps)
+    instr_count["mul"] += input_count           # normalize
+    instr_count["mac"] += input_count           # scale (*gamma) (+beta)
+
+    oTList[0].shape = X.shape
+    oTList[0].dtype = X.dtype
+
+    reduction_shape = X.shape[:-1] + [1]
+    if len(oTList) >= 2:
+        oTList[1].shape = reduction_shape
+        oTList[1].dtype = X.dtype
+    if len(oTList) >= 3:
+        oTList[2].shape = reduction_shape
+        oTList[2].dtype = X.dtype
+    if len(oTList) >= 4:
+        oTList[3].shape = X.shape
+        oTList[3].dtype = X.dtype
+
+    biasElems = 0 if bias is None else bias.nelems()
+    betaElems = 0 if beta is None else beta.nelems()
+    biasBytes = 0 if bias is None else bias.nbytes(op.precision)
+    betaBytes = 0 if beta is None else beta.nbytes(op.precision)
+    outElems = sum(t.nelems() for t in oTList)
+    outBytes = sum(t.nbytes(op.precision) for t in oTList)
+    op.perf_stats = {
+        "inElems": X.nelems() + skip.nelems() + gamma.nelems() + betaElems + biasElems,
+        "outElems": outElems,
+        "inBytes": X.nbytes(op.precision)
+        + skip.nbytes(op.precision)
+        + gamma.nbytes(op.precision)
+        + betaBytes
+        + biasBytes,
+        "outBytes": outBytes,
+        "instrs": instr_count,
+    }
+
+    oTList[0].data = None
+    return
+
+
 def groupnorm_sinf(iTList, oTList, op, **kwargs):
     # For GroupNormalization, the shape inference is similar to LayerNormalization
     # The output shape is the same as input shape
@@ -1099,6 +1170,24 @@ def register_nn_ops():
             3,
             1,
             ln_sinf,
+            True,
+            True,
+            True,
+            True,
+            True,
+        ],
+        [
+            "SkipLayerNormalization",
+            "ARITY_VARIADIC[3-5]->VARIADIC[1-4]",
+            "com.microsoft",
+            "COMMON",
+            1,
+            1,
+            5,
+            3,
+            4,
+            1,
+            skip_ln_sinf,
             True,
             True,
             True,
