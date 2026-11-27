@@ -111,6 +111,20 @@ def test_convert_torch_attrs_to_onnx():
     with pytest.raises(ValueError, match="both 'dim' and 'axis' are present") as exc_info:
         result = convert_torch_attrs_to_onnx('Softmax', attrs)
 
+    # Test Mean with dim -> should pop dim
+    attrs = {'dim': 1, 'keepdims': True}
+    result = convert_torch_attrs_to_onnx('Mean', attrs)
+    assert result == {'keepdims': True}
+    assert result is not attrs  # Should be a copy
+    assert attrs == {'dim': 1, 'keepdims': True}  # Original should remain unchanged
+
+    # Test MatMul with bias -> should pop bias
+    attrs = {'bias': True, 'transA': False}
+    result = convert_torch_attrs_to_onnx('MatMul', attrs)
+    assert result == {'transA': False}
+    assert result is not attrs  # Should be a copy
+    assert attrs == {'bias': True, 'transA': False}  # Original should remain unchanged
+
 def test_graph2onnx_logsoftmax_with_dim(session_temp_directory):
     """
     Test that a workload graph with LogSoftmax op having 'dim' attribute
@@ -178,3 +192,116 @@ def test_graph2onnx_logsoftmax_with_dim(session_temp_directory):
     axis_attr = next(attr for attr in logsoftmax_node.attribute if attr.name == "axis")
     assert axis_attr.i == 1, "axis should be 1"
 
+
+def test_graph2onnx_mean_with_dim(session_temp_directory):
+    """
+    Test that a workload graph with Mean op having 'dim' attribute
+    is successfully exported to ONNX, with 'dim' stripped out.
+    """
+    graph = WorkloadGraph("test_mean")
+
+    input_tensor = SimTensor({
+        'name': 'input',
+        'shape': (1, 10),
+        'dtype': 'float32',
+        'op_in': ['mean'],
+        'op_out': []
+    })
+    output_tensor = SimTensor({
+        'name': 'output',
+        'shape': (1, 1),
+        'dtype': 'float32',
+        'op_in': [],
+        'op_out': ['mean']
+    })
+
+    graph.add_tensor(input_tensor)
+    graph.add_tensor(output_tensor)
+
+    mean_op = SimOp({
+        'name': 'mean',
+        'optype': 'Mean',
+        'inList': ['input'],
+        'outList': ['output'],
+        'attrs': {'dim': 1}
+    })
+    graph.add_op(mean_op)
+    graph.construct_graph()
+
+    onnx_filename = str(session_temp_directory / "test_mean.onnx")
+    graph.graph2onnx(onnx_filename)
+
+    assert os.path.exists(onnx_filename), "ONNX file should be created"
+
+    model = onnx.load(onnx_filename)
+    onnx.checker.check_model(model)
+
+    graph_def = model.graph
+    mean_node = None
+    for node in graph_def.node:
+        if node.op_type == "Mean":
+            mean_node = node
+            break
+    assert mean_node is not None, "Mean node should be present"
+    assert "dim" not in [attr.name for attr in mean_node.attribute], "Mean should not have 'dim' attribute"
+
+
+def test_graph2onnx_matmul_with_bias(session_temp_directory):
+    """
+    Test that a workload graph with MatMul op having 'bias' attribute
+    is successfully exported to ONNX, with 'bias' stripped out.
+    """
+    graph = WorkloadGraph("test_matmul")
+
+    input_a = SimTensor({
+        'name': 'input_a',
+        'shape': (2, 3),
+        'dtype': 'float32',
+        'op_in': ['matmul'],
+        'op_out': []
+    })
+    input_b = SimTensor({
+        'name': 'input_b',
+        'shape': (3, 4),
+        'dtype': 'float32',
+        'op_in': ['matmul'],
+        'op_out': []
+    })
+    output_tensor = SimTensor({
+        'name': 'output',
+        'shape': (2, 4),
+        'dtype': 'float32',
+        'op_in': [],
+        'op_out': ['matmul']
+    })
+
+    graph.add_tensor(input_a)
+    graph.add_tensor(input_b)
+    graph.add_tensor(output_tensor)
+
+    matmul_op = SimOp({
+        'name': 'matmul',
+        'optype': 'MatMul',
+        'inList': ['input_a', 'input_b'],
+        'outList': ['output'],
+        'attrs': {'bias': True}
+    })
+    graph.add_op(matmul_op)
+    graph.construct_graph()
+
+    onnx_filename = str(session_temp_directory / "test_matmul.onnx")
+    graph.graph2onnx(onnx_filename)
+
+    assert os.path.exists(onnx_filename), "ONNX file should be created"
+
+    model = onnx.load(onnx_filename)
+    onnx.checker.check_model(model)
+
+    graph_def = model.graph
+    matmul_node = None
+    for node in graph_def.node:
+        if node.op_type == "MatMul":
+            matmul_node = node
+            break
+    assert matmul_node is not None, "MatMul node should be present"
+    assert "bias" not in [attr.name for attr in matmul_node.attribute], "MatMul should not have 'bias' attribute"

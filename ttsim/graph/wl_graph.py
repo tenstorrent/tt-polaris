@@ -50,6 +50,18 @@ def convert_torch_attrs_to_onnx(optype: str, attrs: dict) -> dict:
         converted_attrs.pop('train_mode', None)
         return converted_attrs
 
+    # For Mean (ONNX Mean takes a list of tensors and has no 'dim' attribute)
+    if optype == 'Mean':
+        converted_attrs = attrs.copy()
+        converted_attrs.pop('dim', None)
+        return converted_attrs
+
+    # For MatMul (ONNX MatMul does not take 'bias' attribute)
+    if optype == 'MatMul':
+        converted_attrs = attrs.copy()
+        converted_attrs.pop('bias', None)
+        return converted_attrs
+
     # Future extensions can be added here:
     # Example: if optype == 'SomeOp' and 'torch_attr' in attrs:
     #     converted_attrs = attrs.copy()
